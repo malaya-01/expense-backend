@@ -7,6 +7,7 @@ export default () => ({
     CLIENT_HOST: process.env.CLIENT_HOST || 'http://localhost:6379',
     JWT: {
         SECRET: process.env.JWT_SECRET || 'kjhdiuwidh76uuh5egd8hd2nd93dg5hyqyshuyq',
+        REFRESH_SECRET: process.env.JWT_REFRESH_SECRET || 'kjhdiuwidh76uuh5egd8hd2nd93dg5hyqyshuyq',
         EXP: process.env.JWT_EXPIRES_IN || '2d',
     },
     CACHE: {

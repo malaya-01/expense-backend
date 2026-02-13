@@ -6,6 +6,8 @@ import { CacheModule } from '@nestjs/cache-manager';
 import * as redisStore from 'cache-manager-ioredis';
 import appConfiguration from './app.configuration';
 import { DatabaseModule } from './database/database.module';
+import { AuthModule } from './api/auth/auth.module';
+import { UserModule } from './api/user/user.module';
 
 
 @Module({
@@ -19,7 +21,9 @@ import { DatabaseModule } from './database/database.module';
         ttl: 0,
       }),
     }),
-    DatabaseModule
+    DatabaseModule,
+    AuthModule,
+    UserModule
   ],
   controllers: [AppController],
   providers: [AppService],
