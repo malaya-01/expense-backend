@@ -16,6 +16,7 @@ import { OtpGenerateDto } from './dto/generat-otp.dto';
 import { Cache } from 'cache-manager';
 import { JwtService } from '@nestjs/jwt';
 import { Request, Response } from 'express';
+import { randomUUID } from 'crypto';
 
 @Injectable()
 export class AuthService {
@@ -206,6 +207,8 @@ export class AuthService {
 
       const refreshTokenHash = await bcrypt.hash(refreshToken, 10);
 
+      const sessionToken = randomUUID();
+
       // Store session
       await client.query(
         `
@@ -215,7 +218,7 @@ export class AuthService {
       `,
         [
           user.id,
-          accessToken,
+          sessionToken,
           refreshTokenHash,
           req.headers['user-agent'] || null,
           req.ip,

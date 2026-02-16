@@ -5,6 +5,7 @@ import { LoginAuthDto, PasswordResetDto, RegisterAuthDto } from './dto/create-au
 import { ApiOperation } from '@nestjs/swagger';
 import { OtpGenerateDto } from './dto/generat-otp.dto';
 import { Request, Response } from 'express';
+import { Throttle } from '@nestjs/throttler';
 
 @Controller('auth')
 export class AuthController {
@@ -17,6 +18,7 @@ export class AuthController {
   }
 
   @Post('login')
+  @Throttle({ default: { limit: 1, ttl: 60 } })
   @ApiOperation({ summary: 'User login' })
   async loginUser(@Body() loginUserDto: LoginAuthDto, @Req() req: Request) {
     return this.authService.login(loginUserDto, req);

@@ -8,6 +8,9 @@ import appConfiguration from './app.configuration';
 import { DatabaseModule } from './database/database.module';
 import { AuthModule } from './api/auth/auth.module';
 import { UserModule } from './api/user/user.module';
+import { ThrottleConfigModule } from './throttle/throttle.module';
+import { ExpenseModule } from './api/expense/expense.module';
+import { CategoriesModule } from './api/categories/categories.module';
 
 
 @Module({
@@ -23,7 +26,10 @@ import { UserModule } from './api/user/user.module';
     }),
     DatabaseModule,
     AuthModule,
-    UserModule
+    UserModule,
+    ThrottleConfigModule,
+    ExpenseModule,
+    CategoriesModule
   ],
   controllers: [AppController],
   providers: [AppService],
