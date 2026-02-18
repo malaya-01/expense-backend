@@ -56,8 +56,25 @@ export class CategoriesService {
     }
   }
 
-  findOne(id: number) {
-    return `This action returns a #${id} category`;
+  async findOne(user_id: string, category_id:string) {
+    const client = await this.pgPool.connect()
+    try{
+      const currentUser = await client.query(`
+        SELECT * FROM categories WHERE user_id = $1
+        `, [user_id])
+      if (currentUser.rowCount === 0){
+        throw new BadRequestException('No user found')
+      }else{
+        const categories = await client.query(`
+          SELECT * FROM categories where user_id = $1 AND id = $2
+          `,[user_id, category_id])
+        return categories.rows[0]
+      }
+    }catch(error: any){
+      throw new BadRequestException('Something went wrong')
+    }finally{
+      await client.release()
+    }
   }
 
   update(id: number, updateCategoryDto: UpdateCategoryDto) {

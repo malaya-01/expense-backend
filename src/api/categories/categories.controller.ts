@@ -29,6 +29,7 @@ export class CategoriesController {
   }
 
   @Get()
+  @ApiOperation({ summary: 'Get all the category' })
   @ApiQuery({ name: 'user_id', type: String, required: true })
   async findAll(@Query('user_id') user_id: String, @Res() res:Response) {
     // return this.categoriesService.findAll(user_id);
@@ -42,9 +43,19 @@ export class CategoriesController {
     }
   }
 
-  @Get(':id')
-  findOne(@Param('id') id: string) {
-    return this.categoriesService.findOne(+id);
+  @Get(':user_id/:category_id')
+  @ApiOperation({ summary: 'Find one category' })
+  async findOne(@Param('user_id') user_id:string, @Param('category_id') category_id: string, @Res() res: Response) {
+    // return this.categoriesService.findOne(+id);
+    try{
+      const result = await this.categoriesService.findOne(user_id, category_id)
+      return res.status(HttpStatus.OK).send(successResponse(result, 'Category found'))
+
+    }catch(error){
+      const message = error.message || 'Something went wrong'
+      const statusCode = error.statusCode || error.status || HttpStatus.BAD_REQUEST
+      return res.status(statusCode).send(errorResponse(message, statusCode))
+    }
   }
 
   @Patch(':id')
