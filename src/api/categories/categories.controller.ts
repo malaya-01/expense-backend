@@ -2,10 +2,11 @@ import { Controller, Get, Post, Body, Patch, Param, Delete, Query, HttpStatus, R
 import { CategoriesService } from './categories.service';
 import { CreateCategoryDto } from './dto/create-category.dto';
 import { UpdateCategoryDto } from './dto/update-category.dto';
-import { ApiOperation, ApiBody, ApiResponse, ApiTags, ApiQuery } from '@nestjs/swagger';
+import { ApiOperation, ApiBody, ApiResponse, ApiTags, ApiQuery, ApiBearerAuth } from '@nestjs/swagger';
 import { errorResponse, successResponse } from 'src/utils/response/response';
 import { Response } from 'express';
 
+@ApiBearerAuth('bearer')
 @ApiTags('categories')
 @Controller('categories')
 export class CategoriesController {
@@ -24,7 +25,7 @@ export class CategoriesController {
     }catch(error){
       const message = error.message || 'An unexpected error occured'
       const statusCode = error.statuscode || error.status || HttpStatus.BAD_REQUEST
-      return res.status(statusCode).send(errorResponse(message, statusCode))
+      return res.status(statusCode).send(errorResponse(message, statusCode,[]))
     }
   }
 
@@ -39,7 +40,7 @@ export class CategoriesController {
     }catch(error){
       const message = error.message || 'An unexpected error occured'
       const statusCode = error.statuscode || error.status || HttpStatus.BAD_REQUEST
-      return res.status(statusCode).send(errorResponse(message, statusCode))
+      return res.status(statusCode).send(errorResponse(message, statusCode,[]))
     }
   }
 
@@ -54,16 +55,28 @@ export class CategoriesController {
     }catch(error){
       const message = error.message || 'Something went wrong'
       const statusCode = error.statusCode || error.status || HttpStatus.BAD_REQUEST
-      return res.status(statusCode).send(errorResponse(message, statusCode))
+      return res.status(statusCode).send(errorResponse(message, statusCode, []))
     }
   }
 
-  @Patch(':id')
-  update(@Param('id') id: string, @Body() updateCategoryDto: UpdateCategoryDto) {
-    return this.categoriesService.update(+id, updateCategoryDto);
+  @Patch(':user_id/:category_id')
+  @ApiOperation({ summary: 'Update a category' })
+  async update(@Param('user_id') user_id: string, @Param('category_id') category_id:string, @Body() updateCategoryDto: UpdateCategoryDto, @Res() res:Response) {
+    // return this.categoriesService.update(user_id, category_id, updateCategoryDto);
+    try{
+      const result = await this.categoriesService.update(user_id, category_id, updateCategoryDto)
+      return res.status(HttpStatus.OK).send(successResponse(result, 'Category updated.'))
+    }catch(error){
+      const message = error.message || 'An unexpected error occured'
+      const statusCode = error.status || error.statusCode || HttpStatus.BAD_REQUEST
+      return res.status(statusCode).send(errorResponse(message, statusCode, []))
+    }
   }
 
   @Delete(':id')
+  @ApiOperation({
+    description: 'Delete a category.'
+  })
   remove(@Param('id') id: string) {
     return this.categoriesService.remove(+id);
   }

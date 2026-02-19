@@ -31,6 +31,12 @@ async function bootstrap() {
     .setDescription('Cybrain Worksheet Mangaement API Documentation')
     .setVersion('1.0')
     .addTag('Routes')
+    .addBearerAuth({
+      type: 'http',
+      scheme: 'bearer',
+      bearerFormat: 'JWT',
+      in: 'header',
+    }, 'bearer')
     .build();
   const options: SwaggerDocumentOptions = {
     operationIdFactory: (controllerKey: string, methodKey: string) => methodKey,

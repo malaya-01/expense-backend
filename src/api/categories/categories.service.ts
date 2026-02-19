@@ -77,8 +77,34 @@ export class CategoriesService {
     }
   }
 
-  update(id: number, updateCategoryDto: UpdateCategoryDto) {
-    return `This action updates a #${id} category`;
+  async update(user_id:string, category_id: string, updateCategoryDto: UpdateCategoryDto) {
+    // return `This action updates a #${id} category`;
+    const client = await this.pgPool.connect()
+
+    try{
+      const fields = Object.keys(updateCategoryDto)
+      if (fields.length === 0){
+        throw new BadRequestException('No values found to update.')
+      }
+
+      const setClause = fields.map((field, index)=>`${field} = $${index+1}`).join(', ');
+      const values = Object.values(updateCategoryDto)
+      values.push(user_id, category_id)
+
+      const query =  `UPDATE categories SET ${setClause}, updated_at = NOW() WHERE user_id = $${values.length -1} AND id = $${values.length} RETURNING *
+      `
+      const result = await client.query(query, values)
+      if(result.rowCount === 0){
+        throw new BadRequestException("Category not found.")
+      }
+
+      return result.rows[0]
+    }catch(error){
+      console.log(error)
+      throw new BadRequestException("Failed to update category.")
+    }finally{
+      await client.release()
+    }
   }
 
   remove(id: number) {
