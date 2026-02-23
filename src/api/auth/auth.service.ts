@@ -17,6 +17,7 @@ import { Cache } from 'cache-manager';
 import { JwtService } from '@nestjs/jwt';
 import { Request, Response } from 'express';
 import { randomUUID } from 'crypto';
+import { UserService } from '../user/user.service';
 
 @Injectable()
 export class AuthService {
@@ -25,7 +26,8 @@ export class AuthService {
     private readonly pgPool: Pool,
     @Inject('CACHE_MANAGER')
     private readonly cacheManager: Cache,
-    private readonly jwtService: JwtService
+    private readonly jwtService: JwtService,
+    private readonly userService: UserService
   ) { }
 
 
@@ -52,6 +54,7 @@ export class AuthService {
       throw new InternalServerErrorException('Failed to register user');
     } finally {
       client.release();
+      await this.userService.syncUsersToCache()
     }
   }
 
@@ -237,6 +240,7 @@ export class AuthService {
       throw error;
     } finally {
       client.release();
+      await this.userService.syncUsersToCache()
     }
   }
 

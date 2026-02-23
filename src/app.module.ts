@@ -11,6 +11,7 @@ import { UserModule } from './api/user/user.module';
 import { ThrottleConfigModule } from './throttle/throttle.module';
 import { ExpenseModule } from './api/expense/expense.module';
 import { CategoriesModule } from './api/categories/categories.module';
+import { AuthorizationGuard } from './helper/guards/authorization.guard';
 
 
 @Module({
@@ -32,6 +33,11 @@ import { CategoriesModule } from './api/categories/categories.module';
     CategoriesModule
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [AppService,
+    {
+      provide: 'APP_GUARD',
+      useClass: AuthorizationGuard
+    }
+  ],
 })
 export class AppModule {}

@@ -18,11 +18,15 @@
     "test:cov": "jest --coverage",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
     "test:e2e": "jest --config ./test/jest-e2e.json",
-    "migration:create": "node-pg-migrate create -j sql -m src/database/migrations",
-    "migration:up": "node-pg-migrate up -m src/database/migrations --database-url-var DB_URL",
-    "migration:down": "node-pg-migrate down -m src/database/migrations --database-url-var DB_URL",
+    "migration:create": "node scripts/create-migration.js",
+    "migration:up": "node scripts/run-migrations.js up",
+    "migration:down": "node scripts/run-migrations.js down",
     "migration:redo": "node-pg-migrate redo -m src/database/migrations --database-url-var DB_URL",
-    "migration:up:fake": "node-pg-migrate up -m src/database/migrations --database-url-var DB_URL --fake"
+    "migration:up:fake": "node-pg-migrate up -m src/database/migrations --database-url-var DB_URL --fake",
+    "migration:check": "node scripts/fix-migration-tracking.js check",
+    "migration:list": "node scripts/list-pending-migrations.js",
+    "migration:fix": "node scripts/fix-migration-tracking.js fix",
+    "migration:delete": "node scripts/fix-migration-tracking.js delete"
   },
   "dependencies": {
     "@nestjs/cache-manager": "^3.1.0",
@@ -43,6 +47,7 @@
     "crypto": "^1.0.1",
     "ioredis": "^5.9.3",
     "jsonwebtoken": "^9.0.3",
+    "jwt-decode": "^4.0.0",
     "node-pg-migrate": "^8.0.4",
     "passport": "^0.7.0",
     "passport-jwt": "^4.0.1",

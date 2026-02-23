@@ -7,6 +7,7 @@ import { OtpGenerateDto } from './dto/generat-otp.dto';
 import { Request, Response } from 'express';
 import { Throttle } from '@nestjs/throttler';
 import { errorResponse, successResponse } from 'src/utils/response/response';
+import { Public } from 'src/helper/decorators/public.decorator';
 
 @Controller('auth')
 export class AuthController {
@@ -26,6 +27,7 @@ export class AuthController {
 
   }
 
+  @Public()
   @Post('login')
   @Throttle({ default: { limit: 1, ttl: 60 } })
   @ApiOperation({ summary: 'User login' })
