@@ -13,6 +13,7 @@ import { Public } from 'src/helper/decorators/public.decorator';
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
+  @Public()
   @Post('register')
   @ApiOperation({ summary: 'Register a new user' })
   async registerUser(@Body() registerAuthDto: RegisterAuthDto,@Res() res: Response) {
