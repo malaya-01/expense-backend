@@ -10,8 +10,8 @@ export class CategoriesService {
     private readonly pgPool: Pool
   ) { }
 
-  async create(createCategoryDto: CreateCategoryDto) {
-    const { user_id, name, description, color, icon, parent_id, is_system, budget_amount, budget_period } = createCategoryDto
+  async create(user_id: string, createCategoryDto: CreateCategoryDto) {
+    const { name, description, color, icon, parent_id, is_system, budget_amount, budget_period } = createCategoryDto
     const client = await this.pgPool.connect()
     
     try {
@@ -107,7 +107,17 @@ export class CategoriesService {
     }
   }
 
-  remove(id: string) {
-    return `This action removes a #${id} category`;
+  async remove(user_id:string, category_id: string) {
+    const client = await this.pgPool.connect()
+    try{
+      const result = await client.query(`
+        DELETE FROM categories WHERE user_id = $1 AND id = $2
+        `, [user_id, category_id])
+      return result.rows[0]
+    }catch(error: any){
+      throw new BadRequestException('Failed to delete category')
+    }finally{
+      await client.release()
+    }
   }
 }

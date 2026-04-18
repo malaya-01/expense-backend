@@ -58,7 +58,6 @@ export class AuthService {
     }
   }
 
-
   async generateOtp(dto: OtpGenerateDto) {
     const { email } = dto;
     const user = await this.pgPool.query(

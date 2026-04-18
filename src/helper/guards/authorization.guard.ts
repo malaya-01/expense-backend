@@ -31,7 +31,11 @@ export class AuthorizationGuard implements CanActivate {
             if (!(Object.keys(decode_token).length > 0)) throw new UnauthorizedException('Unauthorized access')
             let all_users: any[] = (await this.Cache.get('all_users')) || []
             let profile = all_users.find((obj:any)=>obj.id === decode_token?.sub) ||null 
-            request['user'] = {profile}
+            request['user'] = 
+                {
+                    id: decode_token.sub,
+                    profile
+                }
         }
         catch(err){
             throw new UnauthorizedException('Unauthorized access')
