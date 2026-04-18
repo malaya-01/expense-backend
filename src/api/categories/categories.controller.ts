@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, Patch, Param, Delete, Query, HttpStatus, Res, Req } from '@nestjs/common';
+﻿import { Controller, Get, Post, Body, Patch, Param, Delete, Query, HttpStatus, Res, Req, BadRequestException } from '@nestjs/common';
 import { CategoriesService } from './categories.service';
 import { CreateCategoryDto } from './dto/create-category.dto';
 import { UpdateCategoryDto } from './dto/update-category.dto';
@@ -17,10 +17,11 @@ export class CategoriesController {
   @ApiBody({ type: CreateCategoryDto })
   @ApiResponse({ status: 201, description: 'Category created successfully' })
   @ApiResponse({ status: 400, description: 'Bad request' })
-  async create(@Body() createCategoryDto: CreateCategoryDto, @Res() res: Response) {
+  async create(@Body() createCategoryDto: CreateCategoryDto, @Res() res: Response, @Req() req: Request ) {
     // return this.categoriesService.create(createCategoryDto);
     try{
-      const result = await this.categoriesService.create(createCategoryDto)
+      const userId = req['user'].id as string
+      const result = await this.categoriesService.create(userId,createCategoryDto)
       return res.status(HttpStatus.OK).send(successResponse(result, 'User loged in successfully.'))
     }catch(error){
       const message = error.message || 'An unexpected error occured'
@@ -31,10 +32,11 @@ export class CategoriesController {
 
   @Get()
   @ApiOperation({ summary: 'Get all the category' })
-  @ApiQuery({ name: 'user_id', type: String, required: true })
-  async findAll(@Query('user_id') user_id: String, @Res() res:Response) {
+  // @ApiQuery({ name: 'user_id', type: String, required: true })
+  async findAll(@Req() req: Request, @Res() res:Response) {
     // return this.categoriesService.findAll(user_id);
     try{
+      const user_id = req['user'].id as string
       const result = await this.categoriesService.findAll(user_id)
       return res.status(HttpStatus.OK).send(successResponse(result, 'User loged in successfully.'))
     }catch(error){
@@ -44,11 +46,12 @@ export class CategoriesController {
     }
   }
 
-  @Get(':user_id/:category_id')
+  @Get(':category_id')
   @ApiOperation({ summary: 'Find one category' })
-  async findOne(@Param('user_id') user_id:string, @Param('category_id') category_id: string, @Res() res: Response) {
+  async findOne(@Req() req: Request, @Param('category_id') category_id: string, @Res() res: Response) {
     // return this.categoriesService.findOne(+id);
     try{
+      const user_id = req['user'].id as string
       const result = await this.categoriesService.findOne(user_id, category_id)
       return res.status(HttpStatus.OK).send(successResponse(result, 'Category found'))
 
@@ -59,11 +62,12 @@ export class CategoriesController {
     }
   }
 
-  @Patch(':user_id/:category_id')
+  @Patch(':category_id')
   @ApiOperation({ summary: 'Update a category' })
-  async update(@Param('user_id') user_id: string, @Param('category_id') category_id:string, @Body() updateCategoryDto: UpdateCategoryDto, @Res() res:Response) {
+  async update(@Req() req: Request, @Param('category_id') category_id:string, @Body() updateCategoryDto: UpdateCategoryDto, @Res() res:Response) {
     // return this.categoriesService.update(user_id, category_id, updateCategoryDto);
     try{
+      const user_id = req['user'].id as string
       const result = await this.categoriesService.update(user_id, category_id, updateCategoryDto)
       return res.status(HttpStatus.OK).send(successResponse(result, 'Category updated.'))
     }catch(error){
@@ -73,11 +77,21 @@ export class CategoriesController {
     }
   }
 
-  @Delete(':id')
+  @Delete(':category_id')
   @ApiOperation({
     description: 'Delete a category.'
   })
-  remove(@Param('id') id: string , @Res() res: Response, @Req() req: Request) {
-    return this.categoriesService.remove(id);
+  remove(@Param('category_id') category_id: string , @Res() res: Response, @Req() req: Request) {
+    try{
+      const user_id = req['user'].id as string  
+      const result = this.categoriesService.remove(user_id, category_id)
+      return res.status(HttpStatus.OK).send(successResponse(result, 'cateogry deleted successfully.'))
+    }catch(error){
+      const message = error.message || 'An unexpected error occured'
+      const statusCode = error.status || error.statusCode || HttpStatus.BAD_REQUEST
+      return res.status(statusCode).send(errorResponse(message, statusCode, []))
+    }
   }
+
+
 }
