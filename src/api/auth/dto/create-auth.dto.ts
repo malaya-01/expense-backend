@@ -1,7 +1,8 @@
-import { ApiProperty } from "@nestjs/swagger";
-import { IsEmail, IsString, MinLength } from "class-validator";
+import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
+import { IsEmail, IsIn, IsOptional, IsString, Length, MinLength } from "class-validator";
+import { COUNTRIES, SUPPORTED_CURRENCIES } from "src/common/currency/currency.data";
 
-// export class CreateAuthDto {}
+const COUNTRY_CODES = COUNTRIES.map((c) => c.code);
 
 export class RegisterAuthDto {
 
@@ -34,6 +35,27 @@ export class RegisterAuthDto {
     @IsString()
     @MinLength(8)
     confirmPassword: string;
+
+    @ApiProperty({
+        description: 'ISO country code',
+        example: 'IN',
+        enum: COUNTRY_CODES,
+    })
+    @IsString()
+    @Length(2, 2)
+    @IsIn(COUNTRY_CODES)
+    country: string;
+
+    @ApiPropertyOptional({
+        description: 'Base / reporting currency (defaults from country)',
+        example: 'INR',
+        enum: SUPPORTED_CURRENCIES,
+    })
+    @IsOptional()
+    @IsString()
+    @Length(3, 3)
+    @IsIn(SUPPORTED_CURRENCIES)
+    currency?: string;
 }
 
 export class LoginAuthDto {

@@ -10,7 +10,7 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
 
-  const port = appConfiguration().PORT || 3000;
+  const port = appConfiguration().PORT || 9000;
   // await app.listen(port);
   
   app.use(cookieParser());
@@ -24,7 +24,10 @@ async function bootstrap() {
     type: VersioningType.URI,
   });
 
-  app.enableCors();
+  app.enableCors({
+    origin: 'http://localhost:3000',
+    credentials: true,
+  });
   useContainer(app.select(AppModule), { fallbackOnErrors: true });
   const config = new DocumentBuilder()
     .setTitle('Cybrain Worksheet Mangaement APIs')

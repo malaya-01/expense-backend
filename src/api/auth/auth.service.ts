@@ -18,6 +18,10 @@ import { JwtService } from '@nestjs/jwt';
 import { Request, Response } from 'express';
 import { randomUUID } from 'crypto';
 import { UserService } from '../user/user.service';
+import {
+  getCountry,
+  isSupportedCurrency,
+} from 'src/common/currency/currency.data';
 
 @Injectable()
 export class AuthService {
@@ -32,20 +36,32 @@ export class AuthService {
 
 
   async register(registerAuthDto: RegisterAuthDto) {
-    const { full_name, email, password, confirmPassword } = registerAuthDto;
+    const { full_name, email, password, confirmPassword, country, currency } =
+      registerAuthDto;
 
     if (password !== confirmPassword) {
       throw new BadRequestException('Password and confirm password do not match');
+    }
+
+    const countryCode = country.toUpperCase();
+    const countryMeta = getCountry(countryCode);
+    if (!countryMeta) {
+      throw new BadRequestException('Unsupported country');
+    }
+    const baseCurrency = (currency || countryMeta.currency).toUpperCase();
+    if (!isSupportedCurrency(baseCurrency)) {
+      throw new BadRequestException('Unsupported currency');
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
     const client = await this.pgPool.connect();
     try {
       const result = await client.query(
-        `INSERT INTO users (full_name, email, password_hash) VALUES ($1, $2, $3)
-        RETURNING id, full_name, email`,
-        [full_name, email, passwordHash]
-      )
+        `INSERT INTO users (full_name, email, password_hash, country, currency)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, full_name, email, country, currency, timezone, locale`,
+        [full_name, email, passwordHash, countryCode, baseCurrency],
+      );
       return result.rows[0];
     } catch (error: any) {
       if (error?.code === '23505') {
@@ -114,7 +130,7 @@ export class AuthService {
 
       const userResult = await client.query(
         `
-      SELECT id, email, password_hash, full_name, 
+      SELECT id, email, password_hash, full_name, country, currency, timezone, locale,
              email_verified, failed_login_attempts, 
              locked_until, deleted_at
       FROM users
@@ -232,6 +248,15 @@ export class AuthService {
       return {
         accessToken,
         refreshToken,
+        user: {
+          id: user.id,
+          email: user.email,
+          full_name: user.full_name,
+          country: user.country,
+          currency: user.currency || 'USD',
+          timezone: user.timezone,
+          locale: user.locale,
+        },
       };
 
     } catch (error) {

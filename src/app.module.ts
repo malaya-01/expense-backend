@@ -11,6 +11,9 @@ import { UserModule } from './api/user/user.module';
 import { ThrottleConfigModule } from './throttle/throttle.module';
 import { ExpenseModule } from './api/expense/expense.module';
 import { CategoriesModule } from './api/categories/categories.module';
+import { AccountsModule } from './api/accounts/accounts.module';
+import { TransactionsModule } from './api/transactions/transactions.module';
+import { FxModule } from './api/fx/fx.module';
 import { AuthorizationGuard } from './helper/guards/authorization.guard';
 
 
@@ -30,7 +33,10 @@ import { AuthorizationGuard } from './helper/guards/authorization.guard';
     UserModule,
     ThrottleConfigModule,
     ExpenseModule,
-    CategoriesModule
+    CategoriesModule,
+    AccountsModule,
+    TransactionsModule,
+    FxModule,
   ],
   controllers: [AppController],
   providers: [AppService,

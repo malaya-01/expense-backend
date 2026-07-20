@@ -1,7 +1,7 @@
 require('dotenv').config()
 export default () => ({
     PROJECT: 'Hospital Management System',
-    PORT: parseInt(process.env.PORT || '3000'),
+    PORT: parseInt(process.env.PORT || '9000'),
 
     ENVIRONMENT: process.env.NODE_ENV || 'development',
     CLIENT_HOST: process.env.CLIENT_HOST || 'http://localhost:6379',
