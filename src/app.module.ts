@@ -14,12 +14,21 @@ import { CategoriesModule } from './api/categories/categories.module';
 import { AccountsModule } from './api/accounts/accounts.module';
 import { TransactionsModule } from './api/transactions/transactions.module';
 import { FxModule } from './api/fx/fx.module';
+import { BudgetsModule } from './api/budgets/budgets.module';
+import { GoalsModule } from './api/goals/goals.module';
+import { InvestmentsModule } from './api/investments/investments.module';
+import { ReportsModule } from './api/reports/reports.module';
+import { AiAdvisorModule } from './api/ai-advisor/ai-advisor.module';
+import { LoansModule } from './api/loans/loans.module';
+import { RecurringModule } from './api/recurring/recurring.module';
+import { ScheduleModule } from '@nestjs/schedule';
 import { AuthorizationGuard } from './helper/guards/authorization.guard';
 
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
+    ScheduleModule.forRoot(),
     CacheModule.registerAsync({
       isGlobal: true,
       useFactory: async () => ({
@@ -37,6 +46,13 @@ import { AuthorizationGuard } from './helper/guards/authorization.guard';
     AccountsModule,
     TransactionsModule,
     FxModule,
+    BudgetsModule,
+    GoalsModule,
+    InvestmentsModule,
+    ReportsModule,
+    AiAdvisorModule,
+    LoansModule,
+    RecurringModule,
   ],
   controllers: [AppController],
   providers: [AppService,

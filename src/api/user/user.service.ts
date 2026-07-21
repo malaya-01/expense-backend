@@ -1,7 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { CreateUserDto } from './dto/create-user.dto';
-import { UpdateUserDto } from './dto/update-user.dto';
-import { Client, Pool } from 'pg';
+import { Pool } from 'pg';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
 
@@ -22,35 +20,15 @@ export class UserService {
     return users.rows
 
   }
-  create(createUserDto: CreateUserDto) {
-    return 'This action adds a new user';
-  }
-
-
-  async findAll() {
-    const client = await this.pgPool.connect()
-
-    try{
-      const allUsers = await client.query(`SELECT * FROM users WHERE is_delete = false AND is_active = true`)
-      return allUsers.rows;
-    }
-    catch(error: any){
-      throw new Error(error.message || 'Failed to fetch users')
-    }
-    finally{
-      client.release()
-    }
-  }
-
-  findOne(id: number) {
-    return `This action returns a #${id} user`;
-  }
-
-  update(id: number, updateUserDto: UpdateUserDto) {
-    return `This action updates a #${id} user`;
-  }
-
-  remove(id: number) {
-    return `This action removes a #${id} user`;
+  async findOne(id: string) {
+    const result = await this.pgPool.query(
+      `SELECT id, full_name, email, country, currency, timezone, locale,
+              email_verified, created_at, updated_at
+       FROM users
+       WHERE id = $1 AND deleted_at IS NULL`,
+      [id],
+    );
+    if (!result.rowCount) return null;
+    return result.rows[0];
   }
 }

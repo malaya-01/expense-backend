@@ -9,11 +9,12 @@ import { UserModule } from '../user/user.module';
   imports:[
     JwtModule.register({
       secret: appConfiguration().JWT.SECRET,
-      signOptions: { expiresIn: parseInt(appConfiguration().JWT.EXP) },
+      signOptions: { expiresIn: '15m' },
     }),
     UserModule
   ],
   controllers: [AuthController],
   providers: [AuthService],
+  exports: [JwtModule],
 })
 export class AuthModule {}

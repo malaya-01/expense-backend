@@ -1,6 +1,9 @@
 import { Module, Global } from '@nestjs/common';
-import { Pool } from 'pg';
+import { Pool, types } from 'pg';
 import appConfiguration from 'src/app.configuration';
+
+// DATE OID 1082 — keep calendar dates as YYYY-MM-DD strings.
+types.setTypeParser(1082, (value: string) => value);
 
 @Global()
 @Module({

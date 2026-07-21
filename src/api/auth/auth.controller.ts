@@ -15,6 +15,7 @@ export class AuthController {
 
   @Public()
   @Post('register')
+  @Throttle({ default: { limit: 3, ttl: 60_000 } })
   @ApiOperation({ summary: 'Register a new user' })
   async registerUser(@Body() registerAuthDto: RegisterAuthDto,@Res() res: Response) {
     try{
@@ -30,12 +31,18 @@ export class AuthController {
 
   @Public()
   @Post('login')
-  @Throttle({ default: { limit: 1, ttl: 60 } })
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @ApiOperation({ summary: 'User login' })
   async loginUser(@Body() loginUserDto: LoginAuthDto, @Req() req: Request, @Res() res: Response) {
     // return this.authService.login(loginUserDto, req);
     try{
       const result = await this.authService.login(loginUserDto, req)
+      res.cookie('refreshToken', result.refreshToken, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        maxAge: 7 * 24 * 60 * 60 * 1000,
+      });
       return res.status(HttpStatus.OK).send(successResponse(result, 'User loged in successfully.'))
     }catch(error){
       const message = error.message || 'An unexpected error occured'
@@ -44,7 +51,9 @@ export class AuthController {
     }
   }
 
+  @Public()
   @Post('generate-otp')
+  @Throttle({ default: { limit: 3, ttl: 60_000 } })
   @ApiOperation({ summary: 'Generate OTP for user' })
   async generateOtp(@Body() dto: OtpGenerateDto, @Res() res: Response) {
     // return this.authService.generateOtp(dto);
@@ -58,7 +67,9 @@ export class AuthController {
     }
   }
 
+  @Public()
   @Post('reset-password')
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @ApiOperation({ summary: 'Reset user password' })
   async resetPassword(@Body() dto: PasswordResetDto, @Res() res: Response){
     // return this.authService.resetPassword(dto);
@@ -72,7 +83,9 @@ export class AuthController {
     }
   }
 
+  @Public()
   @Post('refresh-token')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
   @ApiOperation({summary: "Refresh access token using refresh token."})
   async refreshToken(@Req() req: Request, @Res({passthrough: true}) res: Response) {
     // return this.authService.refreshToken(req, res);

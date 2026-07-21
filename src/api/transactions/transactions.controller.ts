@@ -71,6 +71,29 @@ export class TransactionsController {
     }
   }
 
+  @Get(':id/journal')
+  @ApiOperation({ summary: 'Get immutable journal history for a transaction' })
+  async findJournal(
+    @Param('id') id: string,
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    try {
+      const userId = req['user'].id as string;
+      const result = await this.transactionsService.findJournal(userId, id);
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(result, 'Journal history fetched.'));
+    } catch (error) {
+      const message = error.message || 'An unexpected error occured';
+      const statusCode =
+        error.statuscode || error.status || HttpStatus.BAD_REQUEST;
+      return res
+        .status(statusCode)
+        .send(errorResponse(message, statusCode, []));
+    }
+  }
+
   @Get(':id')
   @ApiOperation({ summary: 'Get one ledger transaction' })
   async findOne(

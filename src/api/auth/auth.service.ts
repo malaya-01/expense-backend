@@ -6,6 +6,7 @@ import {
   Injectable,
   InternalServerErrorException,
   NotFoundException,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { LoginAuthDto, PasswordResetDto, RegisterAuthDto } from './dto/create-auth.dto';
@@ -16,12 +17,14 @@ import { OtpGenerateDto } from './dto/generat-otp.dto';
 import { Cache } from 'cache-manager';
 import { JwtService } from '@nestjs/jwt';
 import { Request, Response } from 'express';
-import { randomUUID } from 'crypto';
+import { randomInt, randomUUID } from 'crypto';
+import * as nodemailer from 'nodemailer';
 import { UserService } from '../user/user.service';
 import {
   getCountry,
   isSupportedCurrency,
 } from 'src/common/currency/currency.data';
+import appConfiguration from 'src/app.configuration';
 
 @Injectable()
 export class AuthService {
@@ -75,25 +78,46 @@ export class AuthService {
   }
 
   async generateOtp(dto: OtpGenerateDto) {
-    const { email } = dto;
+    const email = dto.email.trim().toLowerCase();
+    if (
+      !process.env.SMTP_HOST ||
+      !process.env.SMTP_USER ||
+      !process.env.SMTP_PASSWORD
+    ) {
+      throw new ServiceUnavailableException(
+        'Password recovery email is not configured. Contact the application administrator.',
+      );
+    }
     const user = await this.pgPool.query(
       'SELECT id FROM users WHERE email = $1',
       [email]
     )
     if (user.rowCount === 0) {
-      throw new BadRequestException('User with this email does not exist');
+      return {
+        message:
+          'If an account exists for this email, a recovery code has been sent.',
+      };
     }
-    let otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otp = randomInt(100000, 1_000_000).toString();
     const key = `${email}-otp`;
-    await this.cacheManager.set(key, otp);
-    // Here, you would typically send the OTP via email or SMS
-
-    console.log(`OTP for ${email} is ${otp}`); // For demonstration purposes only
-    return { message: 'OTP generated and sent successfully', otp }; // Return OTP for testing purposes
+    await this.cacheManager.set(key, otp, 10 * 60 * 1000);
+    try {
+      await this.sendRecoveryCode(email, otp);
+    } catch {
+      await this.cacheManager.del(key);
+      throw new ServiceUnavailableException(
+        'Recovery email could not be sent. Please try again later.',
+      );
+    }
+    return {
+      message:
+        'If an account exists for this email, a recovery code has been sent.',
+    };
   }
 
   async resetPassword(dto: PasswordResetDto) {
-    const { email, newPassword, confirmNewPassword, otp } = dto;
+    const { newPassword, confirmNewPassword, otp } = dto;
+    const email = dto.email.trim().toLowerCase();
 
     if (newPassword !== confirmNewPassword) {
       throw new BadRequestException('New password and confirm new password do not match');
@@ -118,6 +142,28 @@ export class AuthService {
     } finally {
       client.release();
     }
+  }
+
+  private async sendRecoveryCode(email: string, otp: string) {
+    const port = Number(process.env.SMTP_PORT || 587);
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port,
+      secure:
+        process.env.SMTP_SECURE === 'true' ||
+        (process.env.SMTP_SECURE !== 'false' && port === 465),
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASSWORD,
+      },
+    });
+    await transporter.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: email,
+      subject: 'Your FinOS password recovery code',
+      text: `Your FinOS recovery code is ${otp}. It expires in 10 minutes. If you did not request this, ignore this email.`,
+      html: `<p>Your FinOS recovery code is:</p><p style="font-size:24px;font-weight:700;letter-spacing:4px">${otp}</p><p>It expires in 10 minutes. If you did not request this, ignore this email.</p>`,
+    });
   }
 
   async login(dto: LoginAuthDto, req: Request) {
@@ -208,8 +254,11 @@ export class AuthService {
           email: user.email,
         },
         {
-          expiresIn: '15 min',
-          secret: process.env.JWT_ACCESS_SECRET,
+          expiresIn: '15m',
+          secret:
+            process.env.JWT_ACCESS_SECRET ||
+            process.env.JWT_SECRET ||
+            appConfiguration().JWT.SECRET,
         },
       );
 
@@ -219,7 +268,10 @@ export class AuthService {
         },
         {
           expiresIn: '7d',
-          secret: process.env.JWT_REFRESH_SECRET,
+          secret:
+            process.env.JWT_REFRESH_SECRET ||
+            process.env.JWT_SECRET ||
+            appConfiguration().JWT.REFRESH_SECRET,
         },
       );
 
@@ -269,15 +321,19 @@ export class AuthService {
   }
 
   async refreshToken(req: Request, res: Response) {
-    const refreshToken = req.cookies['refreshToken'];
+    const refreshToken =
+      req.cookies?.['refreshToken'] || req.body?.refreshToken;
     if (!refreshToken) {
       throw new UnauthorizedException('Refresh token missing');
     }
     let payload: any;
     try {
       payload = await this.jwtService.verifyAsync(refreshToken, {
-        secret: process.env.JWT_REFRESH_SECRET,
-      })
+        secret:
+          process.env.JWT_REFRESH_SECRET ||
+          process.env.JWT_SECRET ||
+          appConfiguration().JWT.REFRESH_SECRET,
+      });
     } catch {
       throw new UnauthorizedException('Invalid refresh token');
     }
@@ -303,23 +359,34 @@ export class AuthService {
       throw new ForbiddenException('Refresh token expired');
     }
 
-    // new access tokens
-    const newAccessToken = await this.jwtService.signAsync({
-      sub: payload.sub,
-    }, {
-      expiresIn: '15m',
-      secret: process.env.JWT_ACCESS_SECRET,
-    });
+    const newAccessToken = await this.jwtService.signAsync(
+      {
+        sub: payload.sub,
+      },
+      {
+        expiresIn: '15m',
+        secret:
+          process.env.JWT_ACCESS_SECRET ||
+          process.env.JWT_SECRET ||
+          appConfiguration().JWT.SECRET,
+      },
+    );
 
     // new refresh token rotating.
-    const newRefreshToken = await this.jwtService.signAsync({
-      sub: payload.sub,
-    }, {
-      expiresIn: '7d',
-      secret: process.env.JWT_REFRESH_SECRET,
-    });
+    const newRefreshToken = await this.jwtService.signAsync(
+      {
+        sub: payload.sub,
+      },
+      {
+        expiresIn: '7d',
+        secret:
+          process.env.JWT_REFRESH_SECRET ||
+          process.env.JWT_SECRET ||
+          appConfiguration().JWT.REFRESH_SECRET,
+      },
+    );
 
-    const newRefreshTokenHashed = await bcrypt.hash(refreshToken, 10);
+    const newRefreshTokenHashed = await bcrypt.hash(newRefreshToken, 10);
 
     await this.pgPool.query(
       `UPDATE user_sessions
@@ -333,12 +400,13 @@ export class AuthService {
 
     res.cookie('refreshToken', newRefreshToken, {
       httpOnly: true,
-      secure: true,
-      sameSite: 'strict',
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
       maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     });
     return {
       accessToken: newAccessToken,
+      refreshToken: newRefreshToken,
     }
 
   }

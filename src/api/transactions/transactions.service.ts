@@ -12,6 +12,7 @@ import {
   getRate,
   roundMoney,
 } from 'src/common/currency/currency.data';
+import { requireDateOnly } from 'src/common/date/to-date-only';
 
 const LIABILITY_TYPES = new Set(['credit_card', 'loan', 'payable']);
 
@@ -28,6 +29,8 @@ type PostedTx = {
   currency: string;
   source_container_id?: string | null;
   destination_container_id?: string | null;
+  source_currency?: string | null;
+  destination_currency?: string | null;
   exchange_rate: number;
   fx_rate_to_base: number;
   amount_base: number;
@@ -51,7 +54,6 @@ export class TransactionsService {
     try {
       await client.query('BEGIN');
       const posted = await this.buildPostedTx(client, userId, dto);
-      await this.applyEffects(client, userId, posted, 1);
       const result = await client.query(
         `INSERT INTO ledger_transactions
           (user_id, type, amount, description, date, category_id,
@@ -75,6 +77,13 @@ export class TransactionsService {
           posted.fx_rate_to_base,
           posted.amount_base,
         ],
+      );
+      await this.postJournal(
+        client,
+        userId,
+        result.rows[0].id,
+        posted,
+        'transactions',
       );
       await client.query('COMMIT');
       return this.normalize(result.rows[0]);
@@ -148,6 +157,64 @@ export class TransactionsService {
     }
   }
 
+  async findJournal(userId: string, transactionId: string) {
+    const transaction = await this.pgPool.query(
+      `SELECT id FROM ledger_transactions
+       WHERE id = $1 AND user_id = $2`,
+      [transactionId, userId],
+    );
+    if (!transaction.rowCount) {
+      throw new NotFoundException('Transaction not found');
+    }
+
+    const result = await this.pgPool.query(
+      `SELECT
+         j.id,
+         j.transaction_id,
+         j.reversal_of_journal_id,
+         j.description,
+         j.source_module,
+         j.correlation_id,
+         j.status,
+         j.posted_at,
+         COALESCE(
+           json_agg(
+             json_build_object(
+               'id', l.id,
+               'sequence_number', l.sequence_number,
+               'container_id', l.container_id,
+               'container_name', c.name,
+               'account_code', l.account_code,
+               'debit_base', l.debit_base,
+               'credit_base', l.credit_base,
+               'native_amount', l.native_amount,
+               'currency', l.currency,
+               'metadata', l.metadata
+             )
+             ORDER BY l.sequence_number
+           ) FILTER (WHERE l.id IS NOT NULL),
+           '[]'::json
+         ) AS lines
+       FROM ledger_journals j
+       LEFT JOIN ledger_journal_lines l ON l.journal_id = j.id
+       LEFT JOIN financial_containers c ON c.id = l.container_id
+       WHERE j.user_id = $1 AND j.transaction_id = $2
+       GROUP BY j.id
+       ORDER BY j.created_at DESC`,
+      [userId, transactionId],
+    );
+
+    return result.rows.map((journal) => ({
+      ...journal,
+      lines: (journal.lines || []).map((line: Record<string, unknown>) => ({
+        ...line,
+        debit_base: Number(line.debit_base || 0),
+        credit_base: Number(line.credit_base || 0),
+        native_amount: Number(line.native_amount || 0),
+      })),
+    }));
+  }
+
   async update(userId: string, id: string, dto: UpdateTransactionDto) {
     const client = await this.pgPool.connect();
     try {
@@ -172,7 +239,7 @@ export class TransactionsService {
         fx_rate_to_base: Number(currentRow.fx_rate_to_base || 1),
         amount_base: Number(currentRow.amount_base || currentRow.amount),
         description: currentRow.description,
-        date: String(currentRow.date).slice(0, 10),
+        date: requireDateOnly(currentRow.date),
         category_id: currentRow.category_id,
         merchant: currentRow.merchant,
         notes: currentRow.notes,
@@ -214,8 +281,13 @@ export class TransactionsService {
       this.validateShape(merged);
       const nextPosted = await this.buildPostedTx(client, userId, merged);
 
-      await this.applyEffects(client, userId, currentPosted, -1);
-      await this.applyEffects(client, userId, nextPosted, 1);
+      await this.reverseJournal(
+        client,
+        userId,
+        id,
+        currentPosted,
+        'Transaction edited',
+      );
 
       const result = await client.query(
         `UPDATE ledger_transactions SET
@@ -252,6 +324,13 @@ export class TransactionsService {
           userId,
           id,
         ],
+      );
+      await this.postJournal(
+        client,
+        userId,
+        id,
+        nextPosted,
+        'transactions',
       );
       await client.query('COMMIT');
       return this.normalize(result.rows[0]);
@@ -290,9 +369,15 @@ export class TransactionsService {
         fx_rate_to_base: Number(row.fx_rate_to_base || 1),
         amount_base: Number(row.amount_base || row.amount),
         description: row.description,
-        date: String(row.date).slice(0, 10),
+        date: requireDateOnly(row.date),
       };
-      await this.applyEffects(client, userId, posted, -1);
+      await this.reverseJournal(
+        client,
+        userId,
+        id,
+        posted,
+        'Transaction deleted',
+      );
       await client.query(
         `UPDATE ledger_transactions
          SET deleted_at = NOW(), updated_at = NOW()
@@ -440,6 +525,8 @@ export class TransactionsService {
       currency: txCurrency,
       source_container_id: dto.source_container_id || null,
       destination_container_id: dto.destination_container_id || null,
+      source_currency: source?.currency || null,
+      destination_currency: destination?.currency || null,
       exchange_rate: exchangeRate,
       fx_rate_to_base: fxRateToBase,
       amount_base: amountBase,
@@ -493,6 +580,138 @@ export class TransactionsService {
     }
   }
 
+  private async postJournal(
+    client: PoolClient,
+    userId: string,
+    transactionId: string,
+    dto: PostedTx,
+    sourceModule: string,
+  ) {
+    const baseCurrency = await this.getUserBaseCurrency(client, userId);
+    const journal = await client.query(
+      `INSERT INTO ledger_journals
+        (user_id, transaction_id, description, source_module)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id`,
+      [userId, transactionId, dto.description, sourceModule],
+    );
+    const journalId = journal.rows[0].id as string;
+    const debitContainer =
+      dto.type === 'income' || dto.type === 'transfer'
+        ? dto.destination_container_id || null
+        : null;
+    const debitAccount =
+      dto.type === 'expense'
+        ? `expense:${dto.category_id || 'uncategorized'}`
+        : null;
+    const creditContainer =
+      dto.type === 'expense' || dto.type === 'transfer'
+        ? dto.source_container_id || null
+        : null;
+    const creditAccount =
+      dto.type === 'income'
+        ? `income:${dto.category_id || 'uncategorized'}`
+        : null;
+    const debitNativeAmount =
+      dto.type === 'transfer'
+        ? roundMoney(dto.amount * dto.exchange_rate)
+        : dto.amount;
+
+    await client.query(
+      `INSERT INTO ledger_journal_lines
+        (journal_id, container_id, account_code, debit_base, credit_base,
+         native_amount, currency, sequence_number, metadata)
+       VALUES
+        ($1, $2, $3, $4, 0, $5, $6, 1, $7::jsonb),
+        ($1, $8, $9, 0, $4, $10, $11, 2, $7::jsonb)`,
+      [
+        journalId,
+        debitContainer,
+        debitAccount,
+        dto.amount_base,
+        debitNativeAmount,
+        dto.type === 'transfer'
+          ? dto.destination_currency || baseCurrency
+          : dto.currency,
+        JSON.stringify({
+          transaction_type: dto.type,
+          category_id: dto.category_id || null,
+        }),
+        creditContainer,
+        creditAccount,
+        dto.amount,
+        dto.source_currency || dto.currency,
+      ],
+    );
+
+    // Container balances are read-model projections updated only by ledger posting.
+    await this.applyEffects(client, userId, dto, 1);
+  }
+
+  private async reverseJournal(
+    client: PoolClient,
+    userId: string,
+    transactionId: string,
+    dto: PostedTx,
+    reason: string,
+  ) {
+    const original = await client.query(
+      `SELECT id, description
+       FROM ledger_journals
+       WHERE user_id = $1
+         AND transaction_id = $2
+         AND reversal_of_journal_id IS NULL
+         AND status = 'posted'
+       ORDER BY created_at DESC
+       LIMIT 1
+       FOR UPDATE`,
+      [userId, transactionId],
+    );
+    if (!original.rowCount) {
+      throw new BadRequestException(
+        'Posted journal not found; transaction cannot be safely reversed.',
+      );
+    }
+
+    const originalId = original.rows[0].id as string;
+    const reversal = await client.query(
+      `INSERT INTO ledger_journals
+        (user_id, transaction_id, reversal_of_journal_id, description, source_module)
+       VALUES ($1, $2, $3, $4, 'transaction_reversal')
+       RETURNING id`,
+      [userId, transactionId, originalId, `${reason}: ${dto.description}`],
+    );
+    const reversalId = reversal.rows[0].id as string;
+
+    await client.query(
+      `INSERT INTO ledger_journal_lines
+        (journal_id, container_id, account_code, debit_base, credit_base,
+         native_amount, currency, sequence_number, metadata)
+       SELECT
+         $1,
+         container_id,
+         account_code,
+         credit_base,
+         debit_base,
+         native_amount,
+         currency,
+         sequence_number,
+         metadata || jsonb_build_object('reversal_of_journal_id', $2::text)
+       FROM ledger_journal_lines
+       WHERE journal_id = $2
+       ORDER BY sequence_number`,
+      [reversalId, originalId],
+    );
+
+    await this.applyEffects(client, userId, dto, -1);
+    await client.query(
+      `UPDATE ledger_journals
+       SET status = 'reversed'
+       WHERE id = $1 AND user_id = $2`,
+      [originalId, userId],
+    );
+  }
+
   private async adjustContainer(
     client: PoolClient,
     userId: string,
@@ -511,6 +730,14 @@ export class TransactionsService {
     const row = result.rows[0];
     const isLiability = LIABILITY_TYPES.has(row.type);
     const delta = isLiability ? -signedAmount : signedAmount;
+    const nextBalance = Number(row.balance) + delta;
+    if (nextBalance < -0.005) {
+      throw new BadRequestException(
+        isLiability
+          ? 'This payment exceeds the outstanding liability balance.'
+          : 'This transaction would make the source container balance negative.',
+      );
+    }
     await client.query(
       `UPDATE financial_containers
        SET balance = balance + $1, updated_at = NOW()
@@ -519,17 +746,14 @@ export class TransactionsService {
     );
   }
 
-  private normalize(row: Record<string, any>) {
+  private normalize(row: Record<string, any>): Record<string, any> {
     return {
       ...row,
       amount: Number(row.amount),
       exchange_rate: Number(row.exchange_rate ?? 1),
       fx_rate_to_base: Number(row.fx_rate_to_base ?? 1),
       amount_base: Number(row.amount_base ?? row.amount),
-      date:
-        typeof row.date === 'string'
-          ? row.date.slice(0, 10)
-          : new Date(row.date).toISOString().slice(0, 10),
+      date: requireDateOnly(row.date),
     };
   }
 }
