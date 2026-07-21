@@ -1,17 +1,48 @@
 /**
  * Enhanced migration runner that ensures consistency
  * Verifies migration files match database records before running
- * 
+ *
  * Usage:
  *   node scripts/run-migrations.js up
  *   node scripts/run-migrations.js down
+ *
+ * Use Supabase:
+ *   Set USE_SUPABASE=true in .env (loads .env.supabase)
  */
 
-require('dotenv').config();
-const { execSync } = require('child_process');
-const { Pool } = require('pg');
 const fs = require('fs');
 const path = require('path');
+const { existsSync } = fs;
+
+function resolveEnvPath(fileName) {
+  const candidates = [
+    path.resolve(process.cwd(), fileName),
+    path.resolve(process.cwd(), 'expense-backend', fileName),
+  ];
+  return candidates.find(existsSync);
+}
+
+const basePath = resolveEnvPath('.env');
+require('dotenv').config(basePath ? { path: basePath } : undefined);
+
+const useSupabase =
+  String(process.env.USE_SUPABASE || '')
+    .trim()
+    .toLowerCase() === 'true';
+if (useSupabase) {
+  const supabasePath = resolveEnvPath('.env.supabase');
+  if (supabasePath) {
+    require('dotenv').config({ path: supabasePath, override: true });
+  }
+}
+
+const { execSync } = require('child_process');
+const { Pool } = require('pg');
+
+const useSsl =
+  String(process.env.PG_SSL || '')
+    .trim()
+    .toLowerCase() === 'true' || useSupabase;
 
 const pool = new Pool({
   host: process.env.PG_HOST,
@@ -19,6 +50,7 @@ const pool = new Pool({
   user: process.env.PG_USERNAME,
   password: process.env.PG_PASSWORD,
   database: process.env.PG_DATABASE,
+  ...(useSsl ? { ssl: { rejectUnauthorized: false } } : {}),
 });
 
 const migrationsDir = path.join(__dirname, '../src/database/migrations');
@@ -116,8 +148,15 @@ async function runMigrations() {
     console.log(`\n🔄 Running migrations: ${command.toUpperCase()}`);
     console.log('=====================================\n');
 
-    const dbUrl = process.env.DB_URL || 
-      `postgres://${process.env.PG_USERNAME}:${process.env.PG_PASSWORD}@${process.env.PG_HOST}:${process.env.PG_PORT}/${process.env.PG_DATABASE}`;
+    let dbUrl =
+      process.env.DB_URL ||
+      `postgres://${process.env.PG_USERNAME}:${encodeURIComponent(
+        process.env.PG_PASSWORD || '',
+      )}@${process.env.PG_HOST}:${process.env.PG_PORT}/${process.env.PG_DATABASE}`;
+
+    if (useSsl && !/[?&]sslmode=/i.test(dbUrl)) {
+      dbUrl += (dbUrl.includes('?') ? '&' : '?') + 'sslmode=require';
+    }
 
     process.env.DB_URL = dbUrl;
 

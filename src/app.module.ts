@@ -3,7 +3,7 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { ConfigModule } from '@nestjs/config';
 import { CacheModule } from '@nestjs/cache-manager';
-import * as redisStore from 'cache-manager-ioredis';
+import { createKeyv } from '@keyv/redis';
 import appConfiguration from './app.configuration';
 import { DatabaseModule } from './database/database.module';
 import { AuthModule } from './api/auth/auth.module';
@@ -31,11 +31,19 @@ import { AuthorizationGuard } from './helper/guards/authorization.guard';
     ScheduleModule.forRoot(),
     CacheModule.registerAsync({
       isGlobal: true,
-      useFactory: async () => ({
-        store: redisStore,
-        url: appConfiguration().CACHE.REDIS_URL,
-        ttl: 0,
-      }),
+      useFactory: async () => {
+        const redisUrl = appConfiguration().CACHE.REDIS_URL;
+        const store = createKeyv(redisUrl, {
+          namespace: 'finos',
+        });
+        store.on('error', (error: Error) => {
+          console.error('Redis cache error:', error.message);
+        });
+        return {
+          stores: [store],
+          ttl: appConfiguration().CACHE.REDIS_TTL * 1000,
+        };
+      },
     }),
     DatabaseModule,
     AuthModule,

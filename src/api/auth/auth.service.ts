@@ -340,7 +340,7 @@ export class AuthService {
 
     const sessionResult = await this.pgPool.query(
       `SELECT id, refresh_token FROM user_sessions
-      WHERE user_id = $1 AND revocked_at IS NULL AND expires_at > NOW()`,
+      WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > NOW()`,
       [payload.sub]
     )
 
@@ -353,10 +353,6 @@ export class AuthService {
 
     if (!isRefreshTokenValid) {
       throw new UnauthorizedException('Invalid refresh token');
-    }
-
-    if (new Date(session.revoked_at) < new Date()) {
-      throw new ForbiddenException('Refresh token expired');
     }
 
     const newAccessToken = await this.jwtService.signAsync(

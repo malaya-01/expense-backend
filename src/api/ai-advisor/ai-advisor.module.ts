@@ -10,6 +10,7 @@ import { GoalsModule } from '../goals/goals.module';
 import { InvestmentsModule } from '../investments/investments.module';
 import { ReportsModule } from '../reports/reports.module';
 import { TransactionsModule } from '../transactions/transactions.module';
+import { AiWebSearchService } from './ai-web-search.service';
 
 @Module({
   imports: [
@@ -22,7 +23,12 @@ import { TransactionsModule } from '../transactions/transactions.module';
     TransactionsModule,
   ],
   controllers: [AiAdvisorController],
-  providers: [AiAdvisorService, AiSettingsService, AiToolsService],
+  providers: [
+    AiAdvisorService,
+    AiSettingsService,
+    AiToolsService,
+    AiWebSearchService,
+  ],
   exports: [AiAdvisorService, AiSettingsService],
 })
 export class AiAdvisorModule {}

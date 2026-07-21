@@ -11,16 +11,28 @@ types.setTypeParser(1082, (value: string) => value);
     {
       provide: 'PG_POOL',
       useFactory: async () => {
+        const db = appConfiguration().DB;
         const pool = new Pool({
-          host: appConfiguration().DB.HOST,
-          port: Number(appConfiguration().DB.PORT),
-          user: appConfiguration().DB.USERNAME,
-          password: appConfiguration().DB.PASSWORD,
-          database: appConfiguration().DB.DATABASE,
+          host: db.HOST,
+          port: Number(db.PORT),
+          user: db.USERNAME,
+          password: db.PASSWORD,
+          database: db.DATABASE,
+          ...(db.SSL
+            ? {
+                ssl: {
+                  rejectUnauthorized: false,
+                },
+              }
+            : {}),
         });
 
         await pool.query('SELECT 1');
-        console.log('✅ PostgreSQL Connected');
+        console.log(
+          `✅ PostgreSQL Connected (${db.HOST}:${db.PORT}/${db.DATABASE}${
+            db.SSL ? ', ssl' : ''
+          })`,
+        );
 
         return pool;
       },

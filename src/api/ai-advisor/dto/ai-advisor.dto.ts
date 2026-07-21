@@ -111,6 +111,13 @@ export class ChatMessageDto {
   @ValidateNested({ each: true })
   @Type(() => ChatAttachmentDto)
   attachments?: ChatAttachmentDto[];
+
+  @ApiPropertyOptional({
+    description: 'Ground the answer with current public web sources',
+  })
+  @IsOptional()
+  @IsBoolean()
+  web_search?: boolean;
 }
 
 export class ChatAttachmentDto {
@@ -145,4 +152,49 @@ export class UpdateAiMemoryPreferenceDto {
   @ApiProperty()
   @IsBoolean()
   enabled: boolean;
+}
+
+export class RenameConversationDto {
+  @ApiProperty({ example: 'June cashflow review' })
+  @IsString()
+  @MinLength(1)
+  @MaxLength(200)
+  title: string;
+}
+
+export class PinConversationDto {
+  @ApiProperty()
+  @IsBoolean()
+  pinned: boolean;
+}
+
+export class ArchiveConversationDto {
+  @ApiProperty()
+  @IsBoolean()
+  archived: boolean;
+}
+
+export class UploadAiDocumentDto {
+  @ApiProperty()
+  @IsString()
+  @MaxLength(180)
+  name: string;
+
+  @ApiProperty()
+  @IsString()
+  @Matches(
+    /^(image\/(png|jpeg|webp|gif)|application\/pdf|text\/plain|text\/csv|application\/json)$/,
+    { message: 'Unsupported document type.' },
+  )
+  mime_type: string;
+
+  @ApiProperty({ description: 'Base64 payload without a data URL prefix' })
+  @IsString()
+  @MaxLength(7_000_000)
+  data_base64: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  conversation_id?: string;
 }

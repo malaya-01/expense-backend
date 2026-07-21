@@ -87,7 +87,7 @@ export class AuthController {
   @Post('refresh-token')
   @Throttle({ default: { limit: 20, ttl: 60_000 } })
   @ApiOperation({summary: "Refresh access token using refresh token."})
-  async refreshToken(@Req() req: Request, @Res({passthrough: true}) res: Response) {
+  async refreshToken(@Req() req: Request, @Res() res: Response) {
     // return this.authService.refreshToken(req, res);
     try{
       const result = await this.authService.refreshToken(req, res)

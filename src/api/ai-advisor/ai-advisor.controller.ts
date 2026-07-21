@@ -6,6 +6,7 @@ import {
   Param,
   Patch,
   Post,
+  Query,
   Req,
   Res,
   HttpStatus,
@@ -20,11 +21,15 @@ import { Response, Request as ExpressRequest } from 'express';
 import { AiSettingsService } from './ai-settings.service';
 import { AiAdvisorService } from './ai-advisor.service';
 import {
+  ArchiveConversationDto,
   ChatMessageDto,
   CreateAiMemoryDto,
+  PinConversationDto,
+  RenameConversationDto,
   SelectActiveProviderDto,
   UpdateAiMemoryPreferenceDto,
   UpdateMasterPromptDto,
+  UploadAiDocumentDto,
   UpsertProviderConfigDto,
 } from './dto/ai-advisor.dto';
 import { AI_PROVIDERS, AiProviderId } from './providers/types';
@@ -252,10 +257,17 @@ export class AiAdvisorController {
   }
 
   @Get('conversations')
-  async conversations(@Req() req: ExpressRequest, @Res() res: Response) {
+  async conversations(
+    @Req() req: ExpressRequest,
+    @Res() res: Response,
+    @Query('q') q?: string,
+  ) {
     try {
       const userId = (req as any).user.id as string;
-      const data = await this.advisorService.listConversations(userId);
+      const data = await this.advisorService.listConversations(
+        userId,
+        q?.trim() || undefined,
+      );
       return res
         .status(HttpStatus.OK)
         .send(successResponse(data, 'Conversations loaded.'));
@@ -281,6 +293,92 @@ export class AiAdvisorController {
     }
   }
 
+  @Patch('conversations/:id')
+  @ApiOperation({ summary: 'Rename a conversation' })
+  async renameConversation(
+    @Param('id') id: string,
+    @Body() dto: RenameConversationDto,
+    @Req() req: ExpressRequest,
+    @Res() res: Response,
+  ) {
+    try {
+      const data = await this.advisorService.renameConversation(
+        (req as any).user.id as string,
+        id,
+        dto.title,
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Conversation renamed.'));
+    } catch (error) {
+      return this.fail(res, error);
+    }
+  }
+
+  @Post('conversations/:id/pin')
+  @ApiOperation({ summary: 'Pin or unpin a conversation' })
+  async pinConversation(
+    @Param('id') id: string,
+    @Body() dto: PinConversationDto,
+    @Req() req: ExpressRequest,
+    @Res() res: Response,
+  ) {
+    try {
+      const data = await this.advisorService.pinConversation(
+        (req as any).user.id as string,
+        id,
+        dto.pinned,
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, dto.pinned ? 'Pinned.' : 'Unpinned.'));
+    } catch (error) {
+      return this.fail(res, error);
+    }
+  }
+
+  @Post('conversations/:id/duplicate')
+  @ApiOperation({ summary: 'Duplicate a conversation' })
+  async duplicateConversation(
+    @Param('id') id: string,
+    @Req() req: ExpressRequest,
+    @Res() res: Response,
+  ) {
+    try {
+      const data = await this.advisorService.duplicateConversation(
+        (req as any).user.id as string,
+        id,
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Conversation duplicated.'));
+    } catch (error) {
+      return this.fail(res, error);
+    }
+  }
+
+  @Post('conversations/:id/archive')
+  @ApiOperation({ summary: 'Archive or restore a conversation' })
+  async archiveConversation(
+    @Param('id') id: string,
+    @Body() dto: ArchiveConversationDto,
+    @Req() req: ExpressRequest,
+    @Res() res: Response,
+  ) {
+    try {
+      const data = await this.advisorService.archiveConversation(
+        (req as any).user.id as string,
+        id,
+        dto.archived,
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, dto.archived ? 'Archived.' : 'Restored.'));
+    } catch (error) {
+      return this.fail(res, error);
+    }
+  }
+
   @Delete('conversations/:id')
   async deleteConversation(
     @Param('id') id: string,
@@ -293,6 +391,98 @@ export class AiAdvisorController {
       return res
         .status(HttpStatus.OK)
         .send(successResponse(data, 'Conversation deleted.'));
+    } catch (error) {
+      return this.fail(res, error);
+    }
+  }
+
+  @Get('proposals/pending')
+  @ApiOperation({ summary: 'List pending action proposals across conversations' })
+  async pendingProposals(@Req() req: ExpressRequest, @Res() res: Response) {
+    try {
+      const data = await this.advisorService.listPendingProposals(
+        (req as any).user.id as string,
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Pending actions loaded.'));
+    } catch (error) {
+      return this.fail(res, error);
+    }
+  }
+
+  @Get('documents')
+  @ApiOperation({ summary: 'List recent AI documents' })
+  async listDocuments(@Req() req: ExpressRequest, @Res() res: Response) {
+    try {
+      const data = await this.advisorService.listDocuments(
+        (req as any).user.id as string,
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Documents loaded.'));
+    } catch (error) {
+      return this.fail(res, error);
+    }
+  }
+
+  @Get('documents/:id')
+  @ApiOperation({ summary: 'Get document metadata and analysis' })
+  async getDocument(
+    @Param('id') id: string,
+    @Req() req: ExpressRequest,
+    @Res() res: Response,
+  ) {
+    try {
+      const data = await this.advisorService.getDocument(
+        (req as any).user.id as string,
+        id,
+        false,
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Document loaded.'));
+    } catch (error) {
+      return this.fail(res, error);
+    }
+  }
+
+  @Post('documents')
+  @ApiOperation({ summary: 'Upload a document into the AI library' })
+  @ApiBody({ type: UploadAiDocumentDto })
+  async uploadDocument(
+    @Body() dto: UploadAiDocumentDto,
+    @Req() req: ExpressRequest,
+    @Res() res: Response,
+  ) {
+    try {
+      const data = await this.advisorService.uploadDocument(
+        (req as any).user.id as string,
+        dto,
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Document uploaded.'));
+    } catch (error) {
+      return this.fail(res, error);
+    }
+  }
+
+  @Delete('documents/:id')
+  @ApiOperation({ summary: 'Soft-delete an AI document' })
+  async deleteDocument(
+    @Param('id') id: string,
+    @Req() req: ExpressRequest,
+    @Res() res: Response,
+  ) {
+    try {
+      const data = await this.advisorService.deleteDocument(
+        (req as any).user.id as string,
+        id,
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Document deleted.'));
     } catch (error) {
       return this.fail(res, error);
     }
@@ -337,9 +527,13 @@ export class AiAdvisorController {
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
+    res.setHeader('Content-Encoding', 'identity');
+    res.socket?.setNoDelay(true);
+    res.socket?.setKeepAlive(true);
     if (typeof (res as any).flushHeaders === 'function') {
       (res as any).flushHeaders();
     }
+    res.write(': connected\n\n');
 
     try {
       for await (const event of this.advisorService.chatStream(
@@ -349,6 +543,10 @@ export class AiAdvisorController {
       )) {
         if (ac.signal.aborted || res.writableEnded) break;
         res.write(`data: ${JSON.stringify(event)}\n\n`);
+        if (typeof (res as any).flush === 'function') {
+          (res as any).flush();
+        }
+        await new Promise<void>((resolve) => setImmediate(resolve));
       }
     } catch (error: any) {
       if (!res.writableEnded) {

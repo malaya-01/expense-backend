@@ -1,12 +1,5 @@
-import { existsSync } from 'fs';
-import { resolve } from 'path';
+import './load-env';
 
-const envCandidates = [
-  resolve(process.cwd(), '.env'),
-  resolve(process.cwd(), 'expense-backend', '.env'),
-];
-const envPath = envCandidates.find(existsSync);
-require('dotenv').config(envPath ? { path: envPath } : undefined);
 export default () => ({
   PROJECT: 'FinOS',
   PORT: parseInt(process.env.PORT || '9000'),
@@ -39,6 +32,13 @@ export default () => ({
     PASSWORD: process.env.PG_PASSWORD,
     DATABASE: process.env.PG_DATABASE,
     URL: process.env.DB_URL,
+    SSL:
+      String(process.env.PG_SSL || '')
+        .trim()
+        .toLowerCase() === 'true' ||
+      String(process.env.USE_SUPABASE || '')
+        .trim()
+        .toLowerCase() === 'true',
   },
   AI: {
     CREDENTIALS_ENCRYPTION_KEY: process.env.AI_CREDENTIALS_ENCRYPTION_KEY || '',

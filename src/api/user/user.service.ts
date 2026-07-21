@@ -14,11 +14,17 @@ export class UserService {
 
   async syncUsersToCache() {
     const cacheKey = 'all_users';
-    const users = await this.pgPool.query(`SELECT id FROM users WHERE is_delete = false AND is_active = true`);
-    await this.cacheManager.set(cacheKey, users.rows)
-    console.log('Users synced to cache successfully', await this.cacheManager.get(cacheKey))
-    return users.rows
-
+    const users = await this.pgPool.query(
+      `SELECT id FROM users
+       WHERE COALESCE(is_delete, false) = false
+         AND COALESCE(is_active, true) = true
+         AND deleted_at IS NULL`,
+    );
+    await this.cacheManager.set(cacheKey, users.rows);
+    console.log(
+      `Users synced to Redis cache (${users.rowCount ?? users.rows.length})`,
+    );
+    return users.rows;
   }
   async findOne(id: string) {
     const result = await this.pgPool.query(

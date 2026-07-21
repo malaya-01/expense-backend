@@ -17,6 +17,10 @@ export type ToolActivity = {
 export type Citation = {
   label: string;
   href: string;
+  snippet?: string;
+  domain?: string;
+  image_url?: string;
+  source_type?: 'module' | 'web';
 };
 
 @Injectable()
@@ -38,12 +42,12 @@ export class AiToolsService {
   }> {
     const activity: ToolActivity[] = [];
     const citations: Citation[] = [
-      { label: 'Reports', href: '/reports' },
-      { label: 'Accounts', href: '/accounts' },
-      { label: 'Transactions', href: '/expenses' },
-      { label: 'Budgets', href: '/budgets' },
-      { label: 'Goals', href: '/goals' },
-      { label: 'Investments', href: '/investments' },
+      { label: 'Reports', href: '/reports', source_type: 'module' },
+      { label: 'Accounts', href: '/accounts', source_type: 'module' },
+      { label: 'Transactions', href: '/expenses', source_type: 'module' },
+      { label: 'Budgets', href: '/budgets', source_type: 'module' },
+      { label: 'Goals', href: '/goals', source_type: 'module' },
+      { label: 'Investments', href: '/investments', source_type: 'module' },
     ];
 
     const context: Record<string, unknown> = {};
