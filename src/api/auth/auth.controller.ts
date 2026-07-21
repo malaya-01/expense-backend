@@ -8,6 +8,7 @@ import { Request, Response } from 'express';
 import { Throttle } from '@nestjs/throttler';
 import { errorResponse, successResponse } from 'src/utils/response/response';
 import { Public } from 'src/helper/decorators/public.decorator';
+import { REFRESH_COOKIE_NAME, refreshCookieOptions } from './refresh-cookie';
 
 @Controller('auth')
 export class AuthController {
@@ -37,12 +38,7 @@ export class AuthController {
     // return this.authService.login(loginUserDto, req);
     try{
       const result = await this.authService.login(loginUserDto, req)
-      res.cookie('refreshToken', result.refreshToken, {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
-        maxAge: 7 * 24 * 60 * 60 * 1000,
-      });
+      res.cookie(REFRESH_COOKIE_NAME, result.refreshToken, refreshCookieOptions());
       return res.status(HttpStatus.OK).send(successResponse(result, 'User loged in successfully.'))
     }catch(error){
       const message = error.message || 'An unexpected error occured'

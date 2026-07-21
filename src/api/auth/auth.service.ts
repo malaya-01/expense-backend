@@ -25,6 +25,7 @@ import {
   isSupportedCurrency,
 } from 'src/common/currency/currency.data';
 import appConfiguration from 'src/app.configuration';
+import { REFRESH_COOKIE_NAME, refreshCookieOptions } from './refresh-cookie';
 
 @Injectable()
 export class AuthService {
@@ -340,7 +341,8 @@ export class AuthService {
 
     const sessionResult = await this.pgPool.query(
       `SELECT id, refresh_token FROM user_sessions
-      WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > NOW()`,
+      WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > NOW()
+      ORDER BY created_at DESC`,
       [payload.sub]
     )
 
@@ -348,10 +350,17 @@ export class AuthService {
       throw new UnauthorizedException('Session not found');
     }
 
-    const session = sessionResult.rows[0];
-    const isRefreshTokenValid = await bcrypt.compare(refreshToken, session.refresh_token);
+    // A user can have multiple active sessions (different devices/logins).
+    // Find the one whose stored hash matches this refresh token.
+    let session: { id: string; refresh_token: string } | undefined;
+    for (const candidate of sessionResult.rows) {
+      if (await bcrypt.compare(refreshToken, candidate.refresh_token)) {
+        session = candidate;
+        break;
+      }
+    }
 
-    if (!isRefreshTokenValid) {
+    if (!session) {
       throw new UnauthorizedException('Invalid refresh token');
     }
 
@@ -394,12 +403,7 @@ export class AuthService {
     )
 
 
-    res.cookie('refreshToken', newRefreshToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-    });
+    res.cookie(REFRESH_COOKIE_NAME, newRefreshToken, refreshCookieOptions());
     return {
       accessToken: newAccessToken,
       refreshToken: newRefreshToken,

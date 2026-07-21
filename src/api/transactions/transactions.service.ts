@@ -658,8 +658,8 @@ export class TransactionsService {
     const original = await client.query(
       `SELECT id, description
        FROM ledger_journals
-       WHERE user_id = $1
-         AND transaction_id = $2
+       WHERE user_id = $1::uuid
+         AND transaction_id = $2::uuid
          AND reversal_of_journal_id IS NULL
          AND status = 'posted'
        ORDER BY created_at DESC
@@ -677,7 +677,7 @@ export class TransactionsService {
     const reversal = await client.query(
       `INSERT INTO ledger_journals
         (user_id, transaction_id, reversal_of_journal_id, description, source_module)
-       VALUES ($1, $2, $3, $4, 'transaction_reversal')
+       VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 'transaction_reversal')
        RETURNING id`,
       [userId, transactionId, originalId, `${reason}: ${dto.description}`],
     );
@@ -688,7 +688,7 @@ export class TransactionsService {
         (journal_id, container_id, account_code, debit_base, credit_base,
          native_amount, currency, sequence_number, metadata)
        SELECT
-         $1,
+         $1::uuid,
          container_id,
          account_code,
          credit_base,
@@ -696,9 +696,9 @@ export class TransactionsService {
          native_amount,
          currency,
          sequence_number,
-         metadata || jsonb_build_object('reversal_of_journal_id', $2::text)
+         metadata || jsonb_build_object('reversal_of_journal_id', $2::uuid::text)
        FROM ledger_journal_lines
-       WHERE journal_id = $2
+       WHERE journal_id = $2::uuid
        ORDER BY sequence_number`,
       [reversalId, originalId],
     );
@@ -707,7 +707,7 @@ export class TransactionsService {
     await client.query(
       `UPDATE ledger_journals
        SET status = 'reversed'
-       WHERE id = $1 AND user_id = $2`,
+       WHERE id = $1::uuid AND user_id = $2::uuid`,
       [originalId, userId],
     );
   }
