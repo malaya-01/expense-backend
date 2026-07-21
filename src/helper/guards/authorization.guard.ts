@@ -1,3 +1,4 @@
+/* eslint-disable prettier/prettier */
 import { Injectable, CanActivate, Inject, ExecutionContext, UnauthorizedException } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
 import { Cache } from "cache-manager";
