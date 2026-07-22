@@ -80,6 +80,43 @@ export class AuthController {
   }
 
   @Public()
+  @Post('verify-email')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({ summary: 'Verify email with token from verification link' })
+  async verifyEmail(@Body() body: { token?: string }, @Res() res: Response) {
+    try {
+      const result = await this.authService.verifyEmail(body?.token || '');
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(result, 'Email verified successfully'));
+    } catch (error) {
+      const statusCode = error.status || error.statusCode || HttpStatus.BAD_REQUEST;
+      const message = error.message || 'An unexpected error occured.';
+      return res.status(statusCode).send(errorResponse(message, statusCode));
+    }
+  }
+
+  @Public()
+  @Post('resend-verification')
+  @Throttle({ default: { limit: 3, ttl: 60_000 } })
+  @ApiOperation({ summary: 'Resend email verification link' })
+  async resendVerification(
+    @Body() body: { email?: string },
+    @Res() res: Response,
+  ) {
+    try {
+      const result = await this.authService.resendVerification(body?.email || '');
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(result, 'Verification email processed'));
+    } catch (error) {
+      const statusCode = error.status || error.statusCode || HttpStatus.BAD_REQUEST;
+      const message = error.message || 'An unexpected error occured.';
+      return res.status(statusCode).send(errorResponse(message, statusCode));
+    }
+  }
+
+  @Public()
   @Post('refresh-token')
   @Throttle({ default: { limit: 20, ttl: 60_000 } })
   @ApiOperation({summary: "Refresh access token using refresh token."})

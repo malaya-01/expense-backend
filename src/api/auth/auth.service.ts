@@ -17,8 +17,7 @@ import { OtpGenerateDto } from './dto/generat-otp.dto';
 import { Cache } from 'cache-manager';
 import { JwtService } from '@nestjs/jwt';
 import { Request, Response } from 'express';
-import { randomInt, randomUUID } from 'crypto';
-import * as nodemailer from 'nodemailer';
+import { randomBytes, randomInt, randomUUID } from 'crypto';
 import { UserService } from '../user/user.service';
 import {
   getCountry,
@@ -26,6 +25,14 @@ import {
 } from 'src/common/currency/currency.data';
 import appConfiguration from 'src/app.configuration';
 import { REFRESH_COOKIE_NAME, refreshCookieOptions } from './refresh-cookie';
+import {
+  buildVerificationEmailHtml,
+  isMailConfigured,
+  sendMail,
+} from 'src/utils/mail/mail.util';
+
+const EMAIL_VERIFY_TTL_MS = 60 * 60 * 1000; // 1 hour
+const EMAIL_VERIFY_TTL_HOURS = 1;
 
 @Injectable()
 export class AuthService {
@@ -47,6 +54,12 @@ export class AuthService {
       throw new BadRequestException('Password and confirm password do not match');
     }
 
+    if (!isMailConfigured()) {
+      throw new ServiceUnavailableException(
+        'Email delivery is not configured. Contact the application administrator.',
+      );
+    }
+
     const countryCode = country.toUpperCase();
     const countryMeta = getCountry(countryCode);
     if (!countryMeta) {
@@ -61,20 +74,142 @@ export class AuthService {
     const client = await this.pgPool.connect();
     try {
       const result = await client.query(
-        `INSERT INTO users (full_name, email, password_hash, country, currency)
-         VALUES ($1, $2, $3, $4, $5)
-         RETURNING id, full_name, email, country, currency, timezone, locale`,
+        `INSERT INTO users (full_name, email, password_hash, country, currency, email_verified)
+         VALUES ($1, $2, $3, $4, $5, FALSE)
+         RETURNING id, full_name, email, country, currency, timezone, locale, email_verified`,
         [full_name, email, passwordHash, countryCode, baseCurrency],
       );
-      return result.rows[0];
+      const user = result.rows[0];
+      await this.sendVerificationEmail(user.id, user.email, user.full_name);
+      return {
+        ...user,
+        message:
+          'Account created. Please verify your email before signing in.',
+      };
     } catch (error: any) {
       if (error?.code === '23505') {
         throw new ConflictException('Email already exists');
+      }
+      if (
+        error instanceof ServiceUnavailableException ||
+        error instanceof BadRequestException
+      ) {
+        throw error;
       }
       throw new InternalServerErrorException('Failed to register user');
     } finally {
       client.release();
       await this.userService.syncUsersToCache()
+    }
+  }
+
+  async verifyEmail(token: string) {
+    const raw = (token || '').trim();
+    if (!raw) throw new BadRequestException('Verification token is required');
+    const payload = await this.cacheManager.get<{
+      userId: string;
+      email: string;
+    }>(`email-verify:${raw}`);
+    if (!payload?.userId) {
+      throw new BadRequestException(
+        'Verification link is invalid or has expired. Request a new one from the sign-in page.',
+      );
+    }
+    // Idempotent: safe to call twice (React Strict Mode / double-click).
+    // Keep the token until TTL so a second request still succeeds.
+    await this.pgPool.query(
+      `UPDATE users SET email_verified = TRUE, updated_at = NOW() WHERE id = $1`,
+      [payload.userId],
+    );
+    await this.userService.syncUsersToCache();
+    return {
+      message: 'Email verified successfully. You can sign in now.',
+      email: payload.email,
+    };
+  }
+
+  async resendVerification(emailInput: string) {
+    const email = emailInput.trim().toLowerCase();
+    const userResult = await this.pgPool.query(
+      `SELECT id, email, full_name, email_verified FROM users WHERE email = $1 AND deleted_at IS NULL`,
+      [email],
+    );
+    if (userResult.rowCount === 0) {
+      return {
+        message:
+          'If an unverified account exists for this email, a verification link has been sent.',
+      };
+    }
+    const user = userResult.rows[0];
+    if (user.email_verified) {
+      return { message: 'This email is already verified. You can sign in.' };
+    }
+    await this.sendVerificationEmail(user.id, user.email, user.full_name);
+    return {
+      message:
+        'If an unverified account exists for this email, a verification link has been sent.',
+    };
+  }
+
+  private async sendVerificationEmail(
+    userId: string,
+    email: string,
+    fullName?: string | null,
+  ) {
+    if (!isMailConfigured()) {
+      throw new ServiceUnavailableException(
+        'Email delivery is not configured. Contact the application administrator.',
+      );
+    }
+    const previous = await this.cacheManager.get<string>(
+      `email-verify-user:${userId}`,
+    );
+    if (previous) {
+      await this.cacheManager.del(`email-verify:${previous}`);
+    }
+    const token = randomBytes(32).toString('hex');
+    await this.cacheManager.set(
+      `email-verify:${token}`,
+      { userId, email },
+      EMAIL_VERIFY_TTL_MS,
+    );
+    await this.cacheManager.set(
+      `email-verify-user:${userId}`,
+      token,
+      EMAIL_VERIFY_TTL_MS,
+    );
+
+    const clientHost = (
+      process.env.CLIENT_HOST ||
+      process.env.FRONTEND_URL ||
+      'http://localhost:3000'
+    ).replace(/\/$/, '');
+    const verifyUrl = `${clientHost}/verify-email?token=${token}`;
+    const text = `Hi ${fullName || 'there'},\n\nVerify your FinOS email by opening this link (expires in ${EMAIL_VERIFY_TTL_HOURS} hour):\n${verifyUrl}\n\nIf you did not create this account, ignore this email.`;
+
+    try {
+      await sendMail({
+        to: email,
+        subject: 'Verify your FinOS email',
+        text,
+        html: buildVerificationEmailHtml({
+          fullName,
+          verifyUrl,
+          expiresHours: EMAIL_VERIFY_TTL_HOURS,
+        }),
+      });
+    } catch {
+      await this.cacheManager.del(`email-verify:${token}`);
+      await this.cacheManager.del(`email-verify-user:${userId}`);
+      throw new ServiceUnavailableException(
+        'Verification email could not be sent. Please try again later.',
+      );
+    }
+
+    if (process.env.NODE_ENV !== 'production') {
+      // Helpful for local testing when the mailbox is hard to reach.
+      // eslint-disable-next-line no-console
+      console.info(`[FinOS] Email verification link for ${email}: ${verifyUrl}`);
     }
   }
 
@@ -146,20 +281,12 @@ export class AuthService {
   }
 
   private async sendRecoveryCode(email: string, otp: string) {
-    const port = Number(process.env.SMTP_PORT || 587);
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port,
-      secure:
-        process.env.SMTP_SECURE === 'true' ||
-        (process.env.SMTP_SECURE !== 'false' && port === 465),
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASSWORD,
-      },
-    });
-    await transporter.sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    if (!isMailConfigured()) {
+      throw new ServiceUnavailableException(
+        'Password recovery email is not configured. Contact the application administrator.',
+      );
+    }
+    await sendMail({
       to: email,
       subject: 'Your FinOS password recovery code',
       text: `Your FinOS recovery code is ${otp}. It expires in 10 minutes. If you did not request this, ignore this email.`,
@@ -178,7 +305,7 @@ export class AuthService {
       const userResult = await client.query(
         `
       SELECT id, email, password_hash, full_name, country, currency, timezone, locale,
-             email_verified, failed_login_attempts, 
+             avatar_url, email_verified, failed_login_attempts, 
              locked_until, deleted_at
       FROM users
       WHERE email = $1
@@ -201,11 +328,6 @@ export class AuthService {
       if (user.locked_until && new Date(user.locked_until) > new Date()) {
         throw new ForbiddenException('Account temporarily locked. Try later.');
       }
-
-      // Email verification check
-      // if (!user.email_verified) {
-      //   throw new ForbiddenException('Email not verified.');
-      // }
 
       const isPasswordValid = await bcrypt.compare(
         password,
@@ -234,6 +356,19 @@ export class AuthService {
         await client.query('COMMIT');
 
         throw new UnauthorizedException('Invalid credentials');
+      }
+
+      // Only after a valid password: block unverified accounts and resend link.
+      if (!user.email_verified) {
+        await client.query('ROLLBACK');
+        try {
+          await this.sendVerificationEmail(user.id, user.email, user.full_name);
+        } catch {
+          // Still block login even if resend fails.
+        }
+        throw new ForbiddenException(
+          'EMAIL_NOT_VERIFIED: Please verify your email. We sent a fresh verification link.',
+        );
       }
 
       // Reset failed attempts
@@ -309,6 +444,7 @@ export class AuthService {
           currency: user.currency || 'USD',
           timezone: user.timezone,
           locale: user.locale,
+          avatar_url: user.avatar_url || null,
         },
       };
 
