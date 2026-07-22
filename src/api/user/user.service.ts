@@ -17,6 +17,16 @@ import {
   ChangePasswordDto,
   UpdateProfileDto,
 } from './dto/update-profile.dto';
+import {
+  assertAvatarFile,
+  AVATAR_UPLOAD_DIR,
+  buildAvatarFilename,
+  deleteAvatarFile,
+  ensureAvatarUploadDir,
+  publicAvatarPath,
+} from './avatar-storage';
+import { writeFileSync } from 'fs';
+import { join } from 'path';
 
 @Injectable()
 export class UserService {
@@ -59,7 +69,6 @@ export class UserService {
     let timezone = (existing.timezone as string) || 'UTC';
     let locale = (existing.locale as string) || 'en-US';
     let fullName = existing.full_name as string | null;
-    let avatarUrl = existing.avatar_url as string | null;
 
     if (dto.full_name !== undefined) {
       fullName = dto.full_name.trim();
@@ -83,19 +92,6 @@ export class UserService {
     if (dto.locale !== undefined) {
       locale = dto.locale.trim() || 'en-US';
     }
-    if (dto.avatar_url !== undefined) {
-      if (dto.avatar_url === null || dto.avatar_url === '') {
-        avatarUrl = null;
-      } else if (
-        !dto.avatar_url.startsWith('data:image/') &&
-        !dto.avatar_url.startsWith('http://') &&
-        !dto.avatar_url.startsWith('https://')
-      ) {
-        throw new BadRequestException('Invalid avatar image');
-      } else {
-        avatarUrl = dto.avatar_url;
-      }
-    }
 
     const result = await this.pgPool.query(
       `UPDATE users
@@ -104,13 +100,57 @@ export class UserService {
            currency = $4,
            timezone = $5,
            locale = $6,
-           avatar_url = $7,
            updated_at = NOW()
        WHERE id = $1 AND deleted_at IS NULL
        RETURNING id, full_name, email, country, currency, timezone, locale,
                  avatar_url, email_verified, created_at, updated_at`,
-      [userId, fullName, country, currency, timezone, locale, avatarUrl],
+      [userId, fullName, country, currency, timezone, locale],
     );
+    return result.rows[0];
+  }
+
+  async uploadAvatar(userId: string, file: Express.Multer.File) {
+    assertAvatarFile(file);
+    const existing = await this.findOne(userId);
+    if (!existing) throw new NotFoundException('User not found');
+
+    ensureAvatarUploadDir();
+    const filename = buildAvatarFilename(userId, file.mimetype);
+    writeFileSync(join(AVATAR_UPLOAD_DIR, filename), file.buffer);
+
+    const previous = existing.avatar_url as string | null;
+    const avatarUrl = publicAvatarPath(filename);
+
+    const result = await this.pgPool.query(
+      `UPDATE users
+       SET avatar_url = $2, updated_at = NOW()
+       WHERE id = $1 AND deleted_at IS NULL
+       RETURNING id, full_name, email, country, currency, timezone, locale,
+                 avatar_url, email_verified, created_at, updated_at`,
+      [userId, avatarUrl],
+    );
+
+    if (previous && previous !== avatarUrl) {
+      deleteAvatarFile(previous);
+    }
+
+    return result.rows[0];
+  }
+
+  async removeAvatar(userId: string) {
+    const existing = await this.findOne(userId);
+    if (!existing) throw new NotFoundException('User not found');
+
+    const previous = existing.avatar_url as string | null;
+    const result = await this.pgPool.query(
+      `UPDATE users
+       SET avatar_url = NULL, updated_at = NOW()
+       WHERE id = $1 AND deleted_at IS NULL
+       RETURNING id, full_name, email, country, currency, timezone, locale,
+                 avatar_url, email_verified, created_at, updated_at`,
+      [userId],
+    );
+    deleteAvatarFile(previous);
     return result.rows[0];
   }
 

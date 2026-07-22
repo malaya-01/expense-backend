@@ -47,13 +47,6 @@ export class UpdateProfileDto {
   @IsString()
   @MaxLength(10)
   locale?: string;
-
-  /** Data URL or remote URL for avatar (nullable to clear). */
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  @MaxLength(700_000)
-  avatar_url?: string | null;
 }
 
 export class ChangePasswordDto {

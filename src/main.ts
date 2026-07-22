@@ -1,4 +1,5 @@
 import { NestFactory } from '@nestjs/core';
+import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
 import appConfiguration from './app.configuration';
 import { ValidationPipe, VersioningType } from '@nestjs/common';
@@ -11,17 +12,26 @@ import {
 import { useContainer } from 'class-validator';
 import * as cookieParser from 'cookie-parser';
 import { json, urlencoded } from 'express';
+import { join } from 'path';
+import { ensureAvatarUploadDir } from './api/user/avatar-storage';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, { bodyParser: false });
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    bodyParser: false,
+  });
 
   const configuration = appConfiguration();
   const port = configuration.PORT || 9000;
 
+  ensureAvatarUploadDir();
+  app.useStaticAssets(join(process.cwd(), 'uploads'), {
+    prefix: '/uploads',
+  });
+
   // cookie-parser is CommonJS; Nest/TS resolves it as a namespace import.
   app.use((cookieParser as unknown as () => ReturnType<typeof cookieParser>)());
-  app.use(json({ limit: '24mb' }));
-  app.use(urlencoded({ extended: true, limit: '24mb' }));
+  app.use(json({ limit: '2mb' }));
+  app.use(urlencoded({ extended: true, limit: '2mb' }));
   app.setGlobalPrefix('api');
   app.useGlobalPipes(
     new ValidationPipe({
