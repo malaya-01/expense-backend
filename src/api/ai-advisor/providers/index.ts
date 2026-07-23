@@ -1,6 +1,7 @@
 import {
   AiProviderAdapter,
   AiProviderId,
+  DEFAULT_MAX_OUTPUT_TOKENS,
   DEFAULT_MODELS,
   ChatMessage,
   ProviderConfig,
@@ -31,15 +32,29 @@ export function getDefaultModels(provider: AiProviderId): string[] {
   return DEFAULT_MODELS[provider] || [];
 }
 
+function withDefaultBudget(
+  request: { model: string; messages: ChatMessage[]; temperature?: number; maxTokens?: number },
+) {
+  return {
+    ...request,
+    maxTokens: request.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+  };
+}
+
 export async function runProviderChat(
   config: ProviderConfig,
   messages: ChatMessage[],
+  maxTokens?: number,
 ) {
   const adapter = getProviderAdapter(config.provider);
-  return adapter.chat(config, {
-    model: config.model,
-    messages,
-  });
+  return adapter.chat(
+    config,
+    withDefaultBudget({
+      model: config.model,
+      messages,
+      maxTokens,
+    }),
+  );
 }
 
 /** Yields text deltas; returns the final ProviderChatResult. */
@@ -47,15 +62,20 @@ export async function* runProviderChatStream(
   config: ProviderConfig,
   messages: ChatMessage[],
   signal?: AbortSignal,
+  maxTokens?: number,
 ) {
   const adapter = getProviderAdapter(config.provider);
-  const request = { model: config.model, messages };
+  const request = withDefaultBudget({
+    model: config.model,
+    messages,
+    maxTokens,
+  });
   if (adapter.streamChat) {
     return yield* adapter.streamChat(config, request, signal);
   }
   const result = await adapter.chat(config, request);
   // Soft-stream non-native providers in small chunks for UI responsiveness.
-  const chunkSize = 48;
+  const chunkSize = 6;
   for (let i = 0; i < result.content.length; i += chunkSize) {
     if (signal?.aborted) {
       throw new Error('Request cancelled');

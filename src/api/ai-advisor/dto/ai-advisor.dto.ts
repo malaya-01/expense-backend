@@ -232,3 +232,16 @@ export class BulkProposalsDto {
   @IsString({ each: true })
   reject_ids?: string[];
 }
+
+export class SuggestCategoryIconDto {
+  @ApiProperty({ example: 'Groceries' })
+  @IsString()
+  @MaxLength(100)
+  name: string;
+
+  @ApiPropertyOptional({ example: 'Supermarket and household food' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  description?: string;
+}

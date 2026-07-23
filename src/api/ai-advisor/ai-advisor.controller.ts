@@ -28,6 +28,7 @@ import {
   PinConversationDto,
   RenameConversationDto,
   SelectActiveProviderDto,
+  SuggestCategoryIconDto,
   UpdateAiMemoryPreferenceDto,
   UpdateMasterPromptDto,
   UploadAiDocumentDto,
@@ -207,6 +208,30 @@ export class AiAdvisorController {
     }
   }
 
+  @Post('suggest-category-icon')
+  @ApiOperation({
+    summary: 'Suggest a category icon id from name/description (AI + fallback)',
+  })
+  @ApiBody({ type: SuggestCategoryIconDto })
+  async suggestCategoryIcon(
+    @Body() dto: SuggestCategoryIconDto,
+    @Req() req: ExpressRequest,
+    @Res() res: Response,
+  ) {
+    try {
+      const data = await this.advisorService.suggestCategoryIcon(
+        (req as any).user.id as string,
+        dto.name,
+        dto.description,
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Category icon suggested.'));
+    } catch (error) {
+      return this.fail(res, error);
+    }
+  }
+
   @Get('memories')
   async memories(@Req() req: ExpressRequest, @Res() res: Response) {
     try {
@@ -275,12 +300,14 @@ export class AiAdvisorController {
     @Req() req: ExpressRequest,
     @Res() res: Response,
     @Query('q') q?: string,
+    @Query('archived') archived?: string,
   ) {
     try {
       const userId = (req as any).user.id as string;
       const data = await this.advisorService.listConversations(
         userId,
         q?.trim() || undefined,
+        { archived: archived === '1' || archived === 'true' },
       );
       return res
         .status(HttpStatus.OK)

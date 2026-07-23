@@ -180,7 +180,7 @@ export const AI_SLASH_COMMANDS: AiSlashCommandDef[] = [
     label: 'Seed categories',
     description: 'Propose a full expense taxonomy',
     prompt:
-      'Review my existing categories. Propose create_category actions for a complete personal-finance taxonomy suitable for FinOS (at least 15 detailed categories covering income, housing, food, transport, utilities, health, shopping, entertainment, subscriptions, travel, education, insurance, debt, savings/transfers, and miscellaneous). Skip names that already exist. Each proposal needs name, description, and an optional color/icon. Do not invent parent_id unless that parent already exists in my twin.',
+      'Review my existing categories. The FinOS server will attach confirmable create_category proposals automatically — do NOT emit action_proposal JSON blocks or long category lists. Reply in under 120 words: acknowledge the seed request, mention that Review / Review all cards will appear, and skip names that already exist.',
     tools: ['list_categories'],
   },
   {

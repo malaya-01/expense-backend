@@ -19,6 +19,14 @@ import {
   parseAtMentions,
   parseSlashCommand,
 } from './ai-command-catalog';
+import {
+  buildSeedCategoryProposals,
+  wantsCategorySeed,
+} from './default-category-taxonomy';
+import {
+  CATEGORY_ICON_IDS,
+  suggestCategoryIconHeuristic,
+} from '../categories/category-icons';
 
 export type AiChatStreamEvent =
   | { type: 'status'; message: string }
@@ -37,6 +45,7 @@ export type AiChatStreamEvent =
   | {
       type: 'done';
       conversation_id: string;
+      conversation_title?: string | null;
       message: Record<string, unknown>;
       proposals: any[];
       provider: string;
@@ -64,15 +73,23 @@ export class AiAdvisorService {
     private readonly webSearchService: AiWebSearchService,
   ) {}
 
-  async listConversations(userId: string, query?: string) {
+  async listConversations(
+    userId: string,
+    query?: string,
+    options?: { archived?: boolean },
+  ) {
     const search = query?.trim();
+    const archived = Boolean(options?.archived);
     const result = await this.pgPool.query(
-      `SELECT id, title, provider, model, pinned_at, archived_at, last_message_preview,
-              created_at, updated_at
+      `SELECT id, title, provider, model, pinned_at, archived_at, auto_titled_at,
+              last_message_preview, created_at, updated_at
        FROM ai_conversations
        WHERE user_id = $1
          AND deleted_at IS NULL
-         AND archived_at IS NULL
+         AND (
+           ($3::boolean IS TRUE AND archived_at IS NOT NULL)
+           OR ($3::boolean IS NOT TRUE AND archived_at IS NULL)
+         )
          AND (
            $2::text IS NULL
            OR title ILIKE '%' || $2 || '%'
@@ -80,7 +97,7 @@ export class AiAdvisorService {
          )
        ORDER BY pinned_at DESC NULLS LAST, updated_at DESC
        LIMIT 80`,
-      [userId, search || null],
+      [userId, search || null, archived],
     );
     return result.rows;
   }
@@ -136,11 +153,13 @@ export class AiAdvisorService {
   async renameConversation(userId: string, id: string, title: string) {
     const result = await this.pgPool.query(
       `UPDATE ai_conversations
-       SET title = $3, updated_at = NOW()
+       SET title = $3,
+           auto_titled_at = COALESCE(auto_titled_at, NOW()),
+           updated_at = NOW()
        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-       RETURNING id, title, provider, model, pinned_at, archived_at, last_message_preview,
-                 created_at, updated_at`,
-      [id, userId, title.trim()],
+       RETURNING id, title, provider, model, pinned_at, archived_at, auto_titled_at,
+                 last_message_preview, created_at, updated_at`,
+      [id, userId, title.trim().slice(0, 80)],
     );
     if (!result.rowCount) throw new NotFoundException('Conversation not found');
     return result.rows[0];
@@ -165,8 +184,8 @@ export class AiAdvisorService {
     const title = `${source.conversation.title} (copy)`.slice(0, 200);
     const created = await this.pgPool.query(
       `INSERT INTO ai_conversations
-        (user_id, title, provider, model, last_message_preview)
-       VALUES ($1, $2, $3, $4, $5)
+        (user_id, title, provider, model, last_message_preview, auto_titled_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
        RETURNING id, title, provider, model, pinned_at, last_message_preview,
                  created_at, updated_at`,
       [
@@ -305,20 +324,15 @@ export class AiAdvisorService {
       dto.mime_type,
       buffer,
     );
-    const analysis = await this.analyzeDocumentWithProvider(
-      userId,
-      dto.name,
-      dto.mime_type,
-      dto.data_base64,
-      localAnalysis,
-    );
 
+    // Persist immediately so upload HTTP progress matches "file received".
+    // Heavy provider analysis continues in the background.
     const inserted = await this.pgPool.query(
       `INSERT INTO ai_documents
         (user_id, conversation_id, name, mime_type, size_bytes, content,
          detected_type, summary, analysis_confidence, extracted_sections,
          suggested_actions, related_accounts, related_transactions, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'ready')
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'analyzing')
        RETURNING id, conversation_id, name, mime_type, size_bytes, detected_type,
                  summary, analysis_confidence, extracted_sections, suggested_actions,
                  related_accounts, related_transactions,
@@ -330,6 +344,70 @@ export class AiAdvisorService {
         dto.mime_type,
         buffer.length,
         buffer,
+        localAnalysis.detected_type,
+        localAnalysis.summary,
+        localAnalysis.analysis_confidence,
+        JSON.stringify(localAnalysis.extracted_sections),
+        JSON.stringify(localAnalysis.suggested_actions),
+        JSON.stringify(localAnalysis.related_accounts),
+        JSON.stringify(localAnalysis.related_transactions),
+      ],
+    );
+    const row = inserted.rows[0];
+
+    void this.finalizeDocumentAnalysis(userId, row.id, dto, localAnalysis).catch(
+      (error: unknown) => {
+        const message =
+          error instanceof Error ? error.message : 'Document analysis failed';
+        // Best-effort failure mark; upload already succeeded.
+        void this.pgPool.query(
+          `UPDATE ai_documents
+           SET status = 'failed',
+               analysis_error = $3,
+               updated_at = NOW()
+           WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+          [row.id, userId, message.slice(0, 500)],
+        );
+      },
+    );
+
+    return row;
+  }
+
+  private async finalizeDocumentAnalysis(
+    userId: string,
+    documentId: string,
+    dto: {
+      name: string;
+      mime_type: string;
+      data_base64: string;
+    },
+    localAnalysis: ReturnType<AiAdvisorService['analyzeDocumentLocally']>,
+  ) {
+    const analysis = await this.analyzeDocumentWithProvider(
+      userId,
+      dto.name,
+      dto.mime_type,
+      dto.data_base64,
+      localAnalysis,
+    );
+
+    await this.pgPool.query(
+      `UPDATE ai_documents
+       SET detected_type = $3,
+           summary = $4,
+           analysis_confidence = $5,
+           extracted_sections = $6,
+           suggested_actions = $7,
+           related_accounts = $8,
+           related_transactions = $9,
+           status = 'ready',
+           analysis_error = NULL,
+           updated_at = NOW()
+       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+      [
+        documentId,
+        userId,
         analysis.detected_type,
         analysis.summary,
         analysis.analysis_confidence,
@@ -339,7 +417,6 @@ export class AiAdvisorService {
         JSON.stringify(analysis.related_transactions),
       ],
     );
-    return inserted.rows[0];
   }
 
   async deleteDocument(userId: string, id: string) {
@@ -553,6 +630,56 @@ export class AiAdvisorService {
     return { enabled };
   }
 
+  async suggestCategoryIcon(
+    userId: string,
+    name: string,
+    description?: string,
+  ) {
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+      throw new BadRequestException('Category name is required');
+    }
+    const heuristic = suggestCategoryIconHeuristic(
+      trimmedName,
+      description || '',
+    );
+
+    try {
+      const { config } =
+        await this.settingsService.loadActiveProviderConfig(userId);
+      const catalog = CATEGORY_ICON_IDS.join(', ');
+      const messages: ChatMessage[] = [
+        {
+          role: 'system',
+          content:
+            'You pick one category icon id for a personal finance app. Reply with ONLY the icon id, nothing else.',
+        },
+        {
+          role: 'user',
+          content: [
+            `Category name: ${trimmedName}`,
+            `Description: ${(description || '').trim() || '(none)'}`,
+            `Allowed icon ids: ${catalog}`,
+            'Icon id:',
+          ].join('\n'),
+        },
+      ];
+      const response = await runProviderChat(config, messages);
+      const raw = String(response.content || '')
+        .split(/[\s,\n]/)[0]
+        .replace(/["'`]/g, '')
+        .trim()
+        .toLowerCase()
+        .replace(/_/g, '-');
+      if (CATEGORY_ICON_IDS.includes(raw as (typeof CATEGORY_ICON_IDS)[number])) {
+        return { icon: raw, source: 'ai' as const };
+      }
+      return { icon: heuristic, source: 'heuristic' as const };
+    } catch {
+      return { icon: heuristic, source: 'heuristic' as const };
+    }
+  }
+
   async chat(userId: string, dto: ChatMessageDto) {
     const prepared = await this.prepareChat(userId, dto);
     const result = await runProviderChat(prepared.config, prepared.messages);
@@ -607,6 +734,7 @@ export class AiAdvisorService {
       yield {
         type: 'done',
         conversation_id: persisted.conversation_id,
+        conversation_title: persisted.conversation_title,
         message: persisted.message,
         proposals: persisted.proposals,
         provider: persisted.provider,
@@ -642,14 +770,11 @@ export class AiAdvisorService {
         throw new NotFoundException('Conversation not found');
       }
     } else {
-      const title =
-        dto.content.trim().slice(0, 60) +
-        (dto.content.trim().length > 60 ? '…' : '');
       const created = await this.pgPool.query(
         `INSERT INTO ai_conversations (user_id, title, provider, model)
          VALUES ($1, $2, $3, $4)
          RETURNING id, title, provider, model, created_at, updated_at`,
-        [userId, title || 'New conversation', config.provider, config.model],
+        [userId, 'New chat', config.provider, config.model],
       );
       conversationId = created.rows[0].id;
     }
@@ -823,6 +948,7 @@ export class AiAdvisorService {
       config,
       conversationId: conversationId as string,
       userPrompt: effectiveContent,
+      originalUserPrompt: dto.content.trim(),
       messages,
       context,
       activity,
@@ -881,6 +1007,7 @@ export class AiAdvisorService {
       >['config'];
       conversationId: string;
       userPrompt: string;
+      originalUserPrompt?: string;
       messages: ChatMessage[];
       context: Record<string, unknown>;
       activity: Array<{ name: string; status: string; summary: string }>;
@@ -890,12 +1017,38 @@ export class AiAdvisorService {
     model: string,
   ) {
     const parsed = this.extractProposals(rawContent);
-    const cleanContent = parsed.cleanedContent;
+    let cleanContent = this.stripSensitiveIdentifiers(
+      this.stripBrokenProposalFences(parsed.cleanedContent),
+    );
     const userId = prepared.userId;
+
+    const proposals = [...parsed.proposals];
+    const createCategoryCount = proposals.filter(
+      (p) => p.action_type === 'create_category',
+    ).length;
+    const seedIntent = wantsCategorySeed(
+      prepared.originalUserPrompt || prepared.userPrompt,
+    );
+
+    // Models routinely truncate large create_category lists. When the user asked
+    // to seed categories and no valid proposals were parsed, attach a built-in set.
+    if (seedIntent && createCategoryCount === 0) {
+      const existing = Array.isArray(prepared.context.categories)
+        ? (prepared.context.categories as Array<{ name?: string }>)
+            .map((c) => String(c?.name || ''))
+            .filter(Boolean)
+        : [];
+      const seeded = buildSeedCategoryProposals(existing);
+      proposals.push(...seeded);
+      if (seeded.length && !/pending actions|confirm/i.test(cleanContent)) {
+        cleanContent =
+          `${cleanContent.trim()}\n\nI've attached **${seeded.length} create_category** proposals for your review — use Review / Review all to approve them.`.trim();
+      }
+    }
 
     const proposalIds: string[] = [];
     const proposalRows: any[] = [];
-    for (const proposal of parsed.proposals) {
+    for (const proposal of proposals) {
       const inserted = await this.pgPool.query(
         `INSERT INTO ai_action_proposals
           (user_id, conversation_id, action_type, title, summary, payload, status, expires_at)
@@ -947,15 +1100,17 @@ export class AiAdvisorService {
       ],
     );
 
-    const suggestedQuestions = await this.generateSuggestedQuestions(
+    const conversationTitle = await this.maybeAutoTitleConversation(
+      userId,
+      prepared.conversationId,
       prepared.config,
-      prepared.userPrompt,
-      cleanContent,
-      prepared.context,
     );
+
+    const suggestedQuestions: string[] = [];
 
     return {
       conversation_id: prepared.conversationId,
+      conversation_title: conversationTitle,
       message: assistant.rows[0],
       proposals: proposalRows,
       provider: prepared.config.provider,
@@ -964,6 +1119,170 @@ export class AiAdvisorService {
       citations: prepared.citations,
       suggested_questions: suggestedQuestions,
     };
+  }
+
+  /**
+   * ChatGPT-style naming: after the first assistant reply, generate a short
+   * human title once. Skips when already auto-titled or manually renamed.
+   */
+  private async maybeAutoTitleConversation(
+    userId: string,
+    conversationId: string,
+    config: Awaited<
+      ReturnType<AiSettingsService['loadActiveProviderConfig']>
+    >['config'],
+  ): Promise<string | null> {
+    const conv = await this.pgPool.query(
+      `SELECT title, auto_titled_at FROM ai_conversations
+       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+      [conversationId, userId],
+    );
+    if (!conv.rowCount) return null;
+    const { title, auto_titled_at } = conv.rows[0] as {
+      title: string;
+      auto_titled_at: string | null;
+    };
+    if (auto_titled_at) return title;
+
+    const history = await this.pgPool.query(
+      `SELECT role, content FROM ai_messages
+       WHERE conversation_id = $1 AND user_id = $2 AND role IN ('user', 'assistant')
+       ORDER BY created_at ASC
+       LIMIT 4`,
+      [conversationId, userId],
+    );
+    const userMsg = history.rows.find((row) => row.role === 'user')?.content;
+    const assistantMsg = history.rows.find(
+      (row) => row.role === 'assistant',
+    )?.content;
+    if (!userMsg || !assistantMsg) return title;
+
+    const current = String(title || '').trim();
+    const legacySnippet =
+      String(userMsg).trim().slice(0, 60) +
+      (String(userMsg).trim().length > 60 ? '…' : '');
+    const needsTitle =
+      !current ||
+      current === 'New chat' ||
+      current === 'New conversation' ||
+      current === legacySnippet;
+    if (!needsTitle) {
+      await this.pgPool.query(
+        `UPDATE ai_conversations
+         SET auto_titled_at = NOW()
+         WHERE id = $1 AND user_id = $2`,
+        [conversationId, userId],
+      );
+      return current;
+    }
+
+    let nextTitle = this.heuristicConversationTitle(String(userMsg));
+    try {
+      const generated = await this.generateConversationTitleWithProvider(
+        config,
+        String(userMsg),
+        String(assistantMsg),
+      );
+      if (generated) nextTitle = generated;
+    } catch {
+      // Keep heuristic title.
+    }
+
+    nextTitle = nextTitle.replace(/\s+/g, ' ').trim().slice(0, 60) || 'New chat';
+    await this.pgPool.query(
+      `UPDATE ai_conversations
+       SET title = $3,
+           auto_titled_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+      [conversationId, userId, nextTitle],
+    );
+    return nextTitle;
+  }
+
+  private heuristicConversationTitle(userMessage: string): string {
+    let text = userMessage
+      .replace(/\r\n/g, '\n')
+      .replace(/```[\s\S]*?```/g, ' ')
+      .replace(/^\s*\/[a-z0-9_-]+\b/i, '')
+      .replace(/@[a-z0-9_-]+\b/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!text) return 'New chat';
+    const words = text.split(' ').slice(0, 6);
+    let title = words.join(' ');
+    if (text.split(' ').length > 6) title = `${title}…`;
+    return title.charAt(0).toUpperCase() + title.slice(1);
+  }
+
+  private async generateConversationTitleWithProvider(
+    config: Awaited<
+      ReturnType<AiSettingsService['loadActiveProviderConfig']>
+    >['config'],
+    userMessage: string,
+    assistantMessage: string,
+  ): Promise<string | null> {
+    const messages: ChatMessage[] = [
+      {
+        role: 'system',
+        content:
+          'Create a short chat title like ChatGPT. Rules: 2–6 words, Title Case when natural, no quotes, no trailing punctuation, no emojis, no markdown. Reply with the title only.',
+      },
+      {
+        role: 'user',
+        content: [
+          `User: ${userMessage.replace(/\s+/g, ' ').trim().slice(0, 400)}`,
+          `Assistant: ${assistantMessage.replace(/\s+/g, ' ').trim().slice(0, 400)}`,
+          'Title:',
+        ].join('\n'),
+      },
+    ];
+    const response = await runProviderChat(config, messages);
+    const raw = String(response.content || '')
+      .split('\n')[0]
+      .replace(/^["'`]+|["'`]+$/g, '')
+      .replace(/^title\s*:\s*/i, '')
+      .trim();
+    if (!raw || raw.length < 2 || raw.length > 80) return null;
+    if (/^(new chat|untitled|conversation)$/i.test(raw)) return null;
+    return raw;
+  }
+
+  /** Never persist UUIDs / machine IDs into chat content shown to users. */
+  private stripSensitiveIdentifiers(content: string): string {
+    const uuid =
+      '[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
+    return content
+      .replace(
+        new RegExp(
+          `\\s*[\\(\\[]\\s*(?:id|uuid|container[_ ]?id|category[_ ]?id|account[_ ]?id)\\s*[:#]?\\s*\`?${uuid}\`?\\s*[\\)\\]]`,
+          'gi',
+        ),
+        '',
+      )
+      .replace(
+        new RegExp(
+          `\\b(?:id|uuid|container_id|category_id|account_id|source_container_id|destination_container_id)\\s*[:=]\\s*\`?${uuid}\`?`,
+          'gi',
+        ),
+        '',
+      )
+      .replace(new RegExp(`\`${uuid}\``, 'gi'), '')
+      .replace(new RegExp(`\\b${uuid}\\b`, 'gi'), '')
+      .replace(/\(\s*\)/g, '')
+      .replace(/\[\s*\]/g, '')
+      .replace(/[ \t]{2,}/g, ' ')
+      .replace(/ +\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  /** Drop truncated ```action_proposal / ```json fences the model left unfinished. */
+  private stripBrokenProposalFences(content: string): string {
+    return content
+      .replace(/```(?:action_proposal|json)\s*[\s\S]*?(?:```|$)/gi, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
   }
 
   private async generateSuggestedQuestions(
@@ -975,26 +1294,30 @@ export class AiAdvisorService {
     context: Record<string, unknown>,
   ): Promise<string[]> {
     try {
-      const result = await runProviderChat(config, [
-        {
-          role: 'system',
-          content: [
-            'Generate exactly four concise follow-up questions for a financial AI conversation.',
-            'Each question must directly continue the user question and assistant answer.',
-            'Make the questions specific, useful, and distinct—not generic.',
-            'Do not mention APIs, tools, implementation details, or raw application routes.',
-            'Do not repeat a question already answered.',
-            'Return only a valid JSON array of four strings, with no Markdown or explanation.',
-          ].join(' '),
-        },
-        {
-          role: 'user',
-          content: [
-            `Original question:\n${userPrompt.slice(0, 4000)}`,
-            `Assistant answer:\n${assistantContent.slice(0, 10000)}`,
-          ].join('\n\n'),
-        },
-      ]);
+      const result = await runProviderChat(
+        config,
+        [
+          {
+            role: 'system',
+            content: [
+              'Generate exactly four concise follow-up questions for a financial AI conversation.',
+              'Each question must directly continue the user question and assistant answer.',
+              'Make the questions specific, useful, and distinct—not generic.',
+              'Do not mention APIs, tools, implementation details, or raw application routes.',
+              'Do not repeat a question already answered.',
+              'Return only a valid JSON array of four strings, with no Markdown or explanation.',
+            ].join(' '),
+          },
+          {
+            role: 'user',
+            content: [
+              `Original question:\n${userPrompt.slice(0, 4000)}`,
+              `Assistant answer:\n${assistantContent.slice(0, 10000)}`,
+            ].join('\n\n'),
+          },
+        ],
+        512,
+      );
 
       const parsed = this.parseSuggestedQuestions(result.content);
       if (parsed.length >= 2) return parsed.slice(0, 4);
@@ -1189,35 +1512,111 @@ export class AiAdvisorService {
     proposals: ParsedProposal[];
   } {
     const proposals: ParsedProposal[] = [];
+
+    // Prefer labeled fences, but also accept ```json (models often ignore the
+    // action_proposal label). Strip only when at least one proposal was parsed.
     const cleanedContent = content.replace(
-      /```action_proposal\s*([\s\S]*?)```/gi,
-      (_match, json) => {
-        try {
-          const parsed = JSON.parse(String(json).trim());
-          if (parsed?.action_type && parsed?.title) {
-            const actionType = String(parsed.action_type);
-            if (
-              !(SUPPORTED_ACTION_TYPES as readonly string[]).includes(actionType)
-            ) {
-              return '';
-            }
-            proposals.push({
-              action_type: actionType,
-              title: String(parsed.title),
-              summary: parsed.summary ? String(parsed.summary) : undefined,
-              payload:
-                typeof parsed.payload === 'object' && parsed.payload
-                  ? parsed.payload
-                  : {},
-            });
-          }
-        } catch {
-          /* ignore malformed */
-        }
-        return '';
+      /```(?:action_proposal|json)\s*([\s\S]*?)```/gi,
+      (match, json) => {
+        const before = proposals.length;
+        this.ingestProposalJson(String(json).trim(), proposals);
+        return proposals.length > before ? '' : match;
       },
     );
+
     return { cleanedContent: cleanedContent.trim(), proposals };
+  }
+
+  /** Accept a single object, an array, or NDJSON lines of action proposals. */
+  private ingestProposalJson(raw: string, out: ParsedProposal[]) {
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          const proposal = this.normalizeProposal(item);
+          if (proposal) out.push(proposal);
+        }
+        return;
+      }
+      const single = this.normalizeProposal(parsed);
+      if (single) {
+        out.push(single);
+        return;
+      }
+    } catch {
+      /* fall through to NDJSON */
+    }
+
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed === '[' || trimmed === ']' || trimmed === ',') {
+        continue;
+      }
+      try {
+        const proposal = this.normalizeProposal(JSON.parse(trimmed));
+        if (proposal) out.push(proposal);
+      } catch {
+        /* ignore malformed line */
+      }
+    }
+  }
+
+  private normalizeProposal(value: unknown): ParsedProposal | null {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return null;
+    }
+    const raw = value as Record<string, unknown>;
+    const actionType = raw.action_type ? String(raw.action_type) : '';
+    if (
+      !actionType ||
+      !(SUPPORTED_ACTION_TYPES as readonly string[]).includes(actionType)
+    ) {
+      return null;
+    }
+
+    let payload: Record<string, unknown> =
+      typeof raw.payload === 'object' &&
+      raw.payload &&
+      !Array.isArray(raw.payload)
+        ? { ...(raw.payload as Record<string, unknown>) }
+        : {};
+
+    // Models sometimes put fields at the top level instead of under payload.
+    if (!Object.keys(payload).length) {
+      const {
+        action_type: _a,
+        title: _t,
+        summary: _s,
+        ...rest
+      } = raw;
+      payload = rest;
+    }
+
+    const title =
+      (raw.title ? String(raw.title).trim() : '') ||
+      this.synthesizeProposalTitle(actionType, payload);
+    if (!title) return null;
+
+    return {
+      action_type: actionType,
+      title,
+      summary: raw.summary ? String(raw.summary) : undefined,
+      payload,
+    };
+  }
+
+  private synthesizeProposalTitle(
+    actionType: string,
+    payload: Record<string, unknown>,
+  ): string {
+    const name =
+      (payload.name ? String(payload.name).trim() : '') ||
+      (payload.title ? String(payload.title).trim() : '') ||
+      (payload.description ? String(payload.description).trim() : '');
+    const label = actionType.replace(/_/g, ' ');
+    if (name) return `${label}: ${name}`.slice(0, 120);
+    return label;
   }
 
   private suggestedQuestions(

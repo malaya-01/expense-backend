@@ -1,6 +1,7 @@
 import { BadRequestException } from '@nestjs/common';
 import {
   AiProviderAdapter,
+  DEFAULT_MAX_OUTPUT_TOKENS,
   ProviderChatRequest,
   ProviderChatResult,
   ProviderConfig,
@@ -91,7 +92,7 @@ export class OpenAiCompatibleAdapter implements AiProviderAdapter {
         model: request.model || config.model,
         messages: this.messages(request),
         temperature: request.temperature ?? 0.3,
-        max_tokens: request.maxTokens ?? 2048,
+        max_tokens: request.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
       }),
     });
 
@@ -130,7 +131,7 @@ export class OpenAiCompatibleAdapter implements AiProviderAdapter {
         model: request.model || config.model,
         messages: this.messages(request),
         temperature: request.temperature ?? 0.3,
-        max_tokens: request.maxTokens ?? 2048,
+        max_tokens: request.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
         stream: true,
       }),
     });

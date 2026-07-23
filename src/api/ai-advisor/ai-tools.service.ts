@@ -14,6 +14,56 @@ import {
   AI_SLASH_COMMANDS,
   SUPPORTED_ACTION_TYPES,
 } from './ai-command-catalog';
+import { CONTAINER_TYPES } from '../accounts/dto/create-account.dto';
+
+const CONTAINER_TYPE_ALIASES: Record<string, (typeof CONTAINER_TYPES)[number]> = {
+  savings: 'bank',
+  saving: 'bank',
+  'savings account': 'bank',
+  'savings_account': 'bank',
+  checking: 'bank',
+  current: 'bank',
+  'current account': 'bank',
+  debit: 'bank',
+  'debit card': 'bank',
+  'credit card': 'credit_card',
+  creditcard: 'credit_card',
+  cc: 'credit_card',
+  brokerage: 'investment',
+  stocks: 'investment',
+  mutual_fund: 'investment',
+  mf: 'investment',
+  bitcoin: 'crypto',
+  btc: 'crypto',
+  eth: 'crypto',
+  ethereum: 'crypto',
+  cash_on_hand: 'cash',
+  petty_cash: 'cash',
+  upi: 'wallet',
+  paypal: 'wallet',
+  digital_wallet: 'wallet',
+  debt: 'loan',
+  emi: 'loan',
+  mortgage: 'loan',
+};
+
+function normalizeContainerType(
+  raw: unknown,
+): (typeof CONTAINER_TYPES)[number] {
+  const key = String(raw || 'bank')
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, '_');
+  if ((CONTAINER_TYPES as readonly string[]).includes(key)) {
+    return key as (typeof CONTAINER_TYPES)[number];
+  }
+  const spaced = key.replace(/_/g, ' ');
+  return (
+    CONTAINER_TYPE_ALIASES[key] ||
+    CONTAINER_TYPE_ALIASES[spaced] ||
+    'bank'
+  );
+}
 
 export type ToolActivity = {
   name: string;
@@ -350,7 +400,7 @@ export class AiToolsService {
       case 'create_account':
         return this.accountsService.create(userId, {
           name: payload.name,
-          type: payload.type || 'bank',
+          type: normalizeContainerType(payload.type),
           balance: Number(payload.balance || 0),
           currency: payload.currency,
           institution: payload.institution,

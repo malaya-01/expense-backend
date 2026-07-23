@@ -1,6 +1,7 @@
 import { BadRequestException } from '@nestjs/common';
 import {
   AiProviderAdapter,
+  DEFAULT_MAX_OUTPUT_TOKENS,
   ProviderChatRequest,
   ProviderChatResult,
   ProviderConfig,
@@ -83,7 +84,7 @@ export class AnthropicAdapter implements AiProviderAdapter {
       },
       body: JSON.stringify({
         model: request.model || config.model,
-        max_tokens: request.maxTokens ?? 2048,
+        max_tokens: request.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
         temperature: request.temperature ?? 0.3,
         system: system || undefined,
         messages,
@@ -141,7 +142,7 @@ export class AnthropicAdapter implements AiProviderAdapter {
       signal,
       body: JSON.stringify({
         model: request.model || config.model,
-        max_tokens: request.maxTokens ?? 2048,
+        max_tokens: request.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
         temperature: request.temperature ?? 0.3,
         system: system || undefined,
         messages,

@@ -22,6 +22,11 @@ export type ProviderChatRequest = {
   maxTokens?: number;
 };
 
+/** Default completion budget for advisor replies (was 2048 and cut long answers short). */
+export const DEFAULT_MAX_OUTPUT_TOKENS = Number(
+  process.env.AI_MAX_OUTPUT_TOKENS || 8192,
+);
+
 export type ProviderChatResult = {
   content: string;
   model: string;

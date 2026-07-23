@@ -30,6 +30,22 @@ export class CategoriesController {
     }
   }
 
+  @Get('icons')
+  @ApiOperation({ summary: 'List supported category icon identifiers' })
+  async listIcons(@Res() res: Response) {
+    try {
+      const result = this.categoriesService.listIcons();
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(result, 'Category icons loaded.'));
+    } catch (error: any) {
+      const message = error.message || 'An unexpected error occured';
+      const statusCode =
+        error.statuscode || error.status || HttpStatus.BAD_REQUEST;
+      return res.status(statusCode).send(errorResponse(message, statusCode, []));
+    }
+  }
+
   @Get()
   @ApiOperation({ summary: 'Get all the category' })
   // @ApiQuery({ name: 'user_id', type: String, required: true })

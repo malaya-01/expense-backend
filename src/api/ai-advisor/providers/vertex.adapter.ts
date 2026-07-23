@@ -2,6 +2,7 @@ import { BadRequestException } from '@nestjs/common';
 import { GoogleAuth } from 'google-auth-library';
 import {
   AiProviderAdapter,
+  DEFAULT_MAX_OUTPUT_TOKENS,
   ProviderChatRequest,
   ProviderChatResult,
   ProviderConfig,
@@ -61,7 +62,12 @@ export class VertexAdapter implements AiProviderAdapter {
       contents,
       generationConfig: {
         temperature: request.temperature ?? 0.3,
-        maxOutputTokens: request.maxTokens ?? 2048,
+        maxOutputTokens: request.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+        // Gemini 2.5 thinking shares the output budget; cap it so replies
+        // don't die mid-sentence after internal reasoning.
+        ...(String(request.model || '').includes('2.5')
+          ? { thinkingConfig: { thinkingBudget: 1024 } }
+          : {}),
       },
     };
   }
