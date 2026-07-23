@@ -22,6 +22,7 @@ import { AiSettingsService } from './ai-settings.service';
 import { AiAdvisorService } from './ai-advisor.service';
 import {
   ArchiveConversationDto,
+  BulkProposalsDto,
   ChatMessageDto,
   CreateAiMemoryDto,
   PinConversationDto,
@@ -188,6 +189,19 @@ export class AiAdvisorController {
       return res
         .status(HttpStatus.OK)
         .send(successResponse(data, 'Starters ready.'));
+    } catch (error) {
+      return this.fail(res, error);
+    }
+  }
+
+  @Get('commands')
+  @ApiOperation({ summary: 'Slash (/) and mention (@) command catalog' })
+  async commands(@Res() res: Response) {
+    try {
+      const data = this.advisorService.commandCatalog();
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Command catalog ready.'));
     } catch (error) {
       return this.fail(res, error);
     }
@@ -562,6 +576,31 @@ export class AiAdvisorController {
         res.write('data: {"type":"close"}\n\n');
         res.end();
       }
+    }
+  }
+
+  @Post('proposals/bulk')
+  @ApiOperation({
+    summary: 'Confirm and/or reject many proposals in one request',
+  })
+  @ApiBody({ type: BulkProposalsDto })
+  async bulkProposals(
+    @Body() dto: BulkProposalsDto,
+    @Req() req: ExpressRequest,
+    @Res() res: Response,
+  ) {
+    try {
+      const userId = (req as any).user.id as string;
+      const data = await this.advisorService.bulkDecideProposals(
+        userId,
+        dto.confirm_ids || [],
+        dto.reject_ids || [],
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Bulk proposal decision applied.'));
+    } catch (error) {
+      return this.fail(res, error);
     }
   }
 

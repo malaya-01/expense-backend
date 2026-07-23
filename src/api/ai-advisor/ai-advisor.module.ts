@@ -8,6 +8,8 @@ import { BudgetsModule } from '../budgets/budgets.module';
 import { CategoriesModule } from '../categories/categories.module';
 import { GoalsModule } from '../goals/goals.module';
 import { InvestmentsModule } from '../investments/investments.module';
+import { LoansModule } from '../loans/loans.module';
+import { RecurringModule } from '../recurring/recurring.module';
 import { ReportsModule } from '../reports/reports.module';
 import { TransactionsModule } from '../transactions/transactions.module';
 import { AiWebSearchService } from './ai-web-search.service';
@@ -19,6 +21,8 @@ import { AiWebSearchService } from './ai-web-search.service';
     CategoriesModule,
     GoalsModule,
     InvestmentsModule,
+    LoansModule,
+    RecurringModule,
     ReportsModule,
     TransactionsModule,
   ],

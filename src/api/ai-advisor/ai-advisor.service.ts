@@ -12,6 +12,13 @@ import { runProviderChat, runProviderChatStream } from './providers';
 import { buildSystemPrompt } from './prompts/finos-master';
 import { ChatMessageDto } from './dto/ai-advisor.dto';
 import { ChatMessage } from './providers/types';
+import {
+  AI_AT_TOOLS,
+  AI_SLASH_COMMANDS,
+  SUPPORTED_ACTION_TYPES,
+  parseAtMentions,
+  parseSlashCommand,
+} from './ai-command-catalog';
 
 export type AiChatStreamEvent =
   | { type: 'status'; message: string }
@@ -714,15 +721,30 @@ export class AiAdvisorService {
       : { rows: [] };
 
     const { context, activity, citations } =
-      await this.toolsService.gatherContext(userId);
+      await this.toolsService.gatherContext(userId, {
+        deepTools: this.resolveInvokedTools(dto),
+      });
+    const slash = parseSlashCommand(dto.content);
+    let effectiveContent = dto.content.trim();
+    if (slash) {
+      const rest = effectiveContent
+        .replace(new RegExp(`^\\${slash.command}\\b`, 'i'), '')
+        .trim();
+      effectiveContent = rest
+        ? `${slash.prompt}\n\nUser note: ${rest}`
+        : slash.prompt;
+    }
+
     const useWebSearch =
       dto.web_search === true ||
-      this.webSearchService.shouldSearchAutomatically(dto.content);
+      slash?.web_search === true ||
+      this.resolveInvokedTools(dto).includes('search_public_web') ||
+      this.webSearchService.shouldSearchAutomatically(effectiveContent);
 
     if (useWebSearch) {
       if (this.webSearchService.available) {
         try {
-          const web = await this.webSearchService.search(dto.content);
+          const web = await this.webSearchService.search(effectiveContent);
           if (web.sources.length) {
             context.web_sources = web.context;
             citations.push(...web.sources);
@@ -739,7 +761,7 @@ export class AiAdvisorService {
             summary: error?.message || 'Web search unavailable',
           });
         }
-      } else if (dto.web_search) {
+      } else {
         activity.push({
           name: 'search_public_web',
           status: 'error',
@@ -748,6 +770,7 @@ export class AiAdvisorService {
       }
     }
 
+    const invoked = this.resolveInvokedTools(dto);
     const system = [
       buildSystemPrompt(masterPrompt),
       memoryEnabled
@@ -758,8 +781,14 @@ export class AiAdvisorService {
             JSON.stringify([...recentAcrossChats.rows].reverse()).slice(0, 16000),
           ].join('\n')
         : 'Cross-conversation memory is disabled by the user.',
+      invoked.length
+        ? `User-invoked tools for this turn (@ / slash): ${invoked.join(', ')}. Prioritize these datasets.`
+        : 'No explicit @ or / tool invocation for this turn.',
       'Live FinOS twin context (JSON):',
-      JSON.stringify({ ...context, web_sources: undefined }).slice(0, 48000),
+      JSON.stringify({ ...context, web_sources: undefined }).slice(
+        0,
+        invoked.length ? 64000 : 48000,
+      ),
       context.web_sources
         ? [
             'Current public web sources are included above.',
@@ -777,8 +806,12 @@ export class AiAdvisorService {
         content: String(m.content),
       })),
     ];
-    if (dto.attachments?.length) {
-      messages[messages.length - 1].attachments = dto.attachments.map((file) => ({
+    const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+    if (lastUser) {
+      lastUser.content = effectiveContent;
+    }
+    if (dto.attachments?.length && lastUser) {
+      lastUser.attachments = dto.attachments.map((file) => ({
         name: file.name,
         mimeType: file.mime_type,
         dataBase64: file.data_base64,
@@ -789,12 +822,48 @@ export class AiAdvisorService {
       userId,
       config,
       conversationId: conversationId as string,
-      userPrompt: dto.content.trim(),
+      userPrompt: effectiveContent,
       messages,
       context,
       activity,
       citations,
     };
+  }
+
+  commandCatalog() {
+    return this.toolsService.commandCatalog();
+  }
+
+  private resolveInvokedTools(dto: ChatMessageDto): string[] {
+    const tools = new Set<string>();
+    for (const raw of dto.invoked_tools || []) {
+      const normalized = this.normalizeToolName(raw);
+      if (normalized) tools.add(normalized);
+    }
+    for (const tool of parseAtMentions(dto.content || '')) {
+      tools.add(tool);
+    }
+    const slash = parseSlashCommand(dto.content || '');
+    if (slash) {
+      for (const tool of slash.tools) tools.add(tool);
+    }
+    return [...tools];
+  }
+
+  private normalizeToolName(raw: string): string | null {
+    const key = String(raw || '')
+      .trim()
+      .toLowerCase()
+      .replace(/^@/, '')
+      .replace(/^\//, '');
+    if (!key) return null;
+    const byTool = AI_AT_TOOLS.find((t) => t.tool === key || t.id === key);
+    if (byTool) return byTool.tool;
+    const bySlash = AI_SLASH_COMMANDS.find(
+      (c) => c.id === key || c.command === `/${key}`,
+    );
+    if (bySlash) return bySlash.tools[0] || null;
+    return null;
   }
 
   private extractExplicitMemory(content: string): string | null {
@@ -1040,6 +1109,63 @@ export class AiAdvisorService {
     return result.rows[0];
   }
 
+  async bulkDecideProposals(
+    userId: string,
+    confirmIds: string[] = [],
+    rejectIds: string[] = [],
+  ) {
+    const confirmSet = [...new Set(confirmIds.filter(Boolean))];
+    const rejectSet = [...new Set(rejectIds.filter(Boolean))].filter(
+      (id) => !confirmSet.includes(id),
+    );
+
+    if (!confirmSet.length && !rejectSet.length) {
+      throw new BadRequestException('No proposal IDs provided');
+    }
+    if (confirmSet.length + rejectSet.length > 100) {
+      throw new BadRequestException('At most 100 proposals per bulk request');
+    }
+
+    const confirmed: Array<Record<string, unknown>> = [];
+    const rejected: Array<Record<string, unknown>> = [];
+    const failed: Array<{ id: string; action: string; error: string }> = [];
+
+    for (const id of confirmSet) {
+      try {
+        confirmed.push(await this.confirmProposal(userId, id));
+      } catch (error: any) {
+        failed.push({
+          id,
+          action: 'confirm',
+          error: error?.message || 'Confirm failed',
+        });
+      }
+    }
+
+    for (const id of rejectSet) {
+      try {
+        rejected.push(await this.rejectProposal(userId, id));
+      } catch (error: any) {
+        failed.push({
+          id,
+          action: 'reject',
+          error: error?.message || 'Reject failed',
+        });
+      }
+    }
+
+    return {
+      confirmed,
+      rejected,
+      failed,
+      summary: {
+        confirmed: confirmed.length,
+        rejected: rejected.length,
+        failed: failed.length,
+      },
+    };
+  }
+
   async starterPrompts(userId: string) {
     try {
       const { context } = await this.toolsService.gatherContext(userId);
@@ -1069,8 +1195,14 @@ export class AiAdvisorService {
         try {
           const parsed = JSON.parse(String(json).trim());
           if (parsed?.action_type && parsed?.title) {
+            const actionType = String(parsed.action_type);
+            if (
+              !(SUPPORTED_ACTION_TYPES as readonly string[]).includes(actionType)
+            ) {
+              return '';
+            }
             proposals.push({
-              action_type: String(parsed.action_type),
+              action_type: actionType,
               title: String(parsed.title),
               summary: parsed.summary ? String(parsed.summary) : undefined,
               payload:

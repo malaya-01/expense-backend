@@ -118,6 +118,18 @@ export class ChatMessageDto {
   @IsOptional()
   @IsBoolean()
   web_search?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      'Tools invoked via @mentions or slash commands (e.g. list_loans, simulate_scenario)',
+    type: [String],
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(20)
+  @IsString({ each: true })
+  @MaxLength(80, { each: true })
+  invoked_tools?: string[];
 }
 
 export class ChatAttachmentDto {
@@ -197,4 +209,26 @@ export class UploadAiDocumentDto {
   @IsOptional()
   @IsString()
   conversation_id?: string;
+}
+
+export class BulkProposalsDto {
+  @ApiPropertyOptional({
+    description: 'Proposal IDs to confirm and execute',
+    type: [String],
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(100)
+  @IsString({ each: true })
+  confirm_ids?: string[];
+
+  @ApiPropertyOptional({
+    description: 'Proposal IDs to reject',
+    type: [String],
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(100)
+  @IsString({ each: true })
+  reject_ids?: string[];
 }

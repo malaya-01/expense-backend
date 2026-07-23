@@ -4,9 +4,16 @@ import { BudgetsService } from '../budgets/budgets.service';
 import { CategoriesService } from '../categories/categories.service';
 import { GoalsService } from '../goals/goals.service';
 import { InvestmentsService } from '../investments/investments.service';
+import { LoansService } from '../loans/loans.service';
+import { RecurringService } from '../recurring/recurring.service';
 import { ReportsService } from '../reports/reports.service';
 import { TransactionsService } from '../transactions/transactions.service';
 import { convertAmount, getRate } from 'src/common/currency/currency.data';
+import {
+  AI_AT_TOOLS,
+  AI_SLASH_COMMANDS,
+  SUPPORTED_ACTION_TYPES,
+} from './ai-command-catalog';
 
 export type ToolActivity = {
   name: string;
@@ -33,13 +40,19 @@ export class AiToolsService {
     private readonly goalsService: GoalsService,
     private readonly investmentsService: InvestmentsService,
     private readonly categoriesService: CategoriesService,
+    private readonly loansService: LoansService,
+    private readonly recurringService: RecurringService,
   ) {}
 
-  async gatherContext(userId: string): Promise<{
+  async gatherContext(
+    userId: string,
+    options?: { deepTools?: string[] },
+  ): Promise<{
     context: Record<string, unknown>;
     activity: ToolActivity[];
     citations: Citation[];
   }> {
+    const deep = new Set(options?.deepTools || []);
     const activity: ToolActivity[] = [];
     const citations: Citation[] = [
       { label: 'Reports', href: '/reports', source_type: 'module' },
@@ -48,135 +61,164 @@ export class AiToolsService {
       { label: 'Budgets', href: '/budgets', source_type: 'module' },
       { label: 'Goals', href: '/goals', source_type: 'module' },
       { label: 'Investments', href: '/investments', source_type: 'module' },
+      { label: 'Loans', href: '/loans', source_type: 'module' },
+      { label: 'Recurring', href: '/recurring', source_type: 'module' },
     ];
 
     const context: Record<string, unknown> = {};
+    const accountLimit = deep.has('list_accounts') ? 50 : 30;
+    const txLimit = deep.has('list_transactions') ? 60 : 30;
+    const categoryLimit = deep.has('list_categories') ? 120 : 40;
 
-    try {
-      context.overview = await this.reportsService.overview(userId, 6);
-      activity.push({
-        name: 'get_financial_overview',
-        status: 'ok',
-        summary: 'Loaded 6-month twin overview',
-      });
-    } catch (error: any) {
-      activity.push({
-        name: 'get_financial_overview',
-        status: 'error',
-        summary: error?.message || 'Failed',
-      });
-    }
+    await this.safeLoad(
+      activity,
+      'get_financial_overview',
+      async () => {
+        context.overview = await this.reportsService.overview(userId, 6);
+        return 'Loaded 6-month twin overview';
+      },
+    );
 
-    try {
-      const accounts = await this.accountsService.findAll(userId);
-      context.accounts = accounts.slice(0, 20).map((a: any) => ({
-        id: a.id,
-        name: a.name,
-        type: a.type,
-        balance: a.balance,
-        currency: a.currency,
-      }));
-      activity.push({
-        name: 'list_accounts',
-        status: 'ok',
-        summary: `${accounts.length} containers`,
-      });
-    } catch (error: any) {
-      activity.push({
-        name: 'list_accounts',
-        status: 'error',
-        summary: error?.message || 'Failed',
-      });
-    }
+    await this.safeLoad(
+      activity,
+      'list_accounts',
+      async () => {
+        const accounts = await this.accountsService.findAll(userId);
+        context.accounts = accounts.slice(0, accountLimit).map((a: any) => ({
+          id: a.id,
+          name: a.name,
+          type: a.type,
+          balance: a.balance,
+          currency: a.currency,
+        }));
+        return `${accounts.length} containers`;
+      },
+    );
 
-    try {
-      const tx = await this.transactionsService.findAll(userId);
-      const recent = (Array.isArray(tx) ? tx : [])
-        .slice(0, 15)
-        .map((t: any) => ({
+    await this.safeLoad(
+      activity,
+      'list_transactions',
+      async () => {
+        const tx = await this.transactionsService.findAll(userId);
+        const rows = Array.isArray(tx) ? tx : [];
+        context.recent_transactions = rows.slice(0, txLimit).map((t: any) => ({
           id: t.id,
           type: t.type,
           amount: t.amount,
           amount_base: t.amount_base,
           currency: t.currency,
           description: t.description,
+          merchant: t.merchant,
           date: t.date,
+          category_id: t.category_id,
           category_name: t.category_name,
         }));
-      context.recent_transactions = recent;
-      activity.push({
-        name: 'list_transactions',
-        status: 'ok',
-        summary: `${recent.length} recent ledger rows`,
-      });
-    } catch (error: any) {
-      activity.push({
-        name: 'list_transactions',
-        status: 'error',
-        summary: error?.message || 'Failed',
-      });
-    }
+        return `${Math.min(rows.length, txLimit)} recent ledger rows`;
+      },
+    );
 
-    try {
+    await this.safeLoad(activity, 'list_budgets', async () => {
       context.budgets = await this.budgetsService.findAll(userId);
-      activity.push({
-        name: 'list_budgets',
-        status: 'ok',
-        summary: 'Budget envelopes loaded',
-      });
-    } catch (error: any) {
-      activity.push({
-        name: 'list_budgets',
-        status: 'error',
-        summary: error?.message || 'Failed',
-      });
-    }
+      return 'Budget envelopes loaded';
+    });
 
-    try {
+    await this.safeLoad(activity, 'list_goals', async () => {
       context.goals = await this.goalsService.findAll(userId);
-      activity.push({
-        name: 'list_goals',
-        status: 'ok',
-        summary: 'Goals loaded',
-      });
-    } catch (error: any) {
-      activity.push({
-        name: 'list_goals',
-        status: 'error',
-        summary: error?.message || 'Failed',
-      });
-    }
+      return 'Goals loaded';
+    });
 
-    try {
+    await this.safeLoad(activity, 'list_investments', async () => {
       context.investments = await this.investmentsService.findAll(userId);
-      activity.push({
-        name: 'list_investments',
-        status: 'ok',
-        summary: 'Holdings loaded',
-      });
-    } catch (error: any) {
-      activity.push({
-        name: 'list_investments',
-        status: 'error',
-        summary: error?.message || 'Failed',
-      });
-    }
+      return 'Holdings loaded';
+    });
 
-    try {
+    await this.safeLoad(activity, 'list_loans', async () => {
+      const loans = await this.loansService.findAll(userId);
+      context.loans = (Array.isArray(loans) ? loans : []).slice(0, 30).map(
+        (l: any) => ({
+          id: l.id,
+          name: l.name,
+          lender: l.lender,
+          principal: l.principal,
+          remaining_principal: l.outstanding_balance ?? l.principal,
+          annual_interest_rate: l.annual_interest_rate,
+          term_months: l.term_months,
+          status: l.status,
+          payment_day: l.payment_day,
+          emi: l.monthly_payment,
+          currency: l.currency,
+          payoff_percent: l.payoff_percent,
+        }),
+      );
+      return `${(context.loans as any[])?.length || 0} debt plans`;
+    });
+
+    await this.safeLoad(activity, 'list_recurring', async () => {
+      const schedules = await this.recurringService.findAll(userId);
+      context.recurring = (Array.isArray(schedules) ? schedules : [])
+        .slice(0, 40)
+        .map((s: any) => ({
+          id: s.id,
+          name: s.name,
+          transaction_type: s.transaction_type,
+          amount: s.amount,
+          currency: s.currency,
+          frequency: s.frequency,
+          next_execution: s.next_execution,
+          status: s.status,
+          category_name: s.category_name,
+          description: s.description,
+        }));
+      return `${(context.recurring as any[])?.length || 0} schedules`;
+    });
+
+    await this.safeLoad(activity, 'list_categories', async () => {
       const categories = await this.categoriesService.findAll(userId);
       context.categories = (Array.isArray(categories) ? categories : [])
-        .slice(0, 30)
+        .slice(0, categoryLimit)
         .map((c: any) => ({ id: c.id, name: c.name }));
-      activity.push({
-        name: 'list_categories',
-        status: 'ok',
-        summary: 'Categories loaded',
+      return 'Categories loaded';
+    });
+
+    if (deep.has('list_uncategorized')) {
+      await this.safeLoad(activity, 'list_uncategorized', async () => {
+        const all = await this.transactionsService.findAll(userId);
+        const rows = Array.isArray(all) ? all : [];
+        context.uncategorized_transactions = rows
+          .filter((t: any) => !t.category_id && !t.category_name)
+          .slice(0, 40)
+          .map((t: any) => ({
+            id: t.id,
+            type: t.type,
+            amount: t.amount,
+            currency: t.currency,
+            description: t.description,
+            merchant: t.merchant,
+            date: t.date,
+          }));
+        return `${(context.uncategorized_transactions as any[])?.length || 0} uncategorized`;
       });
-    } catch (error: any) {
-      activity.push({
-        name: 'list_categories',
-        status: 'error',
-        summary: error?.message || 'Failed',
+    }
+
+    await this.safeLoad(activity, 'get_cash_flow', async () => {
+      const overview = (context.overview as any) || {};
+      context.cash_flow = {
+        this_month: overview.this_month || overview.cash_flow || null,
+        monthly: overview.monthly || overview.cashflow_series || null,
+        savings_rate:
+          overview.savings_rate ?? overview.this_month?.savings_rate,
+      };
+      return 'Cash-flow snapshot attached';
+    });
+
+    if (deep.has('simulate_scenario')) {
+      await this.safeLoad(activity, 'simulate_scenario', async () => {
+        context.scenario = await this.simulateScenario(userId, {
+          cut_percent: 20,
+          extra_monthly_savings: 5000,
+          months: 12,
+        });
+        return 'Baseline what-if scenario computed';
       });
     }
 
@@ -186,7 +228,81 @@ export class AiToolsService {
       note: 'Static pivot rates used by FinOS until live FX is configured',
     };
 
+    if (deep.size) {
+      context.invoked_tools = [...deep];
+    }
+
     return { context, activity, citations };
+  }
+
+  async simulateScenario(
+    userId: string,
+    opts: {
+      cut_percent?: number;
+      extra_monthly_savings?: number;
+      months?: number;
+      category?: string;
+    },
+  ) {
+    const cutPercent = Math.min(80, Math.max(0, Number(opts.cut_percent ?? 20)));
+    const extra = Math.max(0, Number(opts.extra_monthly_savings ?? 0));
+    const months = Math.min(60, Math.max(1, Number(opts.months ?? 12)));
+
+    let monthlyExpense = 0;
+    let monthlyIncome = 0;
+    let currency = 'USD';
+
+    try {
+      const overview: any = await this.reportsService.overview(userId, 6);
+      monthlyExpense = Number(
+        overview?.this_month?.expense ||
+          overview?.cash_flow?.expense ||
+          overview?.totals?.expense ||
+          0,
+      );
+      monthlyIncome = Number(
+        overview?.this_month?.income ||
+          overview?.cash_flow?.income ||
+          overview?.totals?.income ||
+          0,
+      );
+      currency =
+        overview?.base_currency ||
+        overview?.currency ||
+        overview?.this_month?.currency ||
+        'USD';
+    } catch {
+      /* leave zeros */
+    }
+
+    const cutAmount = (monthlyExpense * cutPercent) / 100;
+    const monthlyDelta = cutAmount + extra;
+    const baselineSavings = monthlyIncome - monthlyExpense;
+    const projectedMonthlySavings = baselineSavings + monthlyDelta;
+
+    return {
+      assumptions: {
+        cut_percent: cutPercent,
+        category_filter: opts.category || null,
+        extra_monthly_savings: extra,
+        months,
+        currency,
+      },
+      baseline: {
+        monthly_income: monthlyIncome,
+        monthly_expense: monthlyExpense,
+        monthly_savings: baselineSavings,
+      },
+      projected: {
+        monthly_expense_after_cut: Math.max(0, monthlyExpense - cutAmount),
+        monthly_savings: projectedMonthlySavings,
+        cumulative_extra_savings: monthlyDelta * months,
+        runway_note:
+          projectedMonthlySavings > 0
+            ? `At this pace you add ~${Math.round(monthlyDelta * months)} ${currency} over ${months} months vs today.`
+            : 'Projected savings are still negative — prioritize expense cuts or income first.',
+      },
+    };
   }
 
   async executeProposal(
@@ -242,10 +358,68 @@ export class AiToolsService {
           notes: payload.notes,
           include_in_net_worth: payload.include_in_net_worth ?? true,
         } as any);
+      case 'create_category':
+        return this.categoriesService.create(userId, {
+          name: String(payload.name || '').trim(),
+          description: payload.description,
+          color: payload.color,
+          icon: payload.icon,
+          parent_id: payload.parent_id,
+          budget_amount: payload.budget_amount,
+          budget_period: payload.budget_period,
+        } as any);
+      case 'update_category':
+        if (!payload.id) throw new BadRequestException('Category id required');
+        return this.categoriesService.update(userId, payload.id, {
+          name: payload.name,
+          description: payload.description,
+          color: payload.color,
+          icon: payload.icon,
+          parent_id: payload.parent_id,
+          budget_amount: payload.budget_amount,
+          budget_period: payload.budget_period,
+        } as any);
       case 'create_transaction':
+        if (
+          (payload.type || 'expense') === 'expense' &&
+          !payload.source_container_id
+        ) {
+          throw new BadRequestException(
+            'Paying account (source_container_id) is required for expenses',
+          );
+        }
+        if (payload.type === 'income' && !payload.destination_container_id) {
+          throw new BadRequestException(
+            'Deposit account (destination_container_id) is required for income',
+          );
+        }
+        if (
+          payload.type === 'transfer' &&
+          (!payload.source_container_id || !payload.destination_container_id)
+        ) {
+          throw new BadRequestException(
+            'Transfer requires both source and destination accounts',
+          );
+        }
         return this.transactionsService.create(userId, {
           type: payload.type || 'expense',
           amount: Number(payload.amount),
+          description: payload.description,
+          date: payload.date,
+          category_id: payload.category_id,
+          source_container_id: payload.source_container_id,
+          destination_container_id: payload.destination_container_id,
+          merchant: payload.merchant,
+          currency: payload.currency,
+          exchange_rate: payload.exchange_rate,
+          notes: payload.notes,
+        } as any);
+      case 'update_transaction':
+        if (!payload.id) throw new BadRequestException('Transaction id required');
+        return this.transactionsService.update(userId, payload.id, {
+          type: payload.type,
+          amount:
+            payload.amount !== undefined ? Number(payload.amount) : undefined,
           description: payload.description,
           date: payload.date,
           category_id: payload.category_id,
@@ -268,26 +442,115 @@ export class AiToolsService {
           container_id: payload.container_id,
           notes: payload.notes,
         } as any);
+      case 'create_recurring':
+        return this.recurringService.create(userId, {
+          name: payload.name,
+          transaction_type: payload.transaction_type || 'expense',
+          amount: Number(payload.amount),
+          description: payload.description || payload.name,
+          category_id: payload.category_id,
+          source_container_id: payload.source_container_id,
+          destination_container_id: payload.destination_container_id,
+          currency: payload.currency,
+          exchange_rate: payload.exchange_rate,
+          frequency: payload.frequency || 'monthly',
+          start_date: payload.start_date,
+          end_date: payload.end_date,
+          execution_mode: payload.execution_mode,
+          notes: payload.notes,
+        } as any);
+      case 'update_recurring':
+        if (!payload.id) throw new BadRequestException('Recurring id required');
+        return this.recurringService.update(userId, payload.id, {
+          name: payload.name,
+          transaction_type: payload.transaction_type,
+          amount:
+            payload.amount !== undefined ? Number(payload.amount) : undefined,
+          description: payload.description,
+          category_id: payload.category_id,
+          source_container_id: payload.source_container_id,
+          destination_container_id: payload.destination_container_id,
+          currency: payload.currency,
+          frequency: payload.frequency,
+          start_date: payload.start_date,
+          end_date: payload.end_date,
+          status: payload.status,
+          notes: payload.notes,
+        } as any);
+      case 'create_loan':
+        return this.loansService.create(userId, {
+          container_id: payload.container_id,
+          name: payload.name,
+          lender: payload.lender,
+          principal: Number(payload.principal),
+          annual_interest_rate: Number(payload.annual_interest_rate),
+          interest_type: payload.interest_type,
+          term_months: Number(payload.term_months),
+          start_date: payload.start_date,
+          payment_day: payload.payment_day,
+          notes: payload.notes,
+        } as any);
+      case 'update_loan':
+        if (!payload.id) throw new BadRequestException('Loan id required');
+        return this.loansService.update(userId, payload.id, {
+          container_id: payload.container_id,
+          name: payload.name,
+          lender: payload.lender,
+          principal:
+            payload.principal !== undefined
+              ? Number(payload.principal)
+              : undefined,
+          annual_interest_rate:
+            payload.annual_interest_rate !== undefined
+              ? Number(payload.annual_interest_rate)
+              : undefined,
+          interest_type: payload.interest_type,
+          term_months:
+            payload.term_months !== undefined
+              ? Number(payload.term_months)
+              : undefined,
+          start_date: payload.start_date,
+          payment_day: payload.payment_day,
+          status: payload.status,
+          notes: payload.notes,
+        } as any);
       default:
         throw new BadRequestException(`Unsupported action: ${actionType}`);
     }
   }
 
-  /** Keep for tools prompt documentation */
   describeTools() {
-    return [
-      'get_financial_overview',
-      'list_accounts',
-      'list_transactions',
-      'list_budgets',
-      'list_goals',
-      'list_investments',
-      'list_categories',
-      'fx_convert (server-side rates)',
-    ];
+    return AI_AT_TOOLS.map((t) => t.tool);
+  }
+
+  commandCatalog() {
+    return {
+      at_tools: AI_AT_TOOLS,
+      slash_commands: AI_SLASH_COMMANDS,
+      action_types: SUPPORTED_ACTION_TYPES,
+    };
   }
 
   convert(amount: number, from: string, to: string) {
     return convertAmount(amount, from, to);
+  }
+
+  private async safeLoad(
+    activity: ToolActivity[],
+    name: string,
+    loader: () => Promise<string>,
+    enabled = true,
+  ) {
+    if (!enabled) return;
+    try {
+      const summary = await loader();
+      activity.push({ name, status: 'ok', summary });
+    } catch (error: any) {
+      activity.push({
+        name,
+        status: 'error',
+        summary: error?.message || 'Failed',
+      });
+    }
   }
 }

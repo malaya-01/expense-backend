@@ -7,5 +7,6 @@ import { RecurringService } from './recurring.service';
   imports: [TransactionsModule],
   controllers: [RecurringController],
   providers: [RecurringService],
+  exports: [RecurringService],
 })
 export class RecurringModule {}
