@@ -33,6 +33,8 @@ import {
 
 const EMAIL_VERIFY_TTL_MS = 60 * 60 * 1000; // 1 hour
 const EMAIL_VERIFY_TTL_HOURS = 1;
+/** Temporarily off: Resend free tier can only send to the account owner. */
+const REQUIRE_EMAIL_VERIFICATION = false;
 
 @Injectable()
 export class AuthService {
@@ -54,11 +56,11 @@ export class AuthService {
       throw new BadRequestException('Password and confirm password do not match');
     }
 
-    if (!isMailConfigured()) {
-      throw new ServiceUnavailableException(
-        'Email delivery is not configured. Contact the application administrator.',
-      );
-    }
+    // if (REQUIRE_EMAIL_VERIFICATION && !isMailConfigured()) {
+    //   throw new ServiceUnavailableException(
+    //     'Email delivery is not configured. Contact the application administrator.',
+    //   );
+    // }
 
     const countryCode = country.toUpperCase();
     const countryMeta = getCountry(countryCode);
@@ -75,16 +77,26 @@ export class AuthService {
     try {
       const result = await client.query(
         `INSERT INTO users (full_name, email, password_hash, country, currency, email_verified)
-         VALUES ($1, $2, $3, $4, $5, FALSE)
+         VALUES ($1, $2, $3, $4, $5, $6)
          RETURNING id, full_name, email, country, currency, timezone, locale, email_verified`,
-        [full_name, email, passwordHash, countryCode, baseCurrency],
+        [
+          full_name,
+          email,
+          passwordHash,
+          countryCode,
+          baseCurrency,
+          !REQUIRE_EMAIL_VERIFICATION,
+        ],
       );
       const user = result.rows[0];
-      await this.sendVerificationEmail(user.id, user.email, user.full_name);
+      // if (REQUIRE_EMAIL_VERIFICATION) {
+      //   await this.sendVerificationEmail(user.id, user.email, user.full_name);
+      // }
       return {
         ...user,
-        message:
-          'Account created. Please verify your email before signing in.',
+        message: REQUIRE_EMAIL_VERIFICATION
+          ? 'Account created. Please verify your email before signing in.'
+          : 'Account created. You can sign in now.',
       };
     } catch (error: any) {
       if (error?.code === '23505') {
@@ -357,17 +369,17 @@ export class AuthService {
       }
 
       // Only after a valid password: block unverified accounts and resend link.
-      if (!user.email_verified) {
-        await client.query('ROLLBACK');
-        try {
-          await this.sendVerificationEmail(user.id, user.email, user.full_name);
-        } catch {
-          // Still block login even if resend fails.
-        }
-        throw new ForbiddenException(
-          'EMAIL_NOT_VERIFIED: Please verify your email. We sent a fresh verification link.',
-        );
-      }
+      // if (REQUIRE_EMAIL_VERIFICATION && !user.email_verified) {
+      //   await client.query('ROLLBACK');
+      //   try {
+      //     await this.sendVerificationEmail(user.id, user.email, user.full_name);
+      //   } catch {
+      //     // Still block login even if resend fails.
+      //   }
+      //   throw new ForbiddenException(
+      //     'EMAIL_NOT_VERIFIED: Please verify your email. We sent a fresh verification link.',
+      //   );
+      // }
 
       // Reset failed attempts
       await client.query(
