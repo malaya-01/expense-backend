@@ -216,9 +216,7 @@ export class AuthService {
   async generateOtp(dto: OtpGenerateDto) {
     const email = dto.email.trim().toLowerCase();
     if (
-      !process.env.SMTP_HOST ||
-      !process.env.SMTP_USER ||
-      !process.env.SMTP_PASSWORD
+      !isMailConfigured()
     ) {
       throw new ServiceUnavailableException(
         'Password recovery email is not configured. Contact the application administrator.',

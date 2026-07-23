@@ -1,5 +1,10 @@
 import * as nodemailer from 'nodemailer';
 
+function smtpPassword() {
+  // Gmail app passwords are often pasted with spaces from Google's UI.
+  return (process.env.SMTP_PASSWORD || '').replace(/\s+/g, '');
+}
+
 function createTransporter() {
   const port = Number(process.env.SMTP_PORT || 587);
   return nodemailer.createTransport({
@@ -10,18 +15,64 @@ function createTransporter() {
       (process.env.SMTP_SECURE !== 'false' && port === 465),
     auth: {
       user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASSWORD,
+      pass: smtpPassword(),
     },
+    connectionTimeout: 15_000,
+    greetingTimeout: 15_000,
+    socketTimeout: 20_000,
   });
 }
 
+/** Prefer Resend (HTTPS) on hosts that block SMTP, e.g. Render free tier. */
 export function isMailConfigured() {
   return Boolean(
-    process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASSWORD,
+    process.env.RESEND_API_KEY?.trim() ||
+      (process.env.SMTP_HOST &&
+        process.env.SMTP_USER &&
+        process.env.SMTP_PASSWORD),
   );
 }
 
-export async function sendMail(options: {
+async function sendViaResend(options: {
+  to: string;
+  subject: string;
+  text: string;
+  html: string;
+}) {
+  const apiKey = process.env.RESEND_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error('RESEND_API_KEY is not set');
+  }
+  const from =
+    process.env.RESEND_FROM ||
+    process.env.SMTP_FROM ||
+    process.env.SMTP_USER ||
+    'FinOS <onboarding@resend.dev>';
+
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from,
+      to: [options.to],
+      subject: options.subject,
+      text: options.text,
+      html: options.html,
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw new Error(
+      `Resend API ${response.status}: ${body || response.statusText}`,
+    );
+  }
+}
+
+async function sendViaSmtp(options: {
   to: string;
   subject: string;
   text: string;
@@ -32,6 +83,28 @@ export async function sendMail(options: {
     from: process.env.SMTP_FROM || process.env.SMTP_USER,
     ...options,
   });
+}
+
+export async function sendMail(options: {
+  to: string;
+  subject: string;
+  text: string;
+  html: string;
+}) {
+  try {
+    if (process.env.RESEND_API_KEY?.trim()) {
+      await sendViaResend(options);
+      return;
+    }
+    await sendViaSmtp(options);
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : 'Unknown mail error';
+    // Surface the real reason in Render logs (no secrets).
+    // eslint-disable-next-line no-console
+    console.error('[FinOS] sendMail failed:', message);
+    throw error;
+  }
 }
 
 export function buildVerificationEmailHtml(params: {
