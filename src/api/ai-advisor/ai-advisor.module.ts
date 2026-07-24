@@ -13,6 +13,7 @@ import { RecurringModule } from '../recurring/recurring.module';
 import { ReportsModule } from '../reports/reports.module';
 import { TransactionsModule } from '../transactions/transactions.module';
 import { AiWebSearchService } from './ai-web-search.service';
+import { SpacesModule } from '../spaces/spaces.module';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { AiWebSearchService } from './ai-web-search.service';
     RecurringModule,
     ReportsModule,
     TransactionsModule,
+    SpacesModule,
   ],
   controllers: [AiAdvisorController],
   providers: [

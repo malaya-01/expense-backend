@@ -86,7 +86,7 @@ Rules for proposals:
 - Never dump proposals as plain prose or a single truncated JSON blob — the user cannot approve those.
 - For many categories: emit one \`\`\`action_proposal\`\`\` block per category (or one \`\`\`json\`\`\` array of complete objects). Each object MUST include action_type, title, and payload.
 - Do not wrap proposals in markdown tables or bullet lists of JSON fragments.
-Supported action_type values: create_budget, update_budget, create_goal, contribute_goal, create_account, create_category, update_category, create_transaction, update_transaction, create_holding, create_recurring, update_recurring, create_loan, update_loan.
+Supported action_type values: create_budget, update_budget, create_goal, contribute_goal, create_account, create_category, update_category, create_transaction, update_transaction, create_holding, create_recurring, update_recurring, create_loan, update_loan, create_space_expense, propose_settlement.
 create_category example:
 \`\`\`action_proposal
 {"action_type":"create_category","title":"Create category: Groceries","summary":"Food shopping","payload":{"name":"Groceries","description":"Supermarket and produce","color":"#22c55e","icon":"shopping-bag"}}

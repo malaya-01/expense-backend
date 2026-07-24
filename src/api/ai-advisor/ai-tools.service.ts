@@ -8,6 +8,7 @@ import { LoansService } from '../loans/loans.service';
 import { RecurringService } from '../recurring/recurring.service';
 import { ReportsService } from '../reports/reports.service';
 import { TransactionsService } from '../transactions/transactions.service';
+import { SpacesService } from '../spaces/spaces.service';
 import { convertAmount, getRate } from 'src/common/currency/currency.data';
 import {
   AI_AT_TOOLS,
@@ -92,6 +93,7 @@ export class AiToolsService {
     private readonly categoriesService: CategoriesService,
     private readonly loansService: LoansService,
     private readonly recurringService: RecurringService,
+    private readonly spacesService: SpacesService,
   ) {}
 
   async gatherContext(
@@ -113,6 +115,7 @@ export class AiToolsService {
       { label: 'Investments', href: '/investments', source_type: 'module' },
       { label: 'Loans', href: '/loans', source_type: 'module' },
       { label: 'Recurring', href: '/recurring', source_type: 'module' },
+      { label: 'Spaces', href: '/spaces', source_type: 'module' },
     ];
 
     const context: Record<string, unknown> = {};
@@ -220,6 +223,11 @@ export class AiToolsService {
           description: s.description,
         }));
       return `${(context.recurring as any[])?.length || 0} schedules`;
+    });
+
+    await this.safeLoad(activity, 'list_spaces', async () => {
+      context.spaces = await this.spacesService.overviewForAi(userId);
+      return `${(context.spaces as any[])?.length || 0} collaborative spaces`;
     });
 
     await this.safeLoad(activity, 'list_categories', async () => {
@@ -564,6 +572,37 @@ export class AiToolsService {
           status: payload.status,
           notes: payload.notes,
         } as any);
+      case 'create_space_expense': {
+        if (!payload.space_id) {
+          throw new BadRequestException('space_id is required');
+        }
+        return this.spacesService.createExpense(userId, payload.space_id, {
+          title: payload.title,
+          amount: Number(payload.amount),
+          payer_member_id: payload.payer_member_id,
+          split_method: payload.split_method || 'equal',
+          participants: payload.participants,
+          category: payload.category,
+          expense_date: payload.expense_date,
+          notes: payload.notes,
+          link_to_personal: payload.link_to_personal === true,
+          personal_container_id: payload.personal_container_id,
+        } as any);
+      }
+      case 'propose_settlement': {
+        if (!payload.space_id) {
+          throw new BadRequestException('space_id is required');
+        }
+        return this.spacesService.createSettlement(userId, payload.space_id, {
+          from_member_id: payload.from_member_id,
+          to_member_id: payload.to_member_id,
+          amount: Number(payload.amount),
+          notes: payload.notes,
+          scheduled_at: payload.scheduled_at,
+          link_to_personal: payload.link_to_personal === true,
+          personal_container_id: payload.personal_container_id,
+        } as any);
+      }
       default:
         throw new BadRequestException(`Unsupported action: ${actionType}`);
     }

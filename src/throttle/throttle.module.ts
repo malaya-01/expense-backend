@@ -7,8 +7,9 @@ import { APP_GUARD } from '@nestjs/core';
     ThrottlerModule.forRoot([
       {
         name: 'default',
+        // SPA pages fire many parallel GETs; keep auth routes stricter via @Throttle.
         ttl: 60_000,
-        limit: 20,
+        limit: 200,
       },
     ]),
   ],

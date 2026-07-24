@@ -99,6 +99,13 @@ export const AI_AT_TOOLS: AiAtToolDef[] = [
     href: '/reports',
   },
   {
+    id: 'spaces',
+    tool: 'list_spaces',
+    label: 'Spaces',
+    description: 'Collaborative workspaces and balances',
+    href: '/spaces',
+  },
+  {
     id: 'scenario',
     tool: 'simulate_scenario',
     label: 'Scenario',
@@ -211,6 +218,15 @@ export const AI_SLASH_COMMANDS: AiSlashCommandDef[] = [
     tools: ['list_loans', 'list_accounts', 'get_financial_overview', 'get_cash_flow'],
   },
   {
+    id: 'spaces',
+    command: '/spaces',
+    label: 'Collaborative spaces',
+    description: 'Shared workspace overview',
+    prompt:
+      'Summarize my Collaborative Spaces: who I owe, who owes me, and outstanding settlements. If helpful, propose create_space_expense or propose_settlement actions I can confirm — never auto-write to space or personal ledgers.',
+    tools: ['list_spaces', 'list_accounts'],
+  },
+  {
     id: 'web',
     command: '/web',
     label: 'Web search',
@@ -236,6 +252,8 @@ export const SUPPORTED_ACTION_TYPES = [
   'update_recurring',
   'create_loan',
   'update_loan',
+  'create_space_expense',
+  'propose_settlement',
 ] as const;
 
 export type SupportedActionType = (typeof SUPPORTED_ACTION_TYPES)[number];

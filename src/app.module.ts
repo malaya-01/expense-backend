@@ -21,6 +21,7 @@ import { ReportsModule } from './api/reports/reports.module';
 import { AiAdvisorModule } from './api/ai-advisor/ai-advisor.module';
 import { LoansModule } from './api/loans/loans.module';
 import { RecurringModule } from './api/recurring/recurring.module';
+import { SpacesModule } from './api/spaces/spaces.module';
 import { ScheduleModule } from '@nestjs/schedule';
 import { AuthorizationGuard } from './helper/guards/authorization.guard';
 
@@ -61,6 +62,7 @@ import { AuthorizationGuard } from './helper/guards/authorization.guard';
     AiAdvisorModule,
     LoansModule,
     RecurringModule,
+    SpacesModule,
   ],
   controllers: [AppController],
   providers: [AppService,
