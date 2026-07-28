@@ -54,29 +54,55 @@ export class TransactionsService {
     try {
       await client.query('BEGIN');
       const posted = await this.buildPostedTx(client, userId, dto);
+      const clientId = (dto as { id?: string }).id;
       const result = await client.query(
-        `INSERT INTO ledger_transactions
-          (user_id, type, amount, description, date, category_id,
-           source_container_id, destination_container_id, merchant, currency, notes,
-           exchange_rate, fx_rate_to_base, amount_base)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-         RETURNING *`,
-        [
-          userId,
-          posted.type,
-          posted.amount,
-          posted.description,
-          posted.date,
-          posted.category_id || null,
-          posted.source_container_id || null,
-          posted.destination_container_id || null,
-          posted.merchant || null,
-          posted.currency,
-          posted.notes || null,
-          posted.exchange_rate,
-          posted.fx_rate_to_base,
-          posted.amount_base,
-        ],
+        clientId
+          ? `INSERT INTO ledger_transactions
+              (id, user_id, type, amount, description, date, category_id,
+               source_container_id, destination_container_id, merchant, currency, notes,
+               exchange_rate, fx_rate_to_base, amount_base)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+             RETURNING *`
+          : `INSERT INTO ledger_transactions
+              (user_id, type, amount, description, date, category_id,
+               source_container_id, destination_container_id, merchant, currency, notes,
+               exchange_rate, fx_rate_to_base, amount_base)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+             RETURNING *`,
+        clientId
+          ? [
+              clientId,
+              userId,
+              posted.type,
+              posted.amount,
+              posted.description,
+              posted.date,
+              posted.category_id || null,
+              posted.source_container_id || null,
+              posted.destination_container_id || null,
+              posted.merchant || null,
+              posted.currency,
+              posted.notes || null,
+              posted.exchange_rate,
+              posted.fx_rate_to_base,
+              posted.amount_base,
+            ]
+          : [
+              userId,
+              posted.type,
+              posted.amount,
+              posted.description,
+              posted.date,
+              posted.category_id || null,
+              posted.source_container_id || null,
+              posted.destination_container_id || null,
+              posted.merchant || null,
+              posted.currency,
+              posted.notes || null,
+              posted.exchange_rate,
+              posted.fx_rate_to_base,
+              posted.amount_base,
+            ],
       );
       await this.postJournal(
         client,

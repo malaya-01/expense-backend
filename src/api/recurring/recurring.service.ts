@@ -28,30 +28,57 @@ export class RecurringService {
     if (dto.end_date && dto.end_date < dto.start_date) {
       throw new BadRequestException('End date cannot precede start date.');
     }
+    const clientId = (dto as { id?: string }).id;
     const result = await this.pgPool.query(
-      `INSERT INTO recurring_schedules
-        (user_id, name, transaction_type, amount, description, category_id,
-         source_container_id, destination_container_id, currency, exchange_rate,
-         frequency, start_date, end_date, next_execution, execution_mode, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$12,$14,$15)
-       RETURNING id`,
-      [
-        userId,
-        dto.name.trim(),
-        dto.transaction_type,
-        dto.amount,
-        dto.description.trim(),
-        dto.category_id || null,
-        dto.source_container_id || null,
-        dto.destination_container_id || null,
-        dto.currency || null,
-        dto.exchange_rate || null,
-        dto.frequency,
-        dto.start_date,
-        dto.end_date || null,
-        dto.execution_mode || 'review',
-        dto.notes?.trim() || null,
-      ],
+      clientId
+        ? `INSERT INTO recurring_schedules
+            (id, user_id, name, transaction_type, amount, description, category_id,
+             source_container_id, destination_container_id, currency, exchange_rate,
+             frequency, start_date, end_date, next_execution, execution_mode, notes)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$13,$15,$16)
+           RETURNING id`
+        : `INSERT INTO recurring_schedules
+            (user_id, name, transaction_type, amount, description, category_id,
+             source_container_id, destination_container_id, currency, exchange_rate,
+             frequency, start_date, end_date, next_execution, execution_mode, notes)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$12,$14,$15)
+           RETURNING id`,
+      clientId
+        ? [
+            clientId,
+            userId,
+            dto.name.trim(),
+            dto.transaction_type,
+            dto.amount,
+            dto.description.trim(),
+            dto.category_id || null,
+            dto.source_container_id || null,
+            dto.destination_container_id || null,
+            dto.currency || null,
+            dto.exchange_rate || null,
+            dto.frequency,
+            dto.start_date,
+            dto.end_date || null,
+            dto.execution_mode || 'review',
+            dto.notes?.trim() || null,
+          ]
+        : [
+            userId,
+            dto.name.trim(),
+            dto.transaction_type,
+            dto.amount,
+            dto.description.trim(),
+            dto.category_id || null,
+            dto.source_container_id || null,
+            dto.destination_container_id || null,
+            dto.currency || null,
+            dto.exchange_rate || null,
+            dto.frequency,
+            dto.start_date,
+            dto.end_date || null,
+            dto.execution_mode || 'review',
+            dto.notes?.trim() || null,
+          ],
     );
     return this.findOne(userId, result.rows[0].id);
   }

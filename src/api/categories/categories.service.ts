@@ -29,11 +29,18 @@ export class CategoriesService {
         throw new BadRequestException('A category with this name already exists.')
       }
 
+      const clientId = (createCategoryDto as { id?: string }).id
       const result = await client.query(
-        `INSERT INTO categories (user_id, name, description, color, icon, parent_id, is_system, budget_amount, budget_period) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
-         RETURNING id, user_id, name, description, color, icon, parent_id, is_system, budget_amount, budget_period, created_at, updated_at`,
-        [user_id, name, description || null, color || null, normalizedIcon, parent_id || null, is_system || false, budget_amount || null, budget_period || null]
+        clientId
+          ? `INSERT INTO categories (id, user_id, name, description, color, icon, parent_id, is_system, budget_amount, budget_period) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) 
+             RETURNING id, user_id, name, description, color, icon, parent_id, is_system, budget_amount, budget_period, created_at, updated_at`
+          : `INSERT INTO categories (user_id, name, description, color, icon, parent_id, is_system, budget_amount, budget_period) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
+             RETURNING id, user_id, name, description, color, icon, parent_id, is_system, budget_amount, budget_period, created_at, updated_at`,
+        clientId
+          ? [clientId, user_id, name, description || null, color || null, normalizedIcon, parent_id || null, is_system || false, budget_amount || null, budget_period || null]
+          : [user_id, name, description || null, color || null, normalizedIcon, parent_id || null, is_system || false, budget_amount || null, budget_period || null]
       )
 
       return result.rows[0]
@@ -162,10 +169,17 @@ export class CategoriesService {
     const client = await this.pgPool.connect()
     try{
       const result = await client.query(`
-        DELETE FROM categories WHERE user_id = $1 AND id = $2
+        UPDATE categories
+        SET deleted_at = NOW(), updated_at = NOW()
+        WHERE user_id = $1 AND id = $2 AND deleted_at IS NULL
+        RETURNING id, user_id, name, deleted_at, updated_at, sync_version
         `, [user_id, category_id])
+      if (!result.rowCount) {
+        throw new BadRequestException('Category not found.')
+      }
       return result.rows[0]
     }catch(error: any){
+      if (error?.message?.includes('Category not found')) throw error
       throw new BadRequestException('Failed to delete category')
     }finally{
       await client.release()

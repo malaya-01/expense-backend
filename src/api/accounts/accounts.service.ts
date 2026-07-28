@@ -33,22 +33,41 @@ export class AccountsService {
         );
       }
 
+      const clientId = (dto as { id?: string }).id;
       const result = await client.query(
-        `INSERT INTO financial_containers
-          (user_id, name, type, balance, currency, institution, color, notes, include_in_net_worth)
-         VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8)
-         RETURNING id, user_id, name, type, balance, currency, institution, color, notes,
-                   include_in_net_worth, created_at, updated_at, deleted_at`,
-        [
-          userId,
-          dto.name,
-          dto.type,
-          (dto.currency || 'USD').toUpperCase(),
-          dto.institution || null,
-          dto.color || null,
-          dto.notes || null,
-          dto.include_in_net_worth ?? true,
-        ],
+        clientId
+          ? `INSERT INTO financial_containers
+              (id, user_id, name, type, balance, currency, institution, color, notes, include_in_net_worth)
+             VALUES ($1, $2, $3, $4, 0, $5, $6, $7, $8, $9)
+             RETURNING id, user_id, name, type, balance, currency, institution, color, notes,
+                       include_in_net_worth, created_at, updated_at, deleted_at`
+          : `INSERT INTO financial_containers
+              (user_id, name, type, balance, currency, institution, color, notes, include_in_net_worth)
+             VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8)
+             RETURNING id, user_id, name, type, balance, currency, institution, color, notes,
+                       include_in_net_worth, created_at, updated_at, deleted_at`,
+        clientId
+          ? [
+              clientId,
+              userId,
+              dto.name,
+              dto.type,
+              (dto.currency || 'USD').toUpperCase(),
+              dto.institution || null,
+              dto.color || null,
+              dto.notes || null,
+              dto.include_in_net_worth ?? true,
+            ]
+          : [
+              userId,
+              dto.name,
+              dto.type,
+              (dto.currency || 'USD').toUpperCase(),
+              dto.institution || null,
+              dto.color || null,
+              dto.notes || null,
+              dto.include_in_net_worth ?? true,
+            ],
       );
       const container = result.rows[0];
       if (Number(dto.balance || 0) !== 0) {

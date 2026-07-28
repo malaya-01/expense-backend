@@ -25,22 +25,41 @@ export class GoalsService {
         await this.assertContainer(client, userId, dto.container_id);
       }
 
+      const clientId = (dto as { id?: string }).id;
       const result = await client.query(
-        `INSERT INTO goals
-          (user_id, container_id, name, goal_type, target_amount, current_amount, currency, target_date, notes)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         RETURNING *`,
-        [
-          userId,
-          dto.container_id || null,
-          dto.name.trim(),
-          dto.goal_type || 'other',
-          dto.target_amount,
-          dto.current_amount ?? 0,
-          (dto.currency || baseCurrency).toUpperCase(),
-          dto.target_date || null,
-          dto.notes || null,
-        ],
+        clientId
+          ? `INSERT INTO goals
+              (id, user_id, container_id, name, goal_type, target_amount, current_amount, currency, target_date, notes)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             RETURNING *`
+          : `INSERT INTO goals
+              (user_id, container_id, name, goal_type, target_amount, current_amount, currency, target_date, notes)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             RETURNING *`,
+        clientId
+          ? [
+              clientId,
+              userId,
+              dto.container_id || null,
+              dto.name.trim(),
+              dto.goal_type || 'other',
+              dto.target_amount,
+              dto.current_amount ?? 0,
+              (dto.currency || baseCurrency).toUpperCase(),
+              dto.target_date || null,
+              dto.notes || null,
+            ]
+          : [
+              userId,
+              dto.container_id || null,
+              dto.name.trim(),
+              dto.goal_type || 'other',
+              dto.target_amount,
+              dto.current_amount ?? 0,
+              (dto.currency || baseCurrency).toUpperCase(),
+              dto.target_date || null,
+              dto.notes || null,
+            ],
       );
       return this.withProgress(client, userId, result.rows[0]);
     } catch (error: any) {

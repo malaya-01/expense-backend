@@ -24,26 +24,49 @@ export class LoansService {
   async create(userId: string, dto: CreateLoanDto) {
     await this.assertLiabilityContainer(userId, dto.container_id);
     try {
+      const clientId = (dto as { id?: string }).id;
       const result = await this.pgPool.query(
-        `INSERT INTO loans
-          (user_id, container_id, name, lender, principal,
-           annual_interest_rate, interest_type, term_months,
-           start_date, payment_day, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-         RETURNING id`,
-        [
-          userId,
-          dto.container_id,
-          dto.name.trim(),
-          dto.lender?.trim() || null,
-          dto.principal,
-          dto.annual_interest_rate,
-          dto.interest_type || 'fixed',
-          dto.term_months,
-          dto.start_date,
-          dto.payment_day || null,
-          dto.notes?.trim() || null,
-        ],
+        clientId
+          ? `INSERT INTO loans
+              (id, user_id, container_id, name, lender, principal,
+               annual_interest_rate, interest_type, term_months,
+               start_date, payment_day, notes)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+             RETURNING id`
+          : `INSERT INTO loans
+              (user_id, container_id, name, lender, principal,
+               annual_interest_rate, interest_type, term_months,
+               start_date, payment_day, notes)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+             RETURNING id`,
+        clientId
+          ? [
+              clientId,
+              userId,
+              dto.container_id,
+              dto.name.trim(),
+              dto.lender?.trim() || null,
+              dto.principal,
+              dto.annual_interest_rate,
+              dto.interest_type || 'fixed',
+              dto.term_months,
+              dto.start_date,
+              dto.payment_day || null,
+              dto.notes?.trim() || null,
+            ]
+          : [
+              userId,
+              dto.container_id,
+              dto.name.trim(),
+              dto.lender?.trim() || null,
+              dto.principal,
+              dto.annual_interest_rate,
+              dto.interest_type || 'fixed',
+              dto.term_months,
+              dto.start_date,
+              dto.payment_day || null,
+              dto.notes?.trim() || null,
+            ],
       );
       return this.findOne(userId, result.rows[0].id);
     } catch (error: any) {

@@ -29,20 +29,37 @@ export class BudgetsService {
         await this.assertCategory(client, userId, dto.category_id);
       }
 
+      const clientId = (dto as { id?: string }).id;
       const result = await client.query(
-        `INSERT INTO budgets
-          (user_id, category_id, name, amount, currency, period_type, notes)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING *`,
-        [
-          userId,
-          dto.category_id || null,
-          dto.name.trim(),
-          dto.amount,
-          (dto.currency || baseCurrency).toUpperCase(),
-          dto.period_type || 'monthly',
-          dto.notes || null,
-        ],
+        clientId
+          ? `INSERT INTO budgets
+              (id, user_id, category_id, name, amount, currency, period_type, notes)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             RETURNING *`
+          : `INSERT INTO budgets
+              (user_id, category_id, name, amount, currency, period_type, notes)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING *`,
+        clientId
+          ? [
+              clientId,
+              userId,
+              dto.category_id || null,
+              dto.name.trim(),
+              dto.amount,
+              (dto.currency || baseCurrency).toUpperCase(),
+              dto.period_type || 'monthly',
+              dto.notes || null,
+            ]
+          : [
+              userId,
+              dto.category_id || null,
+              dto.name.trim(),
+              dto.amount,
+              (dto.currency || baseCurrency).toUpperCase(),
+              dto.period_type || 'monthly',
+              dto.notes || null,
+            ],
       );
       return this.withProgress(client, userId, result.rows[0]);
     } catch (error: any) {

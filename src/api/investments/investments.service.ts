@@ -27,23 +27,43 @@ export class InvestmentsService {
         await this.assertInvestContainer(client, userId, dto.container_id);
       }
 
+      const clientId = (dto as { id?: string }).id;
       const result = await client.query(
-        `INSERT INTO investment_holdings
-          (user_id, container_id, name, symbol, asset_type, quantity, avg_cost, current_price, currency, notes)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         RETURNING *`,
-        [
-          userId,
-          dto.container_id || null,
-          dto.name.trim(),
-          dto.symbol?.trim().toUpperCase() || null,
-          dto.asset_type || 'other',
-          dto.quantity,
-          dto.avg_cost,
-          dto.current_price,
-          (dto.currency || baseCurrency).toUpperCase(),
-          dto.notes || null,
-        ],
+        clientId
+          ? `INSERT INTO investment_holdings
+              (id, user_id, container_id, name, symbol, asset_type, quantity, avg_cost, current_price, currency, notes)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             RETURNING *`
+          : `INSERT INTO investment_holdings
+              (user_id, container_id, name, symbol, asset_type, quantity, avg_cost, current_price, currency, notes)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             RETURNING *`,
+        clientId
+          ? [
+              clientId,
+              userId,
+              dto.container_id || null,
+              dto.name.trim(),
+              dto.symbol?.trim().toUpperCase() || null,
+              dto.asset_type || 'other',
+              dto.quantity,
+              dto.avg_cost,
+              dto.current_price,
+              (dto.currency || baseCurrency).toUpperCase(),
+              dto.notes || null,
+            ]
+          : [
+              userId,
+              dto.container_id || null,
+              dto.name.trim(),
+              dto.symbol?.trim().toUpperCase() || null,
+              dto.asset_type || 'other',
+              dto.quantity,
+              dto.avg_cost,
+              dto.current_price,
+              (dto.currency || baseCurrency).toUpperCase(),
+              dto.notes || null,
+            ],
       );
 
       if (dto.container_id) {
