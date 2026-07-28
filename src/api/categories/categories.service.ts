@@ -1,11 +1,12 @@
 import { BadRequestException, Inject, Injectable } from '@nestjs/common';
 import { CreateCategoryDto } from './dto/create-category.dto';
 import { UpdateCategoryDto } from './dto/update-category.dto';
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import {
   CATEGORY_ICON_IDS,
   normalizeCategoryIcon,
 } from './category-icons';
+import { DEFAULT_USER_CATEGORIES } from './default-categories';
 
 @Injectable()
 export class CategoriesService {
@@ -13,6 +14,40 @@ export class CategoriesService {
     @Inject('PG_POOL')
     private readonly pgPool: Pool
   ) { }
+
+  /**
+   * Insert the built-in taxonomy for a user. Safe to call repeatedly
+   * (skips names that already exist via ON CONFLICT).
+   */
+  async seedDefaultsForUser(
+    userId: string,
+    client?: PoolClient,
+  ): Promise<number> {
+    const ownClient = !client;
+    const db = client ?? (await this.pgPool.connect());
+    try {
+      let inserted = 0;
+      for (const cat of DEFAULT_USER_CATEGORIES) {
+        const result = await db.query(
+          `INSERT INTO categories (user_id, name, description, color, icon, is_system)
+           VALUES ($1, $2, $3, $4, $5, TRUE)
+           ON CONFLICT (user_id, name) DO NOTHING
+           RETURNING id`,
+          [
+            userId,
+            cat.name,
+            cat.description,
+            cat.color,
+            normalizeCategoryIcon(cat.icon),
+          ],
+        );
+        if (result.rowCount) inserted += 1;
+      }
+      return inserted;
+    } finally {
+      if (ownClient) db.release();
+    }
+  }
 
   async create(user_id: string, createCategoryDto: CreateCategoryDto) {
     const { name, description, color, icon, parent_id, is_system, budget_amount, budget_period } = createCategoryDto

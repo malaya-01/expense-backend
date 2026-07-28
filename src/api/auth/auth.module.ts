@@ -4,6 +4,7 @@ import { AuthController } from './auth.controller';
 import { JwtModule } from '@nestjs/jwt';
 import appConfiguration from 'src/app.configuration';
 import { UserModule } from '../user/user.module';
+import { CategoriesModule } from '../categories/categories.module';
 
 @Module({
   imports:[
@@ -11,7 +12,8 @@ import { UserModule } from '../user/user.module';
       secret: appConfiguration().JWT.SECRET,
       signOptions: { expiresIn: '15m' },
     }),
-    UserModule
+    UserModule,
+    CategoriesModule,
   ],
   controllers: [AuthController],
   providers: [AuthService],

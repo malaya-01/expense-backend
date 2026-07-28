@@ -19,6 +19,7 @@ import { JwtService } from '@nestjs/jwt';
 import { Request, Response } from 'express';
 import { randomBytes, randomInt, randomUUID } from 'crypto';
 import { UserService } from '../user/user.service';
+import { CategoriesService } from '../categories/categories.service';
 import {
   getCountry,
   isSupportedCurrency,
@@ -44,7 +45,8 @@ export class AuthService {
     @Inject('CACHE_MANAGER')
     private readonly cacheManager: Cache,
     private readonly jwtService: JwtService,
-    private readonly userService: UserService
+    private readonly userService: UserService,
+    private readonly categoriesService: CategoriesService,
   ) { }
 
 
@@ -75,6 +77,7 @@ export class AuthService {
     const passwordHash = await bcrypt.hash(password, 10);
     const client = await this.pgPool.connect();
     try {
+      await client.query('BEGIN');
       const result = await client.query(
         `INSERT INTO users (full_name, email, password_hash, country, currency, email_verified)
          VALUES ($1, $2, $3, $4, $5, $6)
@@ -89,6 +92,8 @@ export class AuthService {
         ],
       );
       const user = result.rows[0];
+      await this.categoriesService.seedDefaultsForUser(user.id, client);
+      await client.query('COMMIT');
       // if (REQUIRE_EMAIL_VERIFICATION) {
       //   await this.sendVerificationEmail(user.id, user.email, user.full_name);
       // }
@@ -99,6 +104,11 @@ export class AuthService {
           : 'Account created. You can sign in now.',
       };
     } catch (error: any) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        /* ignore rollback errors */
+      }
       if (error?.code === '23505') {
         throw new ConflictException('Email already exists');
       }
