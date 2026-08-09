@@ -22,7 +22,9 @@ import { AccountsService } from './accounts.service';
 import { CreateAccountDto } from './dto/create-account.dto';
 import { UpdateAccountDto } from './dto/update-account.dto';
 import { errorResponse, successResponse } from 'src/utils/response/response';
+import { RequirePermissions } from 'src/helper/decorators/permissions.decorator';
 
+@RequirePermissions('accounts.access')
 @ApiBearerAuth('bearer')
 @ApiTags('accounts')
 @Controller('accounts')
@@ -33,6 +35,7 @@ export class AccountsController {
   @ApiOperation({ summary: 'Create a financial container' })
   @ApiBody({ type: CreateAccountDto })
   @ApiResponse({ status: 200, description: 'Container created' })
+  @RequirePermissions('accounts.create')
   async create(
     @Body() dto: CreateAccountDto,
     @Req() req: Request,
@@ -56,6 +59,7 @@ export class AccountsController {
 
   @Get()
   @ApiOperation({ summary: 'List financial containers for the current user' })
+  @RequirePermissions('accounts.read')
   async findAll(@Req() req: Request, @Res() res: Response) {
     try {
       const userId = req['user'].id as string;
@@ -75,6 +79,7 @@ export class AccountsController {
 
   @Get(':id')
   @ApiOperation({ summary: 'Get one financial container' })
+  @RequirePermissions('accounts.read')
   async findOne(
     @Param('id') id: string,
     @Req() req: Request,
@@ -98,6 +103,7 @@ export class AccountsController {
 
   @Patch(':id')
   @ApiOperation({ summary: 'Update a financial container' })
+  @RequirePermissions('accounts.update')
   async update(
     @Param('id') id: string,
     @Body() dto: UpdateAccountDto,
@@ -122,6 +128,7 @@ export class AccountsController {
 
   @Delete(':id')
   @ApiOperation({ summary: 'Soft-delete a financial container' })
+  @RequirePermissions('accounts.delete')
   async remove(
     @Param('id') id: string,
     @Req() req: Request,

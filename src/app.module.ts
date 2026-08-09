@@ -23,8 +23,10 @@ import { LoansModule } from './api/loans/loans.module';
 import { RecurringModule } from './api/recurring/recurring.module';
 import { SpacesModule } from './api/spaces/spaces.module';
 import { SyncModule } from './api/sync/sync.module';
+import { PermissionsModule } from './api/permissions/permissions.module';
 import { ScheduleModule } from '@nestjs/schedule';
 import { AuthorizationGuard } from './helper/guards/authorization.guard';
+import { PermissionsGuard } from './helper/guards/permissions.guard';
 
 
 @Module({
@@ -65,13 +67,18 @@ import { AuthorizationGuard } from './helper/guards/authorization.guard';
     RecurringModule,
     SpacesModule,
     SyncModule,
+    PermissionsModule,
   ],
   controllers: [AppController],
   providers: [AppService,
     {
       provide: 'APP_GUARD',
       useClass: AuthorizationGuard
-    }
+    },
+    {
+      provide: 'APP_GUARD',
+      useClass: PermissionsGuard,
+    },
   ],
 })
 export class AppModule {}

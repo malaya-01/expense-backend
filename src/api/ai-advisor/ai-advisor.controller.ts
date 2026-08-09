@@ -36,9 +36,11 @@ import {
 } from './dto/ai-advisor.dto';
 import { AI_PROVIDERS, AiProviderId } from './providers/types';
 import { errorResponse, successResponse } from 'src/utils/response/response';
+import { RequirePermissions } from 'src/helper/decorators/permissions.decorator';
 
 @ApiBearerAuth('bearer')
 @ApiTags('ai-advisor')
+@RequirePermissions('ai.access')
 @Controller('ai')
 export class AiAdvisorController {
   constructor(
@@ -48,6 +50,7 @@ export class AiAdvisorController {
 
   @Get('settings')
   @ApiOperation({ summary: 'Get AI provider settings and guides' })
+  @RequirePermissions('ai.read')
   async getSettings(@Req() req: ExpressRequest, @Res() res: Response) {
     try {
       const userId = (req as any).user.id as string;
@@ -63,6 +66,7 @@ export class AiAdvisorController {
   @Post('providers')
   @ApiOperation({ summary: 'Save or update a provider configuration' })
   @ApiBody({ type: UpsertProviderConfigDto })
+  @RequirePermissions('ai.create')
   async upsertProvider(
     @Body() dto: UpsertProviderConfigDto,
     @Req() req: ExpressRequest,
@@ -81,6 +85,7 @@ export class AiAdvisorController {
 
   @Delete('providers/:provider')
   @ApiOperation({ summary: 'Disconnect a provider and wipe credentials' })
+  @RequirePermissions('ai.delete')
   async disconnect(
     @Param('provider') provider: string,
     @Req() req: ExpressRequest,
@@ -103,6 +108,7 @@ export class AiAdvisorController {
 
   @Post('providers/:provider/test')
   @ApiOperation({ summary: 'Test provider connection' })
+  @RequirePermissions('ai.create')
   async test(
     @Param('provider') provider: string,
     @Req() req: ExpressRequest,
@@ -125,6 +131,7 @@ export class AiAdvisorController {
 
   @Get('providers/:provider/models')
   @ApiOperation({ summary: 'List models for a provider' })
+  @RequirePermissions('ai.read')
   async models(
     @Param('provider') provider: string,
     @Req() req: ExpressRequest,
@@ -147,6 +154,7 @@ export class AiAdvisorController {
 
   @Post('active')
   @ApiOperation({ summary: 'Select active provider and model' })
+  @RequirePermissions('ai.create')
   async selectActive(
     @Body() dto: SelectActiveProviderDto,
     @Req() req: ExpressRequest,
@@ -165,6 +173,7 @@ export class AiAdvisorController {
 
   @Patch('master-prompt')
   @ApiOperation({ summary: 'Update user master-prompt customization' })
+  @RequirePermissions('ai.update')
   async masterPrompt(
     @Body() dto: UpdateMasterPromptDto,
     @Req() req: ExpressRequest,
@@ -183,6 +192,7 @@ export class AiAdvisorController {
 
   @Get('starters')
   @ApiOperation({ summary: 'Suggested starter questions' })
+  @RequirePermissions('ai.read')
   async starters(@Req() req: ExpressRequest, @Res() res: Response) {
     try {
       const userId = (req as any).user.id as string;
@@ -197,6 +207,7 @@ export class AiAdvisorController {
 
   @Get('commands')
   @ApiOperation({ summary: 'Slash (/) and mention (@) command catalog' })
+  @RequirePermissions('ai.read')
   async commands(@Res() res: Response) {
     try {
       const data = this.advisorService.commandCatalog();
@@ -212,6 +223,7 @@ export class AiAdvisorController {
   @ApiOperation({
     summary: 'Suggest a category icon id from name/description (AI + fallback)',
   })
+  @RequirePermissions('ai.create')
   @ApiBody({ type: SuggestCategoryIconDto })
   async suggestCategoryIcon(
     @Body() dto: SuggestCategoryIconDto,
@@ -233,6 +245,7 @@ export class AiAdvisorController {
   }
 
   @Get('memories')
+  @RequirePermissions('ai.read')
   async memories(@Req() req: ExpressRequest, @Res() res: Response) {
     try {
       const data = await this.advisorService.listMemories(
@@ -245,6 +258,7 @@ export class AiAdvisorController {
   }
 
   @Post('memories')
+  @RequirePermissions('ai.create')
   async addMemory(
     @Body() dto: CreateAiMemoryDto,
     @Req() req: ExpressRequest,
@@ -262,6 +276,7 @@ export class AiAdvisorController {
   }
 
   @Patch('memories/preference')
+  @RequirePermissions('ai.update')
   async memoryPreference(
     @Body() dto: UpdateAiMemoryPreferenceDto,
     @Req() req: ExpressRequest,
@@ -279,6 +294,7 @@ export class AiAdvisorController {
   }
 
   @Delete('memories/:id')
+  @RequirePermissions('ai.delete')
   async deleteMemory(
     @Param('id') id: string,
     @Req() req: ExpressRequest,
@@ -296,6 +312,7 @@ export class AiAdvisorController {
   }
 
   @Get('conversations')
+  @RequirePermissions('ai.read')
   async conversations(
     @Req() req: ExpressRequest,
     @Res() res: Response,
@@ -318,6 +335,7 @@ export class AiAdvisorController {
   }
 
   @Get('conversations/:id')
+  @RequirePermissions('ai.read')
   async conversation(
     @Param('id') id: string,
     @Req() req: ExpressRequest,
@@ -336,6 +354,7 @@ export class AiAdvisorController {
 
   @Patch('conversations/:id')
   @ApiOperation({ summary: 'Rename a conversation' })
+  @RequirePermissions('ai.update')
   async renameConversation(
     @Param('id') id: string,
     @Body() dto: RenameConversationDto,
@@ -358,6 +377,7 @@ export class AiAdvisorController {
 
   @Post('conversations/:id/pin')
   @ApiOperation({ summary: 'Pin or unpin a conversation' })
+  @RequirePermissions('ai.create')
   async pinConversation(
     @Param('id') id: string,
     @Body() dto: PinConversationDto,
@@ -380,6 +400,7 @@ export class AiAdvisorController {
 
   @Post('conversations/:id/duplicate')
   @ApiOperation({ summary: 'Duplicate a conversation' })
+  @RequirePermissions('ai.create')
   async duplicateConversation(
     @Param('id') id: string,
     @Req() req: ExpressRequest,
@@ -400,6 +421,7 @@ export class AiAdvisorController {
 
   @Post('conversations/:id/archive')
   @ApiOperation({ summary: 'Archive or restore a conversation' })
+  @RequirePermissions('ai.create')
   async archiveConversation(
     @Param('id') id: string,
     @Body() dto: ArchiveConversationDto,
@@ -421,6 +443,7 @@ export class AiAdvisorController {
   }
 
   @Delete('conversations/:id')
+  @RequirePermissions('ai.delete')
   async deleteConversation(
     @Param('id') id: string,
     @Req() req: ExpressRequest,
@@ -439,6 +462,7 @@ export class AiAdvisorController {
 
   @Get('proposals/pending')
   @ApiOperation({ summary: 'List pending action proposals across conversations' })
+  @RequirePermissions('ai.read')
   async pendingProposals(@Req() req: ExpressRequest, @Res() res: Response) {
     try {
       const data = await this.advisorService.listPendingProposals(
@@ -454,6 +478,7 @@ export class AiAdvisorController {
 
   @Get('documents')
   @ApiOperation({ summary: 'List recent AI documents' })
+  @RequirePermissions('ai.read')
   async listDocuments(@Req() req: ExpressRequest, @Res() res: Response) {
     try {
       const data = await this.advisorService.listDocuments(
@@ -469,6 +494,7 @@ export class AiAdvisorController {
 
   @Get('documents/:id')
   @ApiOperation({ summary: 'Get document metadata and analysis' })
+  @RequirePermissions('ai.read')
   async getDocument(
     @Param('id') id: string,
     @Req() req: ExpressRequest,
@@ -491,6 +517,7 @@ export class AiAdvisorController {
   @Post('documents')
   @ApiOperation({ summary: 'Upload a document into the AI library' })
   @ApiBody({ type: UploadAiDocumentDto })
+  @RequirePermissions('ai.create')
   async uploadDocument(
     @Body() dto: UploadAiDocumentDto,
     @Req() req: ExpressRequest,
@@ -511,6 +538,7 @@ export class AiAdvisorController {
 
   @Delete('documents/:id')
   @ApiOperation({ summary: 'Soft-delete an AI document' })
+  @RequirePermissions('ai.delete')
   async deleteDocument(
     @Param('id') id: string,
     @Req() req: ExpressRequest,
@@ -532,6 +560,7 @@ export class AiAdvisorController {
   @Post('chat')
   @ApiOperation({ summary: 'Send a message to FinOS AI Advisor' })
   @ApiBody({ type: ChatMessageDto })
+  @RequirePermissions('ai.create')
   async chat(
     @Body() dto: ChatMessageDto,
     @Req() req: ExpressRequest,
@@ -551,6 +580,7 @@ export class AiAdvisorController {
   @Post('chat/stream')
   @ApiOperation({ summary: 'Stream a FinOS AI Advisor reply (SSE)' })
   @ApiBody({ type: ChatMessageDto })
+  @RequirePermissions('ai.create')
   async chatStream(
     @Body() dto: ChatMessageDto,
     @Req() req: ExpressRequest,
@@ -610,6 +640,7 @@ export class AiAdvisorController {
   @ApiOperation({
     summary: 'Confirm and/or reject many proposals in one request',
   })
+  @RequirePermissions('ai.create')
   @ApiBody({ type: BulkProposalsDto })
   async bulkProposals(
     @Body() dto: BulkProposalsDto,
@@ -633,6 +664,7 @@ export class AiAdvisorController {
 
   @Post('proposals/:id/confirm')
   @ApiOperation({ summary: 'Confirm and execute a proposed action' })
+  @RequirePermissions('ai.create')
   async confirm(
     @Param('id') id: string,
     @Req() req: ExpressRequest,
@@ -651,6 +683,7 @@ export class AiAdvisorController {
 
   @Post('proposals/:id/reject')
   @ApiOperation({ summary: 'Reject a proposed action' })
+  @RequirePermissions('ai.create')
   async reject(
     @Param('id') id: string,
     @Req() req: ExpressRequest,

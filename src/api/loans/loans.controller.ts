@@ -17,7 +17,9 @@ import {
   UpdateLoanDto,
 } from './dto/loan.dto';
 import { successResponse } from 'src/utils/response/response';
+import { RequirePermissions } from 'src/helper/decorators/permissions.decorator';
 
+@RequirePermissions('loans.access')
 @ApiBearerAuth('bearer')
 @ApiTags('loans')
 @Controller('loans')
@@ -25,6 +27,7 @@ export class LoansController {
   constructor(private readonly loansService: LoansService) {}
 
   @Get()
+  @RequirePermissions('loans.read')
   async findAll(@Req() req: Request) {
     return successResponse(
       await this.loansService.findAll((req as any).user.id),
@@ -33,6 +36,7 @@ export class LoansController {
   }
 
   @Post()
+  @RequirePermissions('loans.create')
   async create(@Req() req: Request, @Body() dto: CreateLoanDto) {
     return successResponse(
       await this.loansService.create((req as any).user.id, dto),
@@ -41,6 +45,7 @@ export class LoansController {
   }
 
   @Get(':id/amortization')
+  @RequirePermissions('loans.read')
   async amortization(@Req() req: Request, @Param('id') id: string) {
     return successResponse(
       await this.loansService.amortization((req as any).user.id, id),
@@ -49,6 +54,7 @@ export class LoansController {
   }
 
   @Post(':id/payments')
+  @RequirePermissions('loans.update')
   async recordPayment(
     @Req() req: Request,
     @Param('id') id: string,
@@ -61,6 +67,7 @@ export class LoansController {
   }
 
   @Get(':id')
+  @RequirePermissions('loans.read')
   async findOne(@Req() req: Request, @Param('id') id: string) {
     return successResponse(
       await this.loansService.findOne((req as any).user.id, id),
@@ -69,6 +76,7 @@ export class LoansController {
   }
 
   @Patch(':id')
+  @RequirePermissions('loans.update')
   async update(
     @Req() req: Request,
     @Param('id') id: string,
@@ -81,6 +89,7 @@ export class LoansController {
   }
 
   @Delete(':id')
+  @RequirePermissions('loans.delete')
   async archive(@Req() req: Request, @Param('id') id: string) {
     return successResponse(
       await this.loansService.archive((req as any).user.id, id),

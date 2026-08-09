@@ -20,6 +20,7 @@ import { Request, Response } from 'express';
 import { randomBytes, randomInt, randomUUID } from 'crypto';
 import { UserService } from '../user/user.service';
 import { CategoriesService } from '../categories/categories.service';
+import { PermissionsService } from '../permissions/permissions.service';
 import {
   getCountry,
   isSupportedCurrency,
@@ -47,6 +48,7 @@ export class AuthService {
     private readonly jwtService: JwtService,
     private readonly userService: UserService,
     private readonly categoriesService: CategoriesService,
+    private readonly permissionsService: PermissionsService,
   ) { }
 
 
@@ -94,11 +96,15 @@ export class AuthService {
       const user = result.rows[0];
       await this.categoriesService.seedDefaultsForUser(user.id, client);
       await client.query('COMMIT');
+      await this.permissionsService.markAdminIfBootstrapEmail(user.id, user.email);
+      const access = await this.permissionsService.mePayload(user.id);
       // if (REQUIRE_EMAIL_VERIFICATION) {
       //   await this.sendVerificationEmail(user.id, user.email, user.full_name);
       // }
       return {
         ...user,
+        is_admin: access.is_admin,
+        permissions: access.permissions,
         message: REQUIRE_EMAIL_VERIFICATION
           ? 'Account created. Please verify your email before signing in.'
           : 'Account created. You can sign in now.',
@@ -326,7 +332,7 @@ export class AuthService {
         `
       SELECT id, email, password_hash, full_name, country, currency, timezone, locale,
              avatar_url, email_verified, failed_login_attempts, 
-             locked_until, deleted_at
+             locked_until, deleted_at, is_admin
       FROM users
       WHERE email = $1
       `,
@@ -434,6 +440,16 @@ export class AuthService {
       const refreshTokenHash = await bcrypt.hash(refreshToken, 10);
 
       const sessionToken = randomUUID();
+      const clientPlatform =
+        (typeof req.headers['x-finos-client'] === 'string'
+          ? req.headers['x-finos-client']
+          : Array.isArray(req.headers['x-finos-client'])
+            ? req.headers['x-finos-client'][0]
+            : '') || '';
+      const rawUa = req.headers['user-agent'] || null;
+      const userAgent = clientPlatform
+        ? `[finos:${clientPlatform}] ${rawUa || ''}`.trim()
+        : rawUa;
 
       // Store session
       await client.query(
@@ -446,12 +462,14 @@ export class AuthService {
           user.id,
           sessionToken,
           refreshTokenHash,
-          req.headers['user-agent'] || null,
+          userAgent,
           req.ip,
         ],
       );
 
       await client.query('COMMIT');
+
+      const access = await this.permissionsService.mePayload(user.id);
 
       return {
         accessToken,
@@ -465,6 +483,8 @@ export class AuthService {
           timezone: user.timezone,
           locale: user.locale,
           avatar_url: user.avatar_url || null,
+          is_admin: access.is_admin,
+          permissions: access.permissions,
         },
       };
 

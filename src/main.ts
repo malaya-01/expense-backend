@@ -47,6 +47,12 @@ async function bootstrap() {
   app.enableCors({
     origin: configuration.CLIENT_HOST.split(',').map((origin) => origin.trim()),
     credentials: true,
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'Accept',
+      'X-FinOS-Client',
+    ],
   });
   useContainer(app.select(AppModule), { fallbackOnErrors: true });
   const config = new DocumentBuilder()

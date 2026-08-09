@@ -51,7 +51,7 @@ export class UserService {
   async findOne(id: string) {
     const result = await this.pgPool.query(
       `SELECT id, full_name, email, country, currency, timezone, locale,
-              avatar_url, email_verified, created_at, updated_at
+              avatar_url, email_verified, is_admin, created_at, updated_at
        FROM users
        WHERE id = $1 AND deleted_at IS NULL`,
       [id],

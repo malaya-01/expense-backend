@@ -17,7 +17,9 @@ import { Request as ExpressRequest, Response } from 'express';
 import { SyncService } from './sync.service';
 import { SyncPushDto } from './dto/sync.dto';
 import { errorResponse, successResponse } from 'src/utils/response/response';
+import { RequirePermissions } from 'src/helper/decorators/permissions.decorator';
 
+@RequirePermissions('sync.access')
 @ApiBearerAuth('bearer')
 @ApiTags('sync')
 @Controller('sync')
@@ -26,6 +28,7 @@ export class SyncController {
 
   @Get('status')
   @ApiOperation({ summary: 'Sync status and server time' })
+  @RequirePermissions('sync.read')
   async status(@Req() req: ExpressRequest, @Res() res: Response) {
     try {
       const data = await this.syncService.status(req['user'].id);
@@ -41,6 +44,7 @@ export class SyncController {
 
   @Post('push')
   @ApiOperation({ summary: 'Push offline outbox changes' })
+  @RequirePermissions('sync.create')
   async push(
     @Req() req: ExpressRequest,
     @Res() res: Response,
@@ -60,6 +64,7 @@ export class SyncController {
 
   @Get('pull')
   @ApiOperation({ summary: 'Pull incremental changes since cursor' })
+  @RequirePermissions('sync.read')
   async pull(
     @Req() req: ExpressRequest,
     @Res() res: Response,

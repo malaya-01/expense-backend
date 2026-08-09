@@ -26,7 +26,9 @@ import {
   UpdateProfileDto,
 } from './dto/update-profile.dto';
 import { errorResponse, successResponse } from 'src/utils/response/response';
+import { RequirePermissions } from 'src/helper/decorators/permissions.decorator';
 
+@RequirePermissions('settings.access')
 @ApiBearerAuth('bearer')
 @Controller('user')
 export class UserController {
@@ -34,6 +36,7 @@ export class UserController {
 
   @Get()
   @ApiOperation({ summary: 'Get current user profile' })
+  @RequirePermissions('settings.read')
   async findCurrent(@Req() req: Request, @Res() res: Response) {
     try {
       const user = await this.userService.findOne((req as any).user.id as string);
@@ -50,6 +53,7 @@ export class UserController {
 
   @Patch('profile')
   @ApiOperation({ summary: 'Update profile fields' })
+  @RequirePermissions('settings.update')
   async updateProfile(
     @Req() req: Request,
     @Body() dto: UpdateProfileDto,
@@ -83,6 +87,7 @@ export class UserController {
       required: ['avatar'],
     },
   })
+  @RequirePermissions('settings.update')
   @UseInterceptors(
     FileInterceptor('avatar', {
       storage: memoryStorage(),
@@ -112,6 +117,7 @@ export class UserController {
 
   @Delete('avatar')
   @ApiOperation({ summary: 'Remove profile avatar' })
+  @RequirePermissions('settings.update')
   async removeAvatar(@Req() req: Request, @Res() res: Response) {
     try {
       const user = await this.userService.removeAvatar(
@@ -130,6 +136,7 @@ export class UserController {
 
   @Patch('password')
   @ApiOperation({ summary: 'Change account password' })
+  @RequirePermissions('settings.update')
   async changePassword(
     @Req() req: Request,
     @Body() dto: ChangePasswordDto,

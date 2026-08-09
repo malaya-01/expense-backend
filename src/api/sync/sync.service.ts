@@ -14,6 +14,13 @@ import { LoansService } from '../loans/loans.service';
 import { RecurringService } from '../recurring/recurring.service';
 import { UserService } from '../user/user.service';
 import { AiAdvisorService } from '../ai-advisor/ai-advisor.service';
+import { PermissionsService } from '../permissions/permissions.service';
+import {
+  SYNC_ENTITY_MODULE,
+  syncOpToCrud,
+  crudPerm,
+  permissionSatisfied,
+} from '../permissions/permission.codes';
 import {
   SyncChangeDto,
   SyncEntityType,
@@ -72,7 +79,40 @@ export class SyncService {
     private readonly recurring: RecurringService,
     private readonly users: UserService,
     private readonly aiAdvisor: AiAdvisorService,
+    private readonly permissions: PermissionsService,
   ) {}
+
+  private async assertEntityPermission(
+    userId: string,
+    entityType: string,
+    op = 'read',
+  ) {
+    const module = SYNC_ENTITY_MODULE[entityType];
+    if (!module) return;
+    const action = syncOpToCrud(op);
+    const required = crudPerm(module, action);
+    const access = await this.permissions.resolveEffectiveAccess(userId);
+    if (access.is_admin) return;
+    if (!permissionSatisfied(access.permissions, required)) {
+      throw new BadRequestException(
+        `Permission denied for sync ${op} on ${entityType} (need ${required})`,
+      );
+    }
+  }
+
+  private async allowedEntityTypes(userId: string): Promise<Set<string>> {
+    const access = await this.permissions.resolveEffectiveAccess(userId);
+    if (access.is_admin) {
+      return new Set(Object.keys(SYNC_ENTITY_MODULE));
+    }
+    const allowed = new Set<string>();
+    for (const [entity, module] of Object.entries(SYNC_ENTITY_MODULE)) {
+      if (permissionSatisfied(access.permissions, crudPerm(module, 'read'))) {
+        allowed.add(entity);
+      }
+    }
+    return allowed;
+  }
 
   async status(userId: string) {
     const pending = await this.pgPool.query(
@@ -104,6 +144,11 @@ export class SyncService {
       }
 
       try {
+        await this.assertEntityPermission(
+          userId,
+          change.entity_type,
+          change.op,
+        );
         const conflict = await this.detectConflict(userId, change);
         if (conflict) {
           const result: SyncOpResult = {
@@ -152,6 +197,9 @@ export class SyncService {
       throw new BadRequestException('Invalid since cursor');
     }
 
+    const allowed = await this.allowedEntityTypes(userId);
+    const empty = { rows: [] as Record<string, unknown>[] };
+
     const [
       accounts,
       transactions,
@@ -166,41 +214,65 @@ export class SyncService {
       aiMemories,
       notificationPreferences,
     ] = await Promise.all([
-      this.pullTable(userId, 'financial_containers', cursor),
-      this.pullTable(userId, 'ledger_transactions', cursor),
-      this.pullTable(userId, 'categories', cursor),
-      this.pullTable(userId, 'budgets', cursor),
-      this.pullTable(userId, 'goals', cursor),
-      this.pullTable(userId, 'investment_holdings', cursor),
-      this.pullTable(userId, 'loans', cursor),
-      this.pullTable(userId, 'recurring_schedules', cursor),
-      this.pgPool.query(
-        `SELECT id, email, full_name, country, currency, timezone, locale,
-                avatar_url, sync_version, created_at, updated_at, deleted_at
-         FROM users
-         WHERE id = $1 AND updated_at > $2`,
-        [userId, cursor],
-      ),
-      this.pgPool.query(
-        `SELECT user_id, active_provider, active_model, master_prompt,
-                memory_enabled, sync_version, created_at, updated_at
-         FROM user_ai_preferences
-         WHERE user_id = $1 AND updated_at > $2`,
-        [userId, cursor],
-      ),
-      this.pgPool.query(
-        `SELECT id, user_id, content, source, sync_version,
-                created_at, updated_at, deleted_at
-         FROM ai_memories
-         WHERE user_id = $1 AND updated_at > $2`,
-        [userId, cursor],
-      ),
-      this.pgPool.query(
-        `SELECT user_id, preferences, sync_version, created_at, updated_at, deleted_at
-         FROM user_notification_preferences
-         WHERE user_id = $1 AND updated_at > $2`,
-        [userId, cursor],
-      ),
+      allowed.has('account')
+        ? this.pullTable(userId, 'financial_containers', cursor)
+        : empty,
+      allowed.has('transaction')
+        ? this.pullTable(userId, 'ledger_transactions', cursor)
+        : empty,
+      allowed.has('category')
+        ? this.pullTable(userId, 'categories', cursor)
+        : empty,
+      allowed.has('budget')
+        ? this.pullTable(userId, 'budgets', cursor)
+        : empty,
+      allowed.has('goal')
+        ? this.pullTable(userId, 'goals', cursor)
+        : empty,
+      allowed.has('investment')
+        ? this.pullTable(userId, 'investment_holdings', cursor)
+        : empty,
+      allowed.has('loan')
+        ? this.pullTable(userId, 'loans', cursor)
+        : empty,
+      allowed.has('recurring')
+        ? this.pullTable(userId, 'recurring_schedules', cursor)
+        : empty,
+      allowed.has('user_settings')
+        ? this.pgPool.query(
+            `SELECT id, email, full_name, country, currency, timezone, locale,
+                    avatar_url, sync_version, created_at, updated_at, deleted_at
+             FROM users
+             WHERE id = $1 AND updated_at > $2`,
+            [userId, cursor],
+          )
+        : empty,
+      allowed.has('ai_preferences')
+        ? this.pgPool.query(
+            `SELECT user_id, active_provider, active_model, master_prompt,
+                    memory_enabled, sync_version, created_at, updated_at
+             FROM user_ai_preferences
+             WHERE user_id = $1 AND updated_at > $2`,
+            [userId, cursor],
+          )
+        : empty,
+      allowed.has('ai_memory')
+        ? this.pgPool.query(
+            `SELECT id, user_id, content, source, sync_version,
+                    created_at, updated_at, deleted_at
+             FROM ai_memories
+             WHERE user_id = $1 AND updated_at > $2`,
+            [userId, cursor],
+          )
+        : empty,
+      allowed.has('notification_preferences')
+        ? this.pgPool.query(
+            `SELECT user_id, preferences, sync_version, created_at, updated_at, deleted_at
+             FROM user_notification_preferences
+             WHERE user_id = $1 AND updated_at > $2`,
+            [userId, cursor],
+          )
+        : empty,
     ]);
 
     const serverTime = new Date();

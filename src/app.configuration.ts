@@ -51,4 +51,5 @@ export default () => ({
     DESCRIPTION: 'Personal Financial Operating System',
     VERSION: '1.0.0',
   },
+  ADMIN_EMAILS: process.env.ADMIN_EMAILS || '',
 });

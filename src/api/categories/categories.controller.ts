@@ -4,8 +4,10 @@ import { CreateCategoryDto } from './dto/create-category.dto';
 import { UpdateCategoryDto } from './dto/update-category.dto';
 import { ApiOperation, ApiBody, ApiResponse, ApiTags, ApiQuery, ApiBearerAuth } from '@nestjs/swagger';
 import { errorResponse, successResponse } from 'src/utils/response/response';
+import { RequirePermissions } from 'src/helper/decorators/permissions.decorator';
 import { Response } from 'express';
 
+@RequirePermissions('categories.access')
 @ApiBearerAuth('bearer')
 @ApiTags('categories')
 @Controller('categories')
@@ -17,6 +19,7 @@ export class CategoriesController {
   @ApiBody({ type: CreateCategoryDto })
   @ApiResponse({ status: 201, description: 'Category created successfully' })
   @ApiResponse({ status: 400, description: 'Bad request' })
+  @RequirePermissions('categories.create')
   async create(@Body() createCategoryDto: CreateCategoryDto, @Res() res: Response, @Req() req: Request ) {
     // return this.categoriesService.create(createCategoryDto);
     try{
@@ -32,6 +35,7 @@ export class CategoriesController {
 
   @Get('icons')
   @ApiOperation({ summary: 'List supported category icon identifiers' })
+  @RequirePermissions('categories.read')
   async listIcons(@Res() res: Response) {
     try {
       const result = this.categoriesService.listIcons();
@@ -48,6 +52,7 @@ export class CategoriesController {
 
   @Get()
   @ApiOperation({ summary: 'Get all the category' })
+  @RequirePermissions('categories.read')
   // @ApiQuery({ name: 'user_id', type: String, required: true })
   async findAll(@Req() req: Request, @Res() res:Response) {
     // return this.categoriesService.findAll(user_id);
@@ -64,6 +69,7 @@ export class CategoriesController {
 
   @Get(':category_id')
   @ApiOperation({ summary: 'Find one category' })
+  @RequirePermissions('categories.read')
   async findOne(@Req() req: Request, @Param('category_id') category_id: string, @Res() res: Response) {
     // return this.categoriesService.findOne(+id);
     try{
@@ -80,6 +86,7 @@ export class CategoriesController {
 
   @Patch(':category_id')
   @ApiOperation({ summary: 'Update a category' })
+  @RequirePermissions('categories.update')
   async update(@Req() req: Request, @Param('category_id') category_id:string, @Body() updateCategoryDto: UpdateCategoryDto, @Res() res:Response) {
     // return this.categoriesService.update(user_id, category_id, updateCategoryDto);
     try{
@@ -97,6 +104,7 @@ export class CategoriesController {
   @ApiOperation({
     description: 'Delete a category.'
   })
+  @RequirePermissions('categories.delete')
   remove(@Param('category_id') category_id: string , @Res() res: Response, @Req() req: Request) {
     try{
       const user_id = req['user'].id as string  

@@ -22,7 +22,9 @@ import { InvestmentsService } from './investments.service';
 import { CreateInvestmentDto } from './dto/create-investment.dto';
 import { UpdateInvestmentDto } from './dto/update-investment.dto';
 import { errorResponse, successResponse } from 'src/utils/response/response';
+import { RequirePermissions } from 'src/helper/decorators/permissions.decorator';
 
+@RequirePermissions('investments.access')
 @ApiBearerAuth('bearer')
 @ApiTags('investments')
 @Controller('investments')
@@ -33,6 +35,7 @@ export class InvestmentsController {
   @ApiOperation({ summary: 'Create an investment holding' })
   @ApiBody({ type: CreateInvestmentDto })
   @ApiResponse({ status: 200, description: 'Holding created' })
+  @RequirePermissions('investments.create')
   async create(
     @Body() dto: CreateInvestmentDto,
     @Req() req: Request,
@@ -56,6 +59,7 @@ export class InvestmentsController {
 
   @Get()
   @ApiOperation({ summary: 'List holdings with portfolio summary' })
+  @RequirePermissions('investments.read')
   async findAll(@Req() req: Request, @Res() res: Response) {
     try {
       const userId = req['user'].id as string;
@@ -75,6 +79,7 @@ export class InvestmentsController {
 
   @Get(':id')
   @ApiOperation({ summary: 'Get one holding' })
+  @RequirePermissions('investments.read')
   async findOne(
     @Param('id') id: string,
     @Req() req: Request,
@@ -98,6 +103,7 @@ export class InvestmentsController {
 
   @Patch(':id')
   @ApiOperation({ summary: 'Update a holding' })
+  @RequirePermissions('investments.update')
   async update(
     @Param('id') id: string,
     @Body() dto: UpdateInvestmentDto,
@@ -122,6 +128,7 @@ export class InvestmentsController {
 
   @Delete(':id')
   @ApiOperation({ summary: 'Soft-delete a holding' })
+  @RequirePermissions('investments.delete')
   async remove(
     @Param('id') id: string,
     @Req() req: Request,

@@ -21,7 +21,9 @@ import { TransactionsService } from './transactions.service';
 import { CreateTransactionDto } from './dto/create-transaction.dto';
 import { UpdateTransactionDto } from './dto/update-transaction.dto';
 import { errorResponse, successResponse } from 'src/utils/response/response';
+import { RequirePermissions } from 'src/helper/decorators/permissions.decorator';
 
+@RequirePermissions('expenses.access')
 @ApiBearerAuth('bearer')
 @ApiTags('transactions')
 @Controller('transactions')
@@ -31,6 +33,7 @@ export class TransactionsController {
   @Post()
   @ApiOperation({ summary: 'Create a ledger transaction (double-entry)' })
   @ApiBody({ type: CreateTransactionDto })
+  @RequirePermissions('expenses.create')
   async create(
     @Body() dto: CreateTransactionDto,
     @Req() req: Request,
@@ -54,6 +57,7 @@ export class TransactionsController {
 
   @Get()
   @ApiOperation({ summary: 'List ledger transactions' })
+  @RequirePermissions('expenses.read')
   async findAll(@Req() req: Request, @Res() res: Response) {
     try {
       const userId = req['user'].id as string;
@@ -73,6 +77,7 @@ export class TransactionsController {
 
   @Get(':id/journal')
   @ApiOperation({ summary: 'Get immutable journal history for a transaction' })
+  @RequirePermissions('expenses.read')
   async findJournal(
     @Param('id') id: string,
     @Req() req: Request,
@@ -96,6 +101,7 @@ export class TransactionsController {
 
   @Get(':id')
   @ApiOperation({ summary: 'Get one ledger transaction' })
+  @RequirePermissions('expenses.read')
   async findOne(
     @Param('id') id: string,
     @Req() req: Request,
@@ -119,6 +125,7 @@ export class TransactionsController {
 
   @Patch(':id')
   @ApiOperation({ summary: 'Update a ledger transaction (reposts balances)' })
+  @RequirePermissions('expenses.update')
   async update(
     @Param('id') id: string,
     @Body() dto: UpdateTransactionDto,
@@ -143,6 +150,7 @@ export class TransactionsController {
 
   @Delete(':id')
   @ApiOperation({ summary: 'Soft-delete and reverse balance effects' })
+  @RequirePermissions('expenses.delete')
   async remove(
     @Param('id') id: string,
     @Req() req: Request,

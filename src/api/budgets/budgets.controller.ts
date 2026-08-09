@@ -22,7 +22,9 @@ import { BudgetsService } from './budgets.service';
 import { CreateBudgetDto } from './dto/create-budget.dto';
 import { UpdateBudgetDto } from './dto/update-budget.dto';
 import { errorResponse, successResponse } from 'src/utils/response/response';
+import { RequirePermissions } from 'src/helper/decorators/permissions.decorator';
 
+@RequirePermissions('budgets.access')
 @ApiBearerAuth('bearer')
 @ApiTags('budgets')
 @Controller('budgets')
@@ -33,6 +35,7 @@ export class BudgetsController {
   @ApiOperation({ summary: 'Create a spending budget' })
   @ApiBody({ type: CreateBudgetDto })
   @ApiResponse({ status: 200, description: 'Budget created' })
+  @RequirePermissions('budgets.create')
   async create(
     @Body() dto: CreateBudgetDto,
     @Req() req: Request,
@@ -56,6 +59,7 @@ export class BudgetsController {
 
   @Get()
   @ApiOperation({ summary: 'List budgets with current-period progress' })
+  @RequirePermissions('budgets.read')
   async findAll(@Req() req: Request, @Res() res: Response) {
     try {
       const userId = req['user'].id as string;
@@ -75,6 +79,7 @@ export class BudgetsController {
 
   @Get(':id')
   @ApiOperation({ summary: 'Get one budget with progress' })
+  @RequirePermissions('budgets.read')
   async findOne(
     @Param('id') id: string,
     @Req() req: Request,
@@ -98,6 +103,7 @@ export class BudgetsController {
 
   @Patch(':id')
   @ApiOperation({ summary: 'Update a budget' })
+  @RequirePermissions('budgets.update')
   async update(
     @Param('id') id: string,
     @Body() dto: UpdateBudgetDto,
@@ -122,6 +128,7 @@ export class BudgetsController {
 
   @Delete(':id')
   @ApiOperation({ summary: 'Soft-delete a budget' })
+  @RequirePermissions('budgets.delete')
   async remove(
     @Param('id') id: string,
     @Req() req: Request,

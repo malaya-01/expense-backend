@@ -22,7 +22,9 @@ import { GoalsService } from './goals.service';
 import { CreateGoalDto } from './dto/create-goal.dto';
 import { ContributeGoalDto, UpdateGoalDto } from './dto/update-goal.dto';
 import { errorResponse, successResponse } from 'src/utils/response/response';
+import { RequirePermissions } from 'src/helper/decorators/permissions.decorator';
 
+@RequirePermissions('goals.access')
 @ApiBearerAuth('bearer')
 @ApiTags('goals')
 @Controller('goals')
@@ -33,6 +35,7 @@ export class GoalsController {
   @ApiOperation({ summary: 'Create a financial goal' })
   @ApiBody({ type: CreateGoalDto })
   @ApiResponse({ status: 200, description: 'Goal created' })
+  @RequirePermissions('goals.create')
   async create(
     @Body() dto: CreateGoalDto,
     @Req() req: Request,
@@ -56,6 +59,7 @@ export class GoalsController {
 
   @Get()
   @ApiOperation({ summary: 'List goals with progress and predictions' })
+  @RequirePermissions('goals.read')
   async findAll(@Req() req: Request, @Res() res: Response) {
     try {
       const userId = req['user'].id as string;
@@ -75,6 +79,7 @@ export class GoalsController {
 
   @Get(':id')
   @ApiOperation({ summary: 'Get one goal' })
+  @RequirePermissions('goals.read')
   async findOne(
     @Param('id') id: string,
     @Req() req: Request,
@@ -99,6 +104,7 @@ export class GoalsController {
   @Post(':id/contribute')
   @ApiOperation({ summary: 'Add a contribution to a manual goal' })
   @ApiBody({ type: ContributeGoalDto })
+  @RequirePermissions('goals.update')
   async contribute(
     @Param('id') id: string,
     @Body() dto: ContributeGoalDto,
@@ -123,6 +129,7 @@ export class GoalsController {
 
   @Patch(':id')
   @ApiOperation({ summary: 'Update a goal' })
+  @RequirePermissions('goals.update')
   async update(
     @Param('id') id: string,
     @Body() dto: UpdateGoalDto,
@@ -147,6 +154,7 @@ export class GoalsController {
 
   @Delete(':id')
   @ApiOperation({ summary: 'Soft-delete a goal' })
+  @RequirePermissions('goals.delete')
   async remove(
     @Param('id') id: string,
     @Req() req: Request,

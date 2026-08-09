@@ -11,12 +11,14 @@ import {
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Request } from 'express';
 import { successResponse } from 'src/utils/response/response';
+import { RequirePermissions } from 'src/helper/decorators/permissions.decorator';
 import {
   CreateRecurringScheduleDto,
   UpdateRecurringScheduleDto,
 } from './dto/recurring.dto';
 import { RecurringService } from './recurring.service';
 
+@RequirePermissions('recurring.access')
 @ApiBearerAuth('bearer')
 @ApiTags('recurring')
 @Controller('recurring')
@@ -24,6 +26,7 @@ export class RecurringController {
   constructor(private readonly recurringService: RecurringService) {}
 
   @Get()
+  @RequirePermissions('recurring.read')
   async findAll(@Req() req: Request) {
     return successResponse(
       await this.recurringService.findAll((req as any).user.id),
@@ -32,6 +35,7 @@ export class RecurringController {
   }
 
   @Post()
+  @RequirePermissions('recurring.create')
   async create(
     @Req() req: Request,
     @Body() dto: CreateRecurringScheduleDto,
@@ -43,6 +47,7 @@ export class RecurringController {
   }
 
   @Get(':id/history')
+  @RequirePermissions('recurring.read')
   async history(@Req() req: Request, @Param('id') id: string) {
     return successResponse(
       await this.recurringService.history((req as any).user.id, id),
@@ -51,6 +56,7 @@ export class RecurringController {
   }
 
   @Post(':id/execute')
+  @RequirePermissions('recurring.create')
   async execute(@Req() req: Request, @Param('id') id: string) {
     return successResponse(
       await this.recurringService.execute((req as any).user.id, id),
@@ -59,6 +65,7 @@ export class RecurringController {
   }
 
   @Patch(':id')
+  @RequirePermissions('recurring.update')
   async update(
     @Req() req: Request,
     @Param('id') id: string,
@@ -71,6 +78,7 @@ export class RecurringController {
   }
 
   @Delete(':id')
+  @RequirePermissions('recurring.delete')
   async archive(@Req() req: Request, @Param('id') id: string) {
     return successResponse(
       await this.recurringService.archive((req as any).user.id, id),

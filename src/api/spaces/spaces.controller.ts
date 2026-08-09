@@ -28,7 +28,9 @@ import {
   WalletMovementDto,
 } from './dto/spaces.dto';
 import { errorResponse, successResponse } from 'src/utils/response/response';
+import { RequirePermissions } from 'src/helper/decorators/permissions.decorator';
 
+@RequirePermissions('spaces.access')
 @ApiBearerAuth('bearer')
 @ApiTags('spaces')
 @Controller('spaces')
@@ -48,6 +50,7 @@ export class SpacesController {
 
   @Get()
   @ApiOperation({ summary: 'List my collaborative spaces' })
+  @RequirePermissions('spaces.read')
   async listMine(@Req() req: Request, @Res() res: Response) {
     try {
       const data = await this.spacesService.listMine(this.userId(req));
@@ -58,6 +61,7 @@ export class SpacesController {
   }
 
   @Post()
+  @RequirePermissions('spaces.create')
   async create(
     @Req() req: Request,
     @Body() dto: CreateSpaceDto,
@@ -72,6 +76,7 @@ export class SpacesController {
   }
 
   @Get('notifications')
+  @RequirePermissions('spaces.read')
   async notifications(@Req() req: Request, @Res() res: Response) {
     try {
       const data = await this.spacesService.listNotifications(this.userId(req));
@@ -82,6 +87,7 @@ export class SpacesController {
   }
 
   @Get('sync/outbox')
+  @RequirePermissions('spaces.read')
   async syncOutbox(@Req() req: Request, @Res() res: Response) {
     try {
       const data = await this.spacesService.listSyncOutbox(this.userId(req));
@@ -92,6 +98,7 @@ export class SpacesController {
   }
 
   @Post('sync/outbox')
+  @RequirePermissions('spaces.create')
   async enqueueSync(
     @Req() req: Request,
     @Body() dto: SyncOutboxDto,
@@ -106,6 +113,7 @@ export class SpacesController {
   }
 
   @Post('sync/ack')
+  @RequirePermissions('spaces.create')
   async ackSync(
     @Req() req: Request,
     @Body() body: { ids: string[] },
@@ -123,6 +131,7 @@ export class SpacesController {
   }
 
   @Post('invites/:token/accept')
+  @RequirePermissions('spaces.create')
   async acceptInvite(
     @Req() req: Request,
     @Param('token') token: string,
@@ -137,6 +146,7 @@ export class SpacesController {
   }
 
   @Get(':spaceId')
+  @RequirePermissions('spaces.read')
   async dashboard(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -151,6 +161,7 @@ export class SpacesController {
   }
 
   @Patch(':spaceId')
+  @RequirePermissions('spaces.update')
   async update(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -170,6 +181,7 @@ export class SpacesController {
   }
 
   @Post(':spaceId/favorite')
+  @RequirePermissions('spaces.update')
   async favorite(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -190,6 +202,7 @@ export class SpacesController {
   }
 
   @Get(':spaceId/members')
+  @RequirePermissions('spaces.read')
   async members(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -205,6 +218,7 @@ export class SpacesController {
   }
 
   @Post(':spaceId/invites')
+  @RequirePermissions('spaces.create')
   async invite(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -224,6 +238,7 @@ export class SpacesController {
   }
 
   @Patch(':spaceId/members/:memberId')
+  @RequirePermissions('spaces.update')
   async updateRole(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -245,6 +260,7 @@ export class SpacesController {
   }
 
   @Delete(':spaceId/members/:memberId')
+  @RequirePermissions('spaces.delete')
   async removeMember(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -264,6 +280,7 @@ export class SpacesController {
   }
 
   @Get(':spaceId/expenses')
+  @RequirePermissions('spaces.read')
   async expenses(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -279,6 +296,7 @@ export class SpacesController {
   }
 
   @Post(':spaceId/expenses')
+  @RequirePermissions('spaces.create')
   async createExpense(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -298,6 +316,7 @@ export class SpacesController {
   }
 
   @Get(':spaceId/balances')
+  @RequirePermissions('spaces.read')
   async balances(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -313,6 +332,7 @@ export class SpacesController {
   }
 
   @Get(':spaceId/settlements')
+  @RequirePermissions('spaces.read')
   async settlements(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -328,6 +348,7 @@ export class SpacesController {
   }
 
   @Post(':spaceId/settlements')
+  @RequirePermissions('spaces.create')
   async createSettlement(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -347,6 +368,7 @@ export class SpacesController {
   }
 
   @Get(':spaceId/budgets')
+  @RequirePermissions('spaces.read')
   async budgets(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -362,6 +384,7 @@ export class SpacesController {
   }
 
   @Post(':spaceId/budgets')
+  @RequirePermissions('spaces.create')
   async createBudget(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -381,6 +404,7 @@ export class SpacesController {
   }
 
   @Get(':spaceId/goals')
+  @RequirePermissions('spaces.read')
   async goals(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -396,6 +420,7 @@ export class SpacesController {
   }
 
   @Post(':spaceId/goals')
+  @RequirePermissions('spaces.create')
   async createGoal(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -415,6 +440,7 @@ export class SpacesController {
   }
 
   @Post(':spaceId/goals/:goalId/contribute')
+  @RequirePermissions('spaces.create')
   async contribute(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -436,6 +462,7 @@ export class SpacesController {
   }
 
   @Get(':spaceId/activity')
+  @RequirePermissions('spaces.read')
   async activity(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -451,6 +478,7 @@ export class SpacesController {
   }
 
   @Post(':spaceId/wallet')
+  @RequirePermissions('spaces.create')
   async wallet(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,
@@ -470,6 +498,7 @@ export class SpacesController {
   }
 
   @Get(':spaceId/reports')
+  @RequirePermissions('spaces.read')
   async reports(
     @Req() req: Request,
     @Param('spaceId') spaceId: string,

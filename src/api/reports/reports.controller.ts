@@ -15,7 +15,9 @@ import {
 import { Response } from 'express';
 import { ReportsService } from './reports.service';
 import { errorResponse, successResponse } from 'src/utils/response/response';
+import { RequirePermissions } from 'src/helper/decorators/permissions.decorator';
 
+@RequirePermissions('reports.access')
 @ApiBearerAuth('bearer')
 @ApiTags('reports')
 @Controller('reports')
@@ -27,6 +29,7 @@ export class ReportsController {
     summary:
       'Financial overview: twin, cash flow, categories, budgets, investments',
   })
+  @RequirePermissions('reports.read')
   @ApiQuery({ name: 'months', required: false, example: 6 })
   async overview(
     @Query('months') months: string,
