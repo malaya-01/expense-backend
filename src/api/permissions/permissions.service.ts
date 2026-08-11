@@ -135,15 +135,18 @@ export class PermissionsService implements OnModuleInit {
   }
 
   async resolveEffectiveAccess(userId: string): Promise<EffectiveAccess> {
+    const dbAdmin = await this.getUserAdminFlag(userId);
     const cached = await this.cache.get<EffectiveAccess>(this.cacheKey(userId));
     if (cached) {
+      if (dbAdmin) {
+        return { ...cached, is_admin: true };
+      }
       const staleAccessOnly =
-        !cached.is_admin &&
         cached.permissions.some((code) => code.endsWith('.access')) &&
         !cached.permissions.some((code) =>
           /\.(create|read|update|delete)$/.test(code),
         );
-      if (!staleAccessOnly) return cached;
+      if (!staleAccessOnly) return { ...cached, is_admin: false };
     }
 
     const adminResult = await this.pgPool.query(
