@@ -54,12 +54,11 @@ export class PermissionsGuard implements CanActivate {
 
     if (!required.length) return true;
     if (access.is_admin) return true;
-    if (
-      permissionSatisfied(access.permissions, 'admin.access') &&
-      required.every((code) => !code.startsWith('admin.') || code === 'admin.access')
-    ) {
-      return true;
-    }
+
+    // Signed-in users can use the product (accounts, expenses, etc.).
+    // Only the admin console stays permission-gated.
+    const needsAdmin = required.some((code) => code.startsWith('admin.'));
+    if (!needsAdmin) return true;
 
     const granted = access.permissions;
     const ok =

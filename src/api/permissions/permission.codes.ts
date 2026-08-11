@@ -219,10 +219,12 @@ export function permissionSatisfied(
     return CRUD_ACTIONS.some((a) => set.has(perm(module, a)));
   }
 
-  // Older DBs / cached sessions only granted module.access.
-  if ((CRUD_ACTIONS as readonly string[]).includes(action)) {
-    const hasFineGrained = CRUD_ACTIONS.some((a) => set.has(perm(module, a)));
-    if (!hasFineGrained && set.has(perm(module, 'access'))) return true;
+  // Holding module.access means the user can use that module fully.
+  if (
+    (CRUD_ACTIONS as readonly string[]).includes(action) &&
+    set.has(perm(module, 'access'))
+  ) {
+    return true;
   }
 
   return false;

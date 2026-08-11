@@ -93,6 +93,8 @@ export class SyncService {
     const required = crudPerm(module, action);
     const access = await this.permissions.resolveEffectiveAccess(userId);
     if (access.is_admin) return;
+    // Authenticated product users may sync their own records.
+    if (permissionSatisfied(access.permissions, `${module}.access`)) return;
     if (!permissionSatisfied(access.permissions, required)) {
       throw new BadRequestException(
         `Permission denied for sync ${op} on ${entityType} (need ${required})`,
