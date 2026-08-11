@@ -4,11 +4,9 @@ import {
   IsArray,
   IsBoolean,
   IsIn,
-  IsISO8601,
   IsNumber,
   IsOptional,
   IsString,
-  IsUUID,
   MaxLength,
   ValidateNested,
 } from 'class-validator';
@@ -54,7 +52,8 @@ export class SyncChangeDto {
 
   @ApiPropertyOptional()
   @IsOptional()
-  @IsUUID()
+  @IsString()
+  @MaxLength(120)
   entity_id?: string;
 
   @ApiProperty({ enum: SYNC_OPS })
@@ -67,7 +66,8 @@ export class SyncChangeDto {
 
   @ApiPropertyOptional()
   @IsOptional()
-  @IsISO8601()
+  @IsString()
+  @MaxLength(40)
   client_updated_at?: string;
 
   @ApiPropertyOptional()

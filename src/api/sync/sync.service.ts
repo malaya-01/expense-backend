@@ -109,7 +109,10 @@ export class SyncService {
     }
     const allowed = new Set<string>();
     for (const [entity, module] of Object.entries(SYNC_ENTITY_MODULE)) {
-      if (permissionSatisfied(access.permissions, crudPerm(module, 'read'))) {
+      if (
+        permissionSatisfied(access.permissions, crudPerm(module, 'read')) ||
+        permissionSatisfied(access.permissions, `${module}.access`)
+      ) {
         allowed.add(entity);
       }
     }
@@ -194,10 +197,8 @@ export class SyncService {
   }
 
   async pull(userId: string, since: string | undefined, deviceId: string) {
-    const cursor = since ? new Date(since) : new Date(0);
-    if (Number.isNaN(cursor.getTime())) {
-      throw new BadRequestException('Invalid since cursor');
-    }
+    const parsed = since ? new Date(since) : new Date(0);
+    const cursor = Number.isNaN(parsed.getTime()) ? new Date(0) : parsed;
 
     const allowed = await this.allowedEntityTypes(userId);
     const empty = { rows: [] as Record<string, unknown>[] };
