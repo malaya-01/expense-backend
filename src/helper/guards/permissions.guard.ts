@@ -54,6 +54,12 @@ export class PermissionsGuard implements CanActivate {
 
     if (!required.length) return true;
     if (access.is_admin) return true;
+    if (
+      permissionSatisfied(access.permissions, 'admin.access') &&
+      required.every((code) => !code.startsWith('admin.') || code === 'admin.access')
+    ) {
+      return true;
+    }
 
     const granted = access.permissions;
     const ok =

@@ -97,6 +97,7 @@ export class AuthService {
       await this.categoriesService.seedDefaultsForUser(user.id, client);
       await client.query('COMMIT');
       await this.permissionsService.markAdminIfBootstrapEmail(user.id, user.email);
+      await this.permissionsService.ensureFirstUserIsAdmin();
       const access = await this.permissionsService.mePayload(user.id);
       // if (REQUIRE_EMAIL_VERIFICATION) {
       //   await this.sendVerificationEmail(user.id, user.email, user.full_name);

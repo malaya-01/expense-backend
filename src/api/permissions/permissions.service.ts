@@ -44,9 +44,32 @@ export class PermissionsService implements OnModuleInit {
   async onModuleInit() {
     try {
       await this.bootstrapAdminsFromEnv();
+      await this.ensureFirstUserIsAdmin();
     } catch (error) {
       console.error('Failed to bootstrap ADMIN_EMAILS:', error);
     }
+  }
+
+  /** If nobody is super-admin yet, promote the earliest account. */
+  async ensureFirstUserIsAdmin() {
+    const existing = await this.pgPool.query(
+      `SELECT id FROM users
+       WHERE is_admin = TRUE AND deleted_at IS NULL
+       LIMIT 1`,
+    );
+    if (existing.rowCount) return;
+    const first = await this.pgPool.query(
+      `SELECT id FROM users
+       WHERE deleted_at IS NULL
+       ORDER BY created_at ASC
+       LIMIT 1`,
+    );
+    if (!first.rowCount) return;
+    await this.pgPool.query(
+      `UPDATE users SET is_admin = TRUE, updated_at = NOW() WHERE id = $1`,
+      [first.rows[0].id],
+    );
+    await this.invalidateUserCache(first.rows[0].id);
   }
 
   cacheKey(userId: string) {
@@ -93,17 +116,35 @@ export class PermissionsService implements OnModuleInit {
     return true;
   }
 
+  normalizeAdminFlag(value: unknown): boolean {
+    return (
+      value === true ||
+      value === 1 ||
+      value === '1' ||
+      value === 'true' ||
+      value === 't'
+    );
+  }
+
   async getUserAdminFlag(userId: string): Promise<boolean> {
     const result = await this.pgPool.query(
       `SELECT is_admin FROM users WHERE id = $1 AND deleted_at IS NULL`,
       [userId],
     );
-    return Boolean(result.rows[0]?.is_admin);
+    return this.normalizeAdminFlag(result.rows[0]?.is_admin);
   }
 
   async resolveEffectiveAccess(userId: string): Promise<EffectiveAccess> {
     const cached = await this.cache.get<EffectiveAccess>(this.cacheKey(userId));
-    if (cached) return cached;
+    if (cached) {
+      const staleAccessOnly =
+        !cached.is_admin &&
+        cached.permissions.some((code) => code.endsWith('.access')) &&
+        !cached.permissions.some((code) =>
+          /\.(create|read|update|delete)$/.test(code),
+        );
+      if (!staleAccessOnly) return cached;
+    }
 
     const adminResult = await this.pgPool.query(
       `SELECT is_admin FROM users WHERE id = $1 AND deleted_at IS NULL`,
@@ -112,7 +153,7 @@ export class PermissionsService implements OnModuleInit {
     if (!adminResult.rowCount) {
       throw new NotFoundException('User not found');
     }
-    const is_admin = Boolean(adminResult.rows[0].is_admin);
+    const is_admin = this.normalizeAdminFlag(adminResult.rows[0].is_admin);
 
     const rows = await this.pgPool.query(
       `SELECT p.code, p.is_default, o.effect AS override_effect
@@ -151,6 +192,12 @@ export class PermissionsService implements OnModuleInit {
     if (!codes.length) return true;
     const access = await this.resolveEffectiveAccess(userId);
     if (access.is_admin) return true;
+    if (
+      permissionSatisfied(access.permissions, 'admin.access') &&
+      codes.every((code) => !code.startsWith('admin.') || code === 'admin.access')
+    ) {
+      return true;
+    }
     return codes.every((code) =>
       permissionSatisfied(access.permissions, code),
     );
@@ -227,7 +274,7 @@ export class PermissionsService implements OnModuleInit {
       [userId],
     );
 
-    const is_admin = Boolean(userResult.rows[0].is_admin);
+    const is_admin = this.normalizeAdminFlag(userResult.rows[0].is_admin);
     const permissions: UserPermissionRow[] = rows.rows.map((row) => {
       const override_effect =
         (row.override_effect as 'GRANT' | 'REVOKE' | null) ?? null;
