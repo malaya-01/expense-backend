@@ -86,6 +86,24 @@ export class SpacesController {
     }
   }
 
+  @Patch('notifications/read')
+  @RequirePermissions('spaces.read')
+  async markNotificationsRead(
+    @Req() req: Request,
+    @Body() body: { ids?: string[] },
+    @Res() res: Response,
+  ) {
+    try {
+      const data = await this.spacesService.markNotificationsRead(
+        this.userId(req),
+        body.ids || [],
+      );
+      return res.status(HttpStatus.OK).send(successResponse(data, 'Marked read'));
+    } catch (error) {
+      return this.fail(res, error);
+    }
+  }
+
   @Get('sync/outbox')
   @RequirePermissions('spaces.read')
   async syncOutbox(@Req() req: Request, @Res() res: Response) {

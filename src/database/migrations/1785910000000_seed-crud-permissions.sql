@@ -36,7 +36,7 @@ VALUES
   ('loans', 'loans.update', 'Update Loans', 'Edit debt plans', TRUE),
   ('loans', 'loans.delete', 'Delete Loans', 'Delete debt plans', TRUE),
 
-  -- budgets CRUD
+  --fbudgets CRUD
   ('budgets', 'budgets.create', 'Create Budgets', 'Create budgets', TRUE),
   ('budgets', 'budgets.read', 'Read Budgets', 'View budgets', TRUE),
   ('budgets', 'budgets.update', 'Update Budgets', 'Edit budgets', TRUE),

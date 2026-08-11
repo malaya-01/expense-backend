@@ -18,6 +18,9 @@ types.setTypeParser(1082, (value: string) => value);
           user: db.USERNAME,
           password: db.PASSWORD,
           database: db.DATABASE,
+          max: 20,
+          idleTimeoutMillis: 30_000,
+          connectionTimeoutMillis: 15_000,
           ...(db.SSL
             ? {
                 ssl: {

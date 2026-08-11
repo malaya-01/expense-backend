@@ -114,9 +114,9 @@ export class AccountsService {
     try {
       const result = await client.query(
         `SELECT id, user_id, name, type, balance, currency, institution, color, notes,
-                include_in_net_worth, created_at, updated_at, deleted_at
+                include_in_net_worth, space_id, created_at, updated_at, deleted_at
          FROM financial_containers
-         WHERE user_id = $1 AND deleted_at IS NULL
+         WHERE user_id = $1 AND deleted_at IS NULL AND space_id IS NULL
          ORDER BY name ASC`,
         [userId],
       );
@@ -135,7 +135,7 @@ export class AccountsService {
     try {
       const result = await client.query(
         `SELECT id, user_id, name, type, balance, currency, institution, color, notes,
-                include_in_net_worth, created_at, updated_at, deleted_at
+                include_in_net_worth, space_id, created_at, updated_at, deleted_at
          FROM financial_containers
          WHERE user_id = $1 AND id = $2 AND deleted_at IS NULL`,
         [userId, id],

@@ -499,16 +499,23 @@ export class SpacesService {
         const mySplit = splits.find((s) => s.member_id === membership.id);
         const amount = mySplit?.owed_amount || 0;
         if (amount > 0) {
-          const tx = await this.transactionsService.create(userId, {
-            type: 'expense',
-            amount,
-            description: `[${space.name}] ${dto.title.trim()}`,
-            date: dto.expense_date || new Date().toISOString().slice(0, 10),
-            source_container_id: dto.personal_container_id,
-            currency: space.currency,
-            notes: dto.notes || `Linked space expense ${expenseId}`,
-            merchant: dto.title.trim(),
-          } as any);
+          // Use the same client — nested pgPool.connect() while holding this
+          // transaction deadlocks when the pool is saturated.
+          const tx = await this.transactionsService.createWithClient(
+            client,
+            userId,
+            {
+              type: 'expense',
+              amount,
+              description: `[${space.name}] ${dto.title.trim()}`,
+              date: dto.expense_date || new Date().toISOString().slice(0, 10),
+              source_container_id: dto.personal_container_id,
+              currency: space.currency,
+              notes: dto.notes || `Linked space expense ${expenseId}`,
+              merchant: dto.title.trim(),
+            } as any,
+            'spaces',
+          );
           personalTxId = tx.id;
           await client.query(
             `UPDATE space_expenses SET personal_transaction_id = $2 WHERE id = $1`,
@@ -650,15 +657,20 @@ export class SpacesService {
       );
       let personalTxId: string | null = null;
       if (dto.link_to_personal && dto.personal_container_id && status === 'completed') {
-        const tx = await this.transactionsService.create(userId, {
-          type: 'expense',
-          amount: dto.amount,
-          description: `[${space.name}] Settlement`,
-          date: new Date().toISOString().slice(0, 10),
-          source_container_id: dto.personal_container_id,
-          currency: space.currency,
-          notes: dto.notes || `Space settlement ${result.rows[0].id}`,
-        } as any);
+        const tx = await this.transactionsService.createWithClient(
+          client,
+          userId,
+          {
+            type: 'expense',
+            amount: dto.amount,
+            description: `[${space.name}] Settlement`,
+            date: new Date().toISOString().slice(0, 10),
+            source_container_id: dto.personal_container_id,
+            currency: space.currency,
+            notes: dto.notes || `Space settlement ${result.rows[0].id}`,
+          } as any,
+          'spaces',
+        );
         personalTxId = tx.id;
         await client.query(
           `UPDATE space_settlements SET personal_transaction_id = $2 WHERE id = $1`,
@@ -943,6 +955,7 @@ export class SpacesService {
        FROM space_notifications n
        LEFT JOIN collaborative_spaces s ON s.id = n.space_id
        WHERE n.user_id = $1
+         AND n.read_at IS NULL
        ORDER BY n.created_at DESC
        LIMIT 50`,
       [userId],
@@ -990,6 +1003,23 @@ export class SpacesService {
     );
 
     return merged.slice(0, 50);
+  }
+
+  async markNotificationsRead(userId: string, ids: string[]) {
+    const uuids = (ids || []).filter((id) =>
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        id,
+      ),
+    );
+    if (!uuids.length) return { updated: 0 };
+    const result = await this.pgPool.query(
+      `UPDATE space_notifications
+       SET read_at = COALESCE(read_at, NOW())
+       WHERE user_id = $1 AND id = ANY($2::uuid[])
+       RETURNING id`,
+      [userId, uuids],
+    );
+    return { updated: result.rowCount || 0 };
   }
 
   async overviewForAi(userId: string) {

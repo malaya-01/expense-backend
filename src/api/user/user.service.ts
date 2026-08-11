@@ -176,4 +176,47 @@ export class UserService {
     );
     return { message: 'Password updated successfully' };
   }
+
+  async getNotificationPreferences(userId: string) {
+    const result = await this.pgPool.query(
+      `SELECT preferences FROM user_notification_preferences
+       WHERE user_id = $1 AND deleted_at IS NULL`,
+      [userId],
+    );
+    const preferences =
+      result.rows[0]?.preferences && typeof result.rows[0].preferences === 'object'
+        ? result.rows[0].preferences
+        : {};
+    return { preferences };
+  }
+
+  async saveNotificationPreferences(
+    userId: string,
+    incoming: Record<string, unknown>,
+  ) {
+    const current = await this.getNotificationPreferences(userId);
+    const currentPrefs = (current.preferences || {}) as Record<string, unknown>;
+    const currentIds = Array.isArray(currentPrefs.dismissed_ids)
+      ? currentPrefs.dismissed_ids.map(String)
+      : [];
+    const incomingIds = Array.isArray(incoming.dismissed_ids)
+      ? incoming.dismissed_ids.map(String)
+      : [];
+    const preferences = {
+      ...currentPrefs,
+      ...incoming,
+      dismissed_ids: [...new Set([...currentIds, ...incomingIds])],
+    };
+    const result = await this.pgPool.query(
+      `INSERT INTO user_notification_preferences (user_id, preferences, updated_at)
+       VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET
+         preferences = EXCLUDED.preferences,
+         updated_at = NOW(),
+         deleted_at = NULL
+       RETURNING preferences`,
+      [userId, JSON.stringify(preferences)],
+    );
+    return { preferences: result.rows[0]?.preferences || preferences };
+  }
 }

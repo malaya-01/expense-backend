@@ -134,6 +134,49 @@ export class UserController {
     }
   }
 
+  @Get('notification-preferences')
+  @ApiOperation({ summary: 'Get notification preferences including read state' })
+  @RequirePermissions('settings.read')
+  async getNotificationPreferences(@Req() req: Request, @Res() res: Response) {
+    try {
+      const data = await this.userService.getNotificationPreferences(
+        (req as any).user.id as string,
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Notification preferences'));
+    } catch (error) {
+      const statusCode = error.status || error.statusCode || HttpStatus.BAD_REQUEST;
+      return res
+        .status(statusCode)
+        .send(errorResponse(error.message || 'Failed to load preferences', statusCode));
+    }
+  }
+
+  @Patch('notification-preferences')
+  @ApiOperation({ summary: 'Merge notification preferences' })
+  @RequirePermissions('settings.update')
+  async saveNotificationPreferences(
+    @Req() req: Request,
+    @Body() body: Record<string, unknown>,
+    @Res() res: Response,
+  ) {
+    try {
+      const data = await this.userService.saveNotificationPreferences(
+        (req as any).user.id as string,
+        body || {},
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Notification preferences saved'));
+    } catch (error) {
+      const statusCode = error.status || error.statusCode || HttpStatus.BAD_REQUEST;
+      return res
+        .status(statusCode)
+        .send(errorResponse(error.message || 'Failed to save preferences', statusCode));
+    }
+  }
+
   @Patch('password')
   @ApiOperation({ summary: 'Change account password' })
   @RequirePermissions('settings.update')

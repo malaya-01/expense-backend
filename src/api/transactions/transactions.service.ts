@@ -53,66 +53,9 @@ export class TransactionsService {
     const client = await this.pgPool.connect();
     try {
       await client.query('BEGIN');
-      const posted = await this.buildPostedTx(client, userId, dto);
-      const clientId = (dto as { id?: string }).id;
-      const result = await client.query(
-        clientId
-          ? `INSERT INTO ledger_transactions
-              (id, user_id, type, amount, description, date, category_id,
-               source_container_id, destination_container_id, merchant, currency, notes,
-               exchange_rate, fx_rate_to_base, amount_base)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-             RETURNING *`
-          : `INSERT INTO ledger_transactions
-              (user_id, type, amount, description, date, category_id,
-               source_container_id, destination_container_id, merchant, currency, notes,
-               exchange_rate, fx_rate_to_base, amount_base)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-             RETURNING *`,
-        clientId
-          ? [
-              clientId,
-              userId,
-              posted.type,
-              posted.amount,
-              posted.description,
-              posted.date,
-              posted.category_id || null,
-              posted.source_container_id || null,
-              posted.destination_container_id || null,
-              posted.merchant || null,
-              posted.currency,
-              posted.notes || null,
-              posted.exchange_rate,
-              posted.fx_rate_to_base,
-              posted.amount_base,
-            ]
-          : [
-              userId,
-              posted.type,
-              posted.amount,
-              posted.description,
-              posted.date,
-              posted.category_id || null,
-              posted.source_container_id || null,
-              posted.destination_container_id || null,
-              posted.merchant || null,
-              posted.currency,
-              posted.notes || null,
-              posted.exchange_rate,
-              posted.fx_rate_to_base,
-              posted.amount_base,
-            ],
-      );
-      await this.postJournal(
-        client,
-        userId,
-        result.rows[0].id,
-        posted,
-        'transactions',
-      );
+      const created = await this.createWithClient(client, userId, dto);
       await client.query('COMMIT');
-      return this.normalize(result.rows[0]);
+      return created;
     } catch (error: any) {
       await client.query('ROLLBACK');
       if (error?.status) throw error;
@@ -122,6 +65,79 @@ export class TransactionsService {
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * Create a ledger transaction using an already-open pool client/transaction.
+   * Callers must BEGIN/COMMIT/ROLLBACK and release the client themselves.
+   * Avoids nested `pgPool.connect()` deadlocks when composing multi-step writes.
+   */
+  async createWithClient(
+    client: PoolClient,
+    userId: string,
+    dto: CreateTransactionDto,
+    sourceModule = 'transactions',
+  ) {
+    this.validateShape(dto);
+    const posted = await this.buildPostedTx(client, userId, dto);
+    const clientId = (dto as { id?: string }).id;
+    const result = await client.query(
+      clientId
+        ? `INSERT INTO ledger_transactions
+            (id, user_id, type, amount, description, date, category_id,
+             source_container_id, destination_container_id, merchant, currency, notes,
+             exchange_rate, fx_rate_to_base, amount_base)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+           RETURNING *`
+        : `INSERT INTO ledger_transactions
+            (user_id, type, amount, description, date, category_id,
+             source_container_id, destination_container_id, merchant, currency, notes,
+             exchange_rate, fx_rate_to_base, amount_base)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+           RETURNING *`,
+      clientId
+        ? [
+            clientId,
+            userId,
+            posted.type,
+            posted.amount,
+            posted.description,
+            posted.date,
+            posted.category_id || null,
+            posted.source_container_id || null,
+            posted.destination_container_id || null,
+            posted.merchant || null,
+            posted.currency,
+            posted.notes || null,
+            posted.exchange_rate,
+            posted.fx_rate_to_base,
+            posted.amount_base,
+          ]
+        : [
+            userId,
+            posted.type,
+            posted.amount,
+            posted.description,
+            posted.date,
+            posted.category_id || null,
+            posted.source_container_id || null,
+            posted.destination_container_id || null,
+            posted.merchant || null,
+            posted.currency,
+            posted.notes || null,
+            posted.exchange_rate,
+            posted.fx_rate_to_base,
+            posted.amount_base,
+          ],
+    );
+    await this.postJournal(
+      client,
+      userId,
+      result.rows[0].id,
+      posted,
+      sourceModule,
+    );
+    return this.normalize(result.rows[0]);
   }
 
   async findAll(userId: string) {

@@ -528,7 +528,28 @@ export class SyncService {
     userId: string,
     payload: { preferences?: Record<string, unknown> },
   ) {
-    const prefs = payload.preferences ?? payload;
+    const incoming = (payload.preferences ?? payload) as Record<string, unknown>;
+    const existing = await this.pgPool.query(
+      `SELECT preferences FROM user_notification_preferences
+       WHERE user_id = $1 AND deleted_at IS NULL`,
+      [userId],
+    );
+    const current =
+      existing.rows[0]?.preferences &&
+      typeof existing.rows[0].preferences === 'object'
+        ? (existing.rows[0].preferences as Record<string, unknown>)
+        : {};
+    const currentIds = Array.isArray(current.dismissed_ids)
+      ? current.dismissed_ids.map(String)
+      : [];
+    const incomingIds = Array.isArray(incoming.dismissed_ids)
+      ? incoming.dismissed_ids.map(String)
+      : [];
+    const prefs = {
+      ...current,
+      ...incoming,
+      dismissed_ids: [...new Set([...currentIds, ...incomingIds])],
+    };
     const result = await this.pgPool.query(
       `INSERT INTO user_notification_preferences (user_id, preferences, updated_at)
        VALUES ($1, $2::jsonb, NOW())
