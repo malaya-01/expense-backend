@@ -558,7 +558,7 @@ export class AiAdvisorController {
   }
 
   @Post('chat')
-  @ApiOperation({ summary: 'Send a message to FinOS AI Advisor' })
+  @ApiOperation({ summary: 'Send a message to Opal AI Advisor' })
   @ApiBody({ type: ChatMessageDto })
   @RequirePermissions('ai.create')
   async chat(
@@ -578,7 +578,7 @@ export class AiAdvisorController {
   }
 
   @Post('chat/stream')
-  @ApiOperation({ summary: 'Stream a FinOS AI Advisor reply (SSE)' })
+  @ApiOperation({ summary: 'Stream an Opal AI Advisor reply (SSE)' })
   @ApiBody({ type: ChatMessageDto })
   @RequirePermissions('ai.create')
   async chatStream(
@@ -621,10 +621,23 @@ export class AiAdvisorController {
       }
     } catch (error: any) {
       if (!res.writableEnded) {
+        const message =
+          typeof error?.getResponse === 'function'
+            ? (() => {
+                const response = error.getResponse();
+                if (typeof response === 'string') return response;
+                if (response?.message) {
+                  return Array.isArray(response.message)
+                    ? response.message.join(', ')
+                    : String(response.message);
+                }
+                return error?.message || 'Stream failed';
+              })()
+            : error?.message || 'Stream failed';
         res.write(
           `data: ${JSON.stringify({
             type: 'error',
-            message: error?.message || 'Stream failed',
+            message,
           })}\n\n`,
         );
       }

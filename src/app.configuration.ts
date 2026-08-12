@@ -1,7 +1,7 @@
 import './load-env';
 
 export default () => ({
-  PROJECT: 'FinOS',
+  PROJECT: 'Opal',
   PORT: parseInt(process.env.PORT || '9000'),
 
   ENVIRONMENT: process.env.NODE_ENV || 'development',
@@ -47,7 +47,7 @@ export default () => ({
       'false',
   },
   SWAGGER: {
-    TITLE: 'FinOS APIs',
+    TITLE: 'Opal APIs',
     DESCRIPTION: 'Personal Financial Operating System',
     VERSION: '1.0.0',
   },

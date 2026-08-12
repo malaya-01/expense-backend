@@ -1,4 +1,4 @@
-/** Shared slash (/) and mention (@) catalog for FinOS AI Advisor. */
+/** Shared slash (/) and mention (@) catalog for Opal AI Advisor. */
 
 export type AiAtToolDef = {
   id: string;
@@ -187,7 +187,7 @@ export const AI_SLASH_COMMANDS: AiSlashCommandDef[] = [
     label: 'Seed categories',
     description: 'Propose a full expense taxonomy',
     prompt:
-      'Review my existing categories. The FinOS server will attach confirmable create_category proposals automatically — do NOT emit action_proposal JSON blocks or long category lists. Reply in under 120 words: acknowledge the seed request, mention that Review / Review all cards will appear, and skip names that already exist.',
+      'Review my existing categories. The Opal server will attach confirmable create_category proposals automatically — do NOT emit action_proposal JSON blocks or long category lists. Reply in under 120 words: acknowledge the seed request, mention that Review / Review all cards will appear, and skip names that already exist.',
     tools: ['list_categories'],
   },
   {

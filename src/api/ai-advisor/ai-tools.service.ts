@@ -283,7 +283,7 @@ export class AiToolsService {
     context.fx_sample = {
       USD_to_INR: getRate('USD', 'INR'),
       INR_to_USD: getRate('INR', 'USD'),
-      note: 'Static pivot rates used by FinOS until live FX is configured',
+      note: 'Static pivot rates used by Opal until live FX is configured',
     };
 
     if (deep.size) {

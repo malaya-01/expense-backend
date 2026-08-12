@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  HttpException,
   Inject,
   Injectable,
   NotFoundException,
@@ -23,7 +24,30 @@ import {
   buildSeedCategoryProposals,
   wantsCategorySeed,
 } from './default-category-taxonomy';
-import {
+
+function extractAdvisorErrorMessage(error: unknown): string {
+  if (!error) return 'Advisor stream failed';
+  if (error instanceof HttpException) {
+    const response = error.getResponse();
+    if (typeof response === 'string' && response.trim()) return response.trim();
+    if (response && typeof response === 'object') {
+      const message = (response as { message?: string | string[] }).message;
+      if (Array.isArray(message)) {
+        const joined = message.filter(Boolean).join(', ').trim();
+        if (joined) return joined;
+      } else if (typeof message === 'string' && message.trim()) {
+        return message.trim();
+      }
+    }
+  }
+  if (error instanceof Error && error.message.trim()) {
+    // Nest often sets Error.message to "Http Exception" — prefer getResponse above.
+    if (!/^http exception$/i.test(error.message.trim())) {
+      return error.message.trim();
+    }
+  }
+  return 'Advisor stream failed';
+}import {
   CATEGORY_ICON_IDS,
   suggestCategoryIconHeuristic,
 } from '../categories/category-icons';
@@ -468,7 +492,7 @@ export class AiAdvisorService {
     }
 
     const suggested_actions = [
-      'Ask FinOS to summarize this document',
+      'Ask Opal to summarize this document',
       'Find unusual expenses related to this file',
       'Create a budget or goal from the insights',
     ];
@@ -750,7 +774,7 @@ export class AiAdvisorService {
       }
       yield {
         type: 'error',
-        message: error?.message || 'Advisor stream failed',
+        message: extractAdvisorErrorMessage(error),
       };
     }
   }
@@ -909,7 +933,7 @@ export class AiAdvisorService {
       invoked.length
         ? `User-invoked tools for this turn (@ / slash): ${invoked.join(', ')}. Prioritize these datasets.`
         : 'No explicit @ or / tool invocation for this turn.',
-      'Live FinOS twin context (JSON):',
+      'Live Opal twin context (JSON):',
       JSON.stringify({ ...context, web_sources: undefined }).slice(
         0,
         invoked.length ? 64000 : 48000,
@@ -917,7 +941,7 @@ export class AiAdvisorService {
       context.web_sources
         ? [
             'Current public web sources are included above.',
-            'Use them only for public facts, clearly distinguish them from the user’s FinOS data, and cite claims with descriptive Markdown links to the supplied URLs.',
+            'Use them only for public facts, clearly distinguish them from the user’s Opal data, and cite claims with descriptive Markdown links to the supplied URLs.',
             'Never fabricate a citation or image.',
             `Public web source excerpts (JSON): ${JSON.stringify(context.web_sources).slice(0, 12000)}`,
           ].join(' ')
@@ -1374,7 +1398,7 @@ export class AiAdvisorService {
           [proposalId],
         );
         await client.query('COMMIT');
-        throw new BadRequestException('Proposal expired. Ask FinOS again.');
+        throw new BadRequestException('Proposal expired. Ask Opal again.');
       }
 
       const executed = await this.toolsService.executeProposal(

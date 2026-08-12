@@ -47,7 +47,7 @@ async function sendViaResend(options: {
     process.env.RESEND_FROM ||
     process.env.SMTP_FROM ||
     process.env.SMTP_USER ||
-    'FinOS <onboarding@resend.dev>';
+    'Opal <onboarding@resend.dev>';
 
   const response = await fetch('https://api.resend.com/emails', {
     method: 'POST',
@@ -102,7 +102,7 @@ export async function sendMail(options: {
       error instanceof Error ? error.message : 'Unknown mail error';
     // Surface the real reason in Render logs (no secrets).
     // eslint-disable-next-line no-console
-    console.error('[FinOS] sendMail failed:', message);
+    console.error('[Opal] sendMail failed:', message);
     throw error;
   }
 }
@@ -118,7 +118,7 @@ export function buildVerificationEmailHtml(params: {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Verify your FinOS email</title>
+  <title>Verify your Opal email</title>
 </head>
 <body style="margin:0;padding:0;background:#f4f5f7;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#171717;">
   <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f4f5f7;padding:32px 16px;">
@@ -127,7 +127,7 @@ export function buildVerificationEmailHtml(params: {
         <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:520px;background:#ffffff;border-radius:16px;overflow:hidden;border:1px solid #e8e8e8;">
           <tr>
             <td style="background:#0f172a;padding:28px 32px;">
-              <div style="font-size:13px;letter-spacing:0.18em;text-transform:uppercase;color:#94a3b8;font-weight:600;">FinOS</div>
+              <div style="font-size:13px;letter-spacing:0.18em;text-transform:uppercase;color:#94a3b8;font-weight:600;">Opal</div>
               <div style="margin-top:8px;font-size:22px;line-height:1.3;font-weight:700;color:#ffffff;">Verify your email</div>
             </td>
           </tr>
@@ -150,7 +150,7 @@ export function buildVerificationEmailHtml(params: {
           </tr>
           <tr>
             <td style="padding:16px 32px 28px;border-top:1px solid #f1f5f9;font-size:11px;line-height:1.5;color:#94a3b8;">
-              If you did not create a FinOS account, you can ignore this message.
+              If you did not create an Opal account, you can ignore this message.
             </td>
           </tr>
         </table>

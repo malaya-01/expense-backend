@@ -157,7 +157,7 @@ export class ChatAttachmentDto {
 }
 
 export class CreateAiMemoryDto {
-  @ApiProperty({ description: 'A durable preference, goal, or fact FinOS should remember' })
+  @ApiProperty({ description: 'A durable preference, goal, or fact Opal should remember' })
   @IsString()
   @MinLength(2)
   @MaxLength(1000)

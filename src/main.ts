@@ -51,7 +51,7 @@ async function bootstrap() {
       'Content-Type',
       'Authorization',
       'Accept',
-      'X-FinOS-Client',
+      'X-Opal-Client',
     ],
   });
   useContainer(app.select(AppModule), { fallbackOnErrors: true });

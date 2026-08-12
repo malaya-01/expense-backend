@@ -214,12 +214,12 @@ export class AuthService {
       'http://localhost:3000'
     ).replace(/\/$/, '');
     const verifyUrl = `${clientHost}/verify-email?token=${token}`;
-    const text = `Hi ${fullName || 'there'},\n\nVerify your FinOS email by opening this link (expires in ${EMAIL_VERIFY_TTL_HOURS} hour):\n${verifyUrl}\n\nIf you did not create this account, ignore this email.`;
+    const text = `Hi ${fullName || 'there'},\n\nVerify your Opal email by opening this link (expires in ${EMAIL_VERIFY_TTL_HOURS} hour):\n${verifyUrl}\n\nIf you did not create this account, ignore this email.`;
 
     try {
       await sendMail({
         to: email,
-        subject: 'Verify your FinOS email',
+        subject: 'Verify your Opal email',
         text,
         html: buildVerificationEmailHtml({
           fullName,
@@ -238,7 +238,7 @@ export class AuthService {
     if (process.env.NODE_ENV !== 'production') {
       // Helpful for local testing when the mailbox is hard to reach.
       // eslint-disable-next-line no-console
-      console.info(`[FinOS] Email verification link for ${email}: ${verifyUrl}`);
+      console.info(`[Opal] Email verification link for ${email}: ${verifyUrl}`);
     }
   }
 
@@ -315,9 +315,9 @@ export class AuthService {
     }
     await sendMail({
       to: email,
-      subject: 'Your FinOS password recovery code',
-      text: `Your FinOS recovery code is ${otp}. It expires in 10 minutes. If you did not request this, ignore this email.`,
-      html: `<p>Your FinOS recovery code is:</p><p style="font-size:24px;font-weight:700;letter-spacing:4px">${otp}</p><p>It expires in 10 minutes. If you did not request this, ignore this email.</p>`,
+      subject: 'Your Opal password recovery code',
+      text: `Your Opal recovery code is ${otp}. It expires in 10 minutes. If you did not request this, ignore this email.`,
+      html: `<p>Your Opal recovery code is:</p><p style="font-size:24px;font-weight:700;letter-spacing:4px">${otp}</p><p>It expires in 10 minutes. If you did not request this, ignore this email.</p>`,
     });
   }
 
@@ -441,15 +441,17 @@ export class AuthService {
       const refreshTokenHash = await bcrypt.hash(refreshToken, 10);
 
       const sessionToken = randomUUID();
+      const clientHeader =
+        req.headers['x-opal-client'] ?? req.headers['x-finos-client'];
       const clientPlatform =
-        (typeof req.headers['x-finos-client'] === 'string'
-          ? req.headers['x-finos-client']
-          : Array.isArray(req.headers['x-finos-client'])
-            ? req.headers['x-finos-client'][0]
+        (typeof clientHeader === 'string'
+          ? clientHeader
+          : Array.isArray(clientHeader)
+            ? clientHeader[0]
             : '') || '';
       const rawUa = req.headers['user-agent'] || null;
       const userAgent = clientPlatform
-        ? `[finos:${clientPlatform}] ${rawUa || ''}`.trim()
+        ? `[opal:${clientPlatform}] ${rawUa || ''}`.trim()
         : rawUa;
 
       // Store session

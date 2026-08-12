@@ -7,22 +7,43 @@ import {
   ProviderChatResult,
   ProviderConfig,
 } from './types';
+import { providerHttpException } from './provider-errors';
 import { normalizeOpenAiCompatibleUrl } from './url-guard';
 
 type CompatibleProviderId = 'openai' | 'local' | 'openrouter';
 
-async function readError(res: Response): Promise<string> {
+async function readErrorPayload(res: Response): Promise<{
+  message: string;
+  code?: string;
+}> {
   try {
     const data = await res.json();
-    return (
+    const message =
       data?.error?.message ||
       data?.message ||
-      data?.error ||
-      `${res.status} ${res.statusText}`
-    );
+      (typeof data?.error === 'string' ? data.error : null) ||
+      `${res.status} ${res.statusText}`;
+    const code =
+      data?.error?.code ||
+      data?.error?.metadata?.raw ||
+      data?.code ||
+      undefined;
+    return {
+      message: String(message),
+      code: code ? String(code) : undefined,
+    };
   } catch {
-    return `${res.status} ${res.statusText}`;
+    return { message: `${res.status} ${res.statusText}` };
   }
+}
+
+function throwProviderFailure(
+  provider: CompatibleProviderId,
+  res: Response,
+  payload: { message: string; code?: string },
+): never {
+  const combined = [payload.code, payload.message].filter(Boolean).join(' — ');
+  throw providerHttpException(provider, res.status, combined);
 }
 
 export class OpenAiCompatibleAdapter implements AiProviderAdapter {
@@ -55,8 +76,8 @@ export class OpenAiCompatibleAdapter implements AiProviderAdapter {
     };
     if (this.id === 'openrouter') {
       const cfg = appConfiguration();
-      headers['HTTP-Referer'] = cfg.CLIENT_HOST || 'https://finos.app';
-      headers['X-OpenRouter-Title'] = cfg.PROJECT || 'FinOS';
+      headers['HTTP-Referer'] = cfg.CLIENT_HOST || 'https://opal.app';
+      headers['X-OpenRouter-Title'] = cfg.PROJECT || 'Opal';
     }
     return headers;
   }
@@ -111,9 +132,7 @@ export class OpenAiCompatibleAdapter implements AiProviderAdapter {
     });
 
     if (!res.ok) {
-      throw new BadRequestException(
-        `Provider error (${this.id}): ${await readError(res)}`,
-      );
+      throwProviderFailure(this.id, res, await readErrorPayload(res));
     }
     const data = await res.json();
     const content = data?.choices?.[0]?.message?.content;
@@ -151,9 +170,7 @@ export class OpenAiCompatibleAdapter implements AiProviderAdapter {
     });
 
     if (!res.ok) {
-      throw new BadRequestException(
-        `Provider error (${this.id}): ${await readError(res)}`,
-      );
+      throwProviderFailure(this.id, res, await readErrorPayload(res));
     }
     if (!res.body) {
       throw new BadRequestException('Provider returned an empty stream.');
