@@ -1,4 +1,10 @@
-export const AI_PROVIDERS = ['openai', 'anthropic', 'local', 'vertex'] as const;
+export const AI_PROVIDERS = [
+  'openrouter',
+  'openai',
+  'anthropic',
+  'local',
+  'vertex',
+] as const;
 export type AiProviderId = (typeof AI_PROVIDERS)[number];
 
 export type ChatMessage = {
@@ -66,6 +72,19 @@ export interface AiProviderAdapter {
 }
 
 export const DEFAULT_MODELS: Record<AiProviderId, string[]> = {
+  /** OpenRouter model slugs — browse more at https://openrouter.ai/models */
+  openrouter: [
+    'openai/gpt-4o-mini',
+    'openai/gpt-4o',
+    'anthropic/claude-sonnet-4',
+    'anthropic/claude-3.5-haiku',
+    'google/gemini-2.5-flash',
+    'google/gemini-2.5-pro',
+    'deepseek/deepseek-chat',
+    'meta-llama/llama-3.3-70b-instruct',
+    'qwen/qwen-2.5-72b-instruct',
+    'mistralai/mistral-small-3.1-24b-instruct',
+  ],
   openai: ['gpt-4.1-mini', 'gpt-4.1', 'gpt-4o-mini', 'gpt-4o', 'o4-mini'],
   anthropic: [
     'claude-3-5-haiku-latest',

@@ -61,14 +61,27 @@ export class AiSettingsService {
         configs.rows.map((row) => [row.provider, this.publicConfig(row)]),
       );
 
-      const providers = (['openai', 'anthropic', 'local', 'vertex'] as AiProviderId[]).map(
+      const providers = (
+        [
+          'openrouter',
+          'openai',
+          'anthropic',
+          'local',
+          'vertex',
+        ] as AiProviderId[]
+      ).map(
         (provider) =>
           byProvider.get(provider) || {
             provider,
             connected: false,
             model: DEFAULT_MODELS[provider][0],
             display_name: null,
-            base_url: provider === 'local' ? 'http://127.0.0.1:11434/v1' : null,
+            base_url:
+              provider === 'local'
+                ? 'http://127.0.0.1:11434/v1'
+                : provider === 'openrouter'
+                  ? 'https://openrouter.ai/api/v1'
+                  : null,
             project_id: null,
             location: provider === 'vertex' ? 'us-central1' : null,
             credentials_meta: {},
@@ -77,6 +90,7 @@ export class AiSettingsService {
             last_test_message: null,
             default_models: getDefaultModels(provider),
             setup: PROVIDER_SETUP_GUIDES[provider],
+            recommended: provider === 'openrouter',
           },
       );
 
@@ -112,7 +126,9 @@ export class AiSettingsService {
       provider === 'local' || provider === 'openai'
         ? validateModelBaseUrl(dto.base_url) ||
           (provider === 'local' ? 'http://127.0.0.1:11434/v1' : null)
-        : null;
+        : provider === 'openrouter'
+          ? 'https://openrouter.ai/api/v1'
+          : null;
 
     const existing = await this.pgPool.query(
       `SELECT * FROM user_ai_provider_configs
@@ -158,6 +174,9 @@ export class AiSettingsService {
       secretPayload.serviceAccountJson = dto.service_account_json.trim();
     }
 
+    if (provider === 'openrouter' && !secretPayload.apiKey) {
+      throw new BadRequestException('OpenRouter API key is required.');
+    }
     if (provider === 'openai' && !secretPayload.apiKey) {
       throw new BadRequestException('OpenAI API key is required.');
     }
@@ -232,6 +251,7 @@ export class AiSettingsService {
       ...this.publicConfig(result.rows[0]),
       default_models: getDefaultModels(provider),
       setup: PROVIDER_SETUP_GUIDES[provider],
+      recommended: provider === 'openrouter',
     };
   }
 
@@ -351,7 +371,8 @@ export class AiSettingsService {
     const discovered = adapter.listModels
       ? await adapter.listModels(config)
       : [];
-    const merged = [...new Set([...discovered, ...defaults])];
+    // Keep curated defaults first so the UI highlights recommended slugs.
+    const merged = [...new Set([...defaults, ...discovered])];
     return {
       models: merged,
       source: discovered.length ? 'provider' : 'defaults',
@@ -430,9 +451,10 @@ export class AiSettingsService {
   }
 
   private publicConfig(row: any) {
+    const provider = row.provider as AiProviderId;
     return {
       id: row.id,
-      provider: row.provider,
+      provider,
       connected: Boolean(row.is_connected),
       display_name: row.display_name,
       model: row.model,
@@ -444,8 +466,9 @@ export class AiSettingsService {
       last_test_status: row.last_test_status,
       last_test_message: row.last_test_message,
       updated_at: row.updated_at,
-      default_models: getDefaultModels(row.provider),
-      setup: PROVIDER_SETUP_GUIDES[row.provider as AiProviderId],
+      default_models: getDefaultModels(provider),
+      setup: PROVIDER_SETUP_GUIDES[provider],
+      recommended: provider === 'openrouter',
     };
   }
 

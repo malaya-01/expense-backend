@@ -21,10 +21,13 @@ export class UpsertProviderConfigDto {
   @IsIn(AI_PROVIDERS)
   provider: (typeof AI_PROVIDERS)[number];
 
-  @ApiPropertyOptional({ example: 'gpt-4o-mini' })
+  @ApiPropertyOptional({
+    example: 'openai/gpt-4o-mini',
+    description: 'Model id (OpenRouter uses provider/model slugs)',
+  })
   @IsOptional()
   @IsString()
-  @MaxLength(120)
+  @MaxLength(200)
   model?: string;
 
   @ApiPropertyOptional({ example: 'Work OpenAI' })
@@ -34,7 +37,8 @@ export class UpsertProviderConfigDto {
   display_name?: string;
 
   @ApiPropertyOptional({
-    description: 'API key for OpenAI / Anthropic / local (optional for local)',
+    description:
+      'API key for OpenRouter / OpenAI / Anthropic / local (optional for local)',
   })
   @IsOptional()
   @IsString()
@@ -75,10 +79,10 @@ export class SelectActiveProviderDto {
   @IsIn(AI_PROVIDERS)
   provider: (typeof AI_PROVIDERS)[number];
 
-  @ApiPropertyOptional()
+  @ApiPropertyOptional({ example: 'openai/gpt-4o-mini' })
   @IsOptional()
   @IsString()
-  @MaxLength(120)
+  @MaxLength(200)
   model?: string;
 }
 

@@ -10,10 +10,12 @@ import { anthropicAdapter } from './anthropic.adapter';
 import {
   localAdapter,
   openAiAdapter,
+  openRouterAdapter,
 } from './openai-compatible.adapter';
 import { vertexAdapter } from './vertex.adapter';
 
 const adapters: Record<AiProviderId, AiProviderAdapter> = {
+  openrouter: openRouterAdapter,
   openai: openAiAdapter,
   anthropic: anthropicAdapter,
   local: localAdapter,

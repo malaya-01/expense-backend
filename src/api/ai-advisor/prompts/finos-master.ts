@@ -98,6 +98,26 @@ Do not invent other action types. Do not invent UUIDs for accounts or categories
 }
 
 export const PROVIDER_SETUP_GUIDES = {
+  openrouter: {
+    title: 'OpenRouter',
+    summary:
+      'Recommended: one API key unlocks hundreds of models (OpenAI, Claude, Gemini, Llama, and more).',
+    steps: [
+      'Open openrouter.ai and create an account.',
+      'Go to Keys and create an API key.',
+      'Add credits if needed (some models are free; paid models need balance).',
+      'Paste the key here, pick a model slug (openai/gpt-4o-mini is a solid default), then Test connection.',
+      'You can switch models anytime — use the list or paste any slug from openrouter.ai/models.',
+    ],
+    links: [
+      {
+        label: 'OpenRouter quickstart',
+        href: 'https://openrouter.ai/docs/quickstart',
+      },
+      { label: 'Create API key', href: 'https://openrouter.ai/keys' },
+      { label: 'Browse models', href: 'https://openrouter.ai/models' },
+    ],
+  },
   openai: {
     title: 'OpenAI',
     summary: 'Use GPT models with your own API key.',

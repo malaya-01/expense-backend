@@ -1,4 +1,5 @@
 import { BadRequestException } from '@nestjs/common';
+import appConfiguration from 'src/app.configuration';
 import {
   AiProviderAdapter,
   DEFAULT_MAX_OUTPUT_TOKENS,
@@ -7,6 +8,8 @@ import {
   ProviderConfig,
 } from './types';
 import { normalizeOpenAiCompatibleUrl } from './url-guard';
+
+type CompatibleProviderId = 'openai' | 'local' | 'openrouter';
 
 async function readError(res: Response): Promise<string> {
   try {
@@ -24,11 +27,14 @@ async function readError(res: Response): Promise<string> {
 
 export class OpenAiCompatibleAdapter implements AiProviderAdapter {
   constructor(
-    readonly id: 'openai' | 'local',
+    readonly id: CompatibleProviderId,
     private readonly defaultBaseUrl: string,
   ) {}
 
   private resolveUrl(config: ProviderConfig): string {
+    if (this.id === 'openrouter') {
+      return (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
+    }
     if (this.id === 'openai') {
       return (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
     }
@@ -38,13 +44,21 @@ export class OpenAiCompatibleAdapter implements AiProviderAdapter {
   private authHeaders(config: ProviderConfig): Record<string, string> {
     const apiKey =
       config.credentials.apiKey || (this.id === 'local' ? 'local' : '');
-    if (this.id === 'openai' && !apiKey) {
-      throw new BadRequestException('OpenAI API key is required.');
+    if ((this.id === 'openai' || this.id === 'openrouter') && !apiKey) {
+      throw new BadRequestException(
+        `${this.id === 'openrouter' ? 'OpenRouter' : 'OpenAI'} API key is required.`,
+      );
     }
-    return {
+    const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`,
     };
+    if (this.id === 'openrouter') {
+      const cfg = appConfiguration();
+      headers['HTTP-Referer'] = cfg.CLIENT_HOST || 'https://finos.app';
+      headers['X-OpenRouter-Title'] = cfg.PROJECT || 'FinOS';
+    }
+    return headers;
   }
 
   private messages(request: ProviderChatRequest) {
@@ -215,16 +229,25 @@ export class OpenAiCompatibleAdapter implements AiProviderAdapter {
   async listModels(config: ProviderConfig): Promise<string[]> {
     try {
       const base = this.resolveUrl(config);
-      const apiKey =
-        config.credentials.apiKey || (this.id === 'local' ? 'local' : '');
       const res = await fetch(`${base}/models`, {
-        headers: { Authorization: `Bearer ${apiKey}` },
+        headers: this.authHeaders(config),
       });
       if (!res.ok) return [];
       const data = await res.json();
       const ids = (data?.data || [])
         .map((m: any) => m.id)
         .filter((id: unknown): id is string => typeof id === 'string');
+
+      if (this.id === 'openrouter') {
+        // Prefer free / popular chat models; curated defaults are merged upstream.
+        const freeFirst = [...ids].sort((a, b) => {
+          const aFree = a.includes(':free') ? 0 : 1;
+          const bFree = b.includes(':free') ? 0 : 1;
+          if (aFree !== bFree) return aFree - bFree;
+          return a.localeCompare(b);
+        });
+        return freeFirst.slice(0, 120);
+      }
       return ids.slice(0, 50);
     } catch {
       return [];
@@ -235,6 +258,11 @@ export class OpenAiCompatibleAdapter implements AiProviderAdapter {
 export const openAiAdapter = new OpenAiCompatibleAdapter(
   'openai',
   'https://api.openai.com/v1',
+);
+
+export const openRouterAdapter = new OpenAiCompatibleAdapter(
+  'openrouter',
+  'https://openrouter.ai/api/v1',
 );
 
 export const localAdapter = new OpenAiCompatibleAdapter(
