@@ -44,14 +44,37 @@ async function bootstrap() {
     type: VersioningType.URI,
   });
 
+  // Capacitor WebViews use these origins (not the Vercel site). Without them,
+  // every mobile XHR fails CORS even when the API is healthy for the website.
+  const capacitorOrigins = [
+    'https://localhost',
+    'http://localhost',
+    'capacitor://localhost',
+    'ionic://localhost',
+  ];
+  const configuredOrigins = configuration.CLIENT_HOST.split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+  const allowedOrigins = new Set([...configuredOrigins, ...capacitorOrigins]);
+
   app.enableCors({
-    origin: configuration.CLIENT_HOST.split(',').map((origin) => origin.trim()),
+    origin: (origin, callback) => {
+      // Native CapacitorHttp / server-to-server often send no Origin.
+      if (!origin || allowedOrigins.has(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(null, false);
+    },
     credentials: true,
+    methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
     allowedHeaders: [
       'Content-Type',
       'Authorization',
       'Accept',
       'X-Opal-Client',
+      'X-Finos-Client',
+      'X-Requested-With',
     ],
   });
   useContainer(app.select(AppModule), { fallbackOnErrors: true });
