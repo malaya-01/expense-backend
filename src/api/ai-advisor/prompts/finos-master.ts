@@ -101,11 +101,12 @@ export const PROVIDER_SETUP_GUIDES = {
   omniroute: {
     title: 'OmniRoute (free)',
     summary:
-      'Built-in free AI — no API key or signup. Uses no-auth free backends with automatic failover. Limited to 20 successful requests per day.',
+      'Built-in free AI — no API key or signup for you. Opal routes across free backends and always falls back to Opal Advisor voice. Limited to 20 successful requests per day.',
     steps: [
-      'Click Use free AI — nothing to paste.',
-      'Pick a free model (auto switches between free backends if one is busy).',
-      'Chat in AI Advisor. After 20 successful replies today, connect OpenRouter or another BYOK provider for unlimited use.',
+      'Click Use free / Use free AI — Opal checks the connection first.',
+      'Pick a free model (auto switches if one route is busy).',
+      'Chat in AI Advisor. Status updates while Opal finds a route.',
+      'After 20 successful replies today, connect OpenRouter or another BYOK provider for unlimited use.',
     ],
     links: [
       {

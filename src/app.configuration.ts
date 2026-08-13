@@ -47,6 +47,11 @@ export default () => ({
       'false',
     OMNIROUTE_BASE_URL: process.env.OMNIROUTE_BASE_URL || '',
     OMNIROUTE_API_KEY: process.env.OMNIROUTE_API_KEY || '',
+    /** Optional shared OpenRouter key for free :free models (users never see it). */
+    OMNIROUTE_PLATFORM_KEY:
+      process.env.OMNIROUTE_PLATFORM_KEY ||
+      process.env.OPENROUTER_API_KEY ||
+      '',
     OMNIROUTE_DAILY_LIMIT: parseInt(process.env.OMNIROUTE_DAILY_LIMIT || '20', 10),
   },
   SWAGGER: {

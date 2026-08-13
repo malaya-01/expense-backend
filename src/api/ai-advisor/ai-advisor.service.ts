@@ -11,6 +11,7 @@ import { AiOmnirouteUsageService } from './ai-omniroute-usage.service';
 import { AiToolsService, Citation } from './ai-tools.service';
 import { AiWebSearchService } from './ai-web-search.service';
 import { runProviderChat, runProviderChatStream } from './providers';
+import { omnirouteAdapter } from './providers/omniroute.adapter';
 import { isOmnirouteProvider } from './providers/omniroute.free-backends';
 import { buildSystemPrompt } from './prompts/finos-master';
 import { ChatMessageDto } from './dto/ai-advisor.dto';
@@ -49,7 +50,9 @@ function extractAdvisorErrorMessage(error: unknown): string {
     }
   }
   return 'Advisor stream failed';
-}import {
+}
+
+import {
   CATEGORY_ICON_IDS,
   suggestCategoryIconHeuristic,
 } from '../categories/category-icons';
@@ -709,7 +712,16 @@ export class AiAdvisorService {
 
   async chat(userId: string, dto: ChatMessageDto) {
     const prepared = await this.prepareChat(userId, dto);
-    const result = await runProviderChat(prepared.config, prepared.messages);
+    const result = isOmnirouteProvider(prepared.config.provider)
+      ? await omnirouteAdapter.chatWithProgress(
+          prepared.config,
+          {
+            model: prepared.config.model,
+            messages: prepared.messages,
+          },
+          () => undefined,
+        )
+      : await runProviderChat(prepared.config, prepared.messages);
     const persisted = await this.persistAssistantTurn(
       prepared,
       result.content,
@@ -727,7 +739,7 @@ export class AiAdvisorService {
     signal?: AbortSignal,
   ): AsyncGenerator<AiChatStreamEvent> {
     try {
-      yield { type: 'status', message: 'Loading provider and twin context…' };
+      yield { type: 'status', message: 'Opening your Financial Twin…' };
       const prepared = await this.prepareChat(userId, dto);
       yield {
         type: 'meta',
@@ -740,27 +752,69 @@ export class AiAdvisorService {
         tool_activity: prepared.activity,
         citations: prepared.citations,
       };
-      yield { type: 'status', message: 'Generating reply…' };
 
       let rawContent = '';
       let model = prepared.config.model;
-      const stream = runProviderChatStream(
-        prepared.config,
-        prepared.messages,
-        signal,
-      );
-      while (true) {
-        const next = await stream.next();
-        if (next.done) {
-          if (next.value?.model) model = next.value.model;
-          if (next.value?.content) rawContent = next.value.content;
-          break;
+
+      if (isOmnirouteProvider(prepared.config.provider)) {
+        yield { type: 'status', message: 'Finding a free Opal route…' };
+        const progressQueue: string[] = [];
+        const resultPromise = omnirouteAdapter.chatWithProgress(
+          prepared.config,
+          {
+            model: prepared.config.model,
+            messages: prepared.messages,
+          },
+          (message) => {
+            progressQueue.push(message);
+          },
+          signal,
+        );
+
+        while (true) {
+          const raced = await Promise.race([
+            resultPromise.then((value) => ({ done: true as const, value })),
+            new Promise<{ done: false }>((resolve) =>
+              setTimeout(() => resolve({ done: false }), 350),
+            ),
+          ]);
+          while (progressQueue.length) {
+            yield { type: 'status', message: progressQueue.shift()! };
+          }
+          if (raced.done) {
+            rawContent = raced.value.content;
+            model = raced.value.model || model;
+            break;
+          }
+          if (signal?.aborted) throw new Error('Request cancelled');
         }
-        rawContent += next.value;
-        yield { type: 'delta', text: next.value };
+
+        yield { type: 'status', message: 'Writing your Opal Advisor reply…' };
+        const chunkSize = 18;
+        for (let i = 0; i < rawContent.length; i += chunkSize) {
+          if (signal?.aborted) throw new Error('Request cancelled');
+          yield { type: 'delta', text: rawContent.slice(i, i + chunkSize) };
+        }
+      } else {
+        yield { type: 'status', message: 'Opal Advisor is thinking…' };
+        const stream = runProviderChatStream(
+          prepared.config,
+          prepared.messages,
+          signal,
+        );
+        while (true) {
+          const next = await stream.next();
+          if (next.done) {
+            if (next.value?.model) model = next.value.model;
+            if (next.value?.content) rawContent = next.value.content;
+            break;
+          }
+          rawContent += next.value;
+          yield { type: 'delta', text: next.value };
+        }
       }
 
-      yield { type: 'status', message: 'Preparing relevant follow-up questions…' };
+      yield { type: 'status', message: 'Preparing follow-ups…' };
       const persisted = await this.persistAssistantTurn(
         prepared,
         rawContent,
