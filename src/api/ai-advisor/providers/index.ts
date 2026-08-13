@@ -12,9 +12,11 @@ import {
   openAiAdapter,
   openRouterAdapter,
 } from './openai-compatible.adapter';
+import { omnirouteAdapter } from './omniroute.adapter';
 import { vertexAdapter } from './vertex.adapter';
 
 const adapters: Record<AiProviderId, AiProviderAdapter> = {
+  omniroute: omnirouteAdapter,
   openrouter: openRouterAdapter,
   openai: openAiAdapter,
   anthropic: anthropicAdapter,

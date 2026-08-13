@@ -12,6 +12,7 @@ import { LoansModule } from '../loans/loans.module';
 import { RecurringModule } from '../recurring/recurring.module';
 import { ReportsModule } from '../reports/reports.module';
 import { TransactionsModule } from '../transactions/transactions.module';
+import { AiOmnirouteUsageService } from './ai-omniroute-usage.service';
 import { AiWebSearchService } from './ai-web-search.service';
 import { SpacesModule } from '../spaces/spaces.module';
 
@@ -34,6 +35,7 @@ import { SpacesModule } from '../spaces/spaces.module';
     AiSettingsService,
     AiToolsService,
     AiWebSearchService,
+    AiOmnirouteUsageService,
   ],
   exports: [AiAdvisorService, AiSettingsService],
 })

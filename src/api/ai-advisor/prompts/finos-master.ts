@@ -98,10 +98,30 @@ Do not invent other action types. Do not invent UUIDs for accounts or categories
 }
 
 export const PROVIDER_SETUP_GUIDES = {
+  omniroute: {
+    title: 'OmniRoute (free)',
+    summary:
+      'Built-in free AI — no API key or signup. Uses no-auth free backends with automatic failover. Limited to 20 successful requests per day.',
+    steps: [
+      'Click Use free AI — nothing to paste.',
+      'Pick a free model (auto switches between free backends if one is busy).',
+      'Chat in AI Advisor. After 20 successful replies today, connect OpenRouter or another BYOK provider for unlimited use.',
+    ],
+    links: [
+      {
+        label: 'OmniRoute project',
+        href: 'https://github.com/diegosouzapw/OmniRoute',
+      },
+      {
+        label: 'Free tiers guide',
+        href: 'https://github.com/diegosouzapw/OmniRoute/blob/release/v3.8.49/docs/getting-started/FREE-TIERS-GUIDE.md',
+      },
+    ],
+  },
   openrouter: {
     title: 'OpenRouter',
     summary:
-      'Recommended: one API key unlocks hundreds of models (OpenAI, Claude, Gemini, Llama, and more).',
+      'Recommended BYOK: one API key unlocks hundreds of models (OpenAI, Claude, Gemini, Llama, and more).',
     steps: [
       'Open openrouter.ai and create an account.',
       'Go to Keys and create an API key.',

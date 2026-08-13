@@ -15,9 +15,12 @@ import {
   DEFAULT_MODELS,
   AiProviderId,
   ProviderConfig,
+  AI_PROVIDERS,
 } from './providers/types';
 import { getDefaultModels, getProviderAdapter } from './providers';
 import { validateModelBaseUrl } from './providers/url-guard';
+import { isOmnirouteProvider } from './providers/omniroute.free-backends';
+import { AiOmnirouteUsageService } from './ai-omniroute-usage.service';
 import {
   FINOS_DEFAULT_MASTER_PROMPT,
   FINOS_IMMUTABLE_SAFETY_LAYER,
@@ -36,6 +39,7 @@ export class AiSettingsService {
   constructor(
     @Inject('PG_POOL')
     private readonly pgPool: Pool,
+    private readonly omnirouteUsage: AiOmnirouteUsageService,
   ) {}
 
   async getSettings(userId: string) {
@@ -61,37 +65,62 @@ export class AiSettingsService {
         configs.rows.map((row) => [row.provider, this.publicConfig(row)]),
       );
 
-      const providers = (
-        [
-          'openrouter',
-          'openai',
-          'anthropic',
-          'local',
-          'vertex',
-        ] as AiProviderId[]
-      ).map(
-        (provider) =>
-          byProvider.get(provider) || {
-            provider,
-            connected: false,
-            model: DEFAULT_MODELS[provider][0],
-            display_name: null,
-            base_url:
-              provider === 'local'
-                ? 'http://127.0.0.1:11434/v1'
-                : provider === 'openrouter'
-                  ? 'https://openrouter.ai/api/v1'
-                  : null,
-            project_id: null,
-            location: provider === 'vertex' ? 'us-central1' : null,
-            credentials_meta: {},
-            last_tested_at: null,
-            last_test_status: null,
-            last_test_message: null,
-            default_models: getDefaultModels(provider),
-            setup: PROVIDER_SETUP_GUIDES[provider],
-            recommended: provider === 'openrouter',
-          },
+      const omnirouteQuota = await this.omnirouteUsage.getUsage(userId);
+
+      const providers = (AI_PROVIDERS as readonly AiProviderId[]).map(
+        (provider) => {
+          if (provider === 'omniroute') {
+            const existing = byProvider.get('omniroute');
+            return {
+              provider: 'omniroute' as const,
+              connected: true,
+              model: existing?.model || DEFAULT_MODELS.omniroute[0],
+              display_name: existing?.display_name || 'OmniRoute free',
+              base_url: null,
+              project_id: null,
+              location: null,
+              credentials_meta: {
+                has_api_key: false,
+                platform_managed: true,
+                no_auth_required: true,
+              },
+              last_tested_at: existing?.last_tested_at || null,
+              last_test_status: existing?.last_test_status || 'ok',
+              last_test_message:
+                existing?.last_test_message ||
+                'Built-in free routing — no API key needed.',
+              default_models: getDefaultModels('omniroute'),
+              setup: PROVIDER_SETUP_GUIDES.omniroute,
+              recommended: true,
+              platform_free: true,
+              daily_quota: omnirouteQuota,
+            };
+          }
+
+          return (
+            byProvider.get(provider) || {
+              provider,
+              connected: false,
+              model: DEFAULT_MODELS[provider][0],
+              display_name: null,
+              base_url:
+                provider === 'local'
+                  ? 'http://127.0.0.1:11434/v1'
+                  : provider === 'openrouter'
+                    ? 'https://openrouter.ai/api/v1'
+                    : null,
+              project_id: null,
+              location: provider === 'vertex' ? 'us-central1' : null,
+              credentials_meta: {},
+              last_tested_at: null,
+              last_test_status: null,
+              last_test_message: null,
+              default_models: getDefaultModels(provider),
+              setup: PROVIDER_SETUP_GUIDES[provider],
+              recommended: false,
+            }
+          );
+        },
       );
 
       const pref = prefs.rows[0];
@@ -105,6 +134,7 @@ export class AiSettingsService {
         prompt_version: FINOS_PROMPT_VERSION,
         providers,
         setup_guides: PROVIDER_SETUP_GUIDES,
+        omniroute_quota: omnirouteQuota,
       };
     } finally {
       client.release();
@@ -112,6 +142,66 @@ export class AiSettingsService {
   }
 
   async upsertProvider(userId: string, dto: UpsertProviderConfigDto) {
+    if (isOmnirouteProvider(dto.provider)) {
+      const model =
+        dto.model && dto.model !== 'default'
+          ? dto.model
+          : DEFAULT_MODELS.omniroute[0];
+      await this.ensurePreferences(this.pgPool, userId);
+      await this.pgPool.query(
+        `UPDATE user_ai_preferences
+         SET active_provider = 'omniroute', active_model = $2, updated_at = NOW()
+         WHERE user_id = $1`,
+        [userId, model],
+      );
+      // Keep a lightweight row so model preference persists without credentials.
+      await this.pgPool.query(
+        `INSERT INTO user_ai_provider_configs
+          (user_id, provider, display_name, model, credentials_meta, is_connected, updated_at, deleted_at)
+         VALUES ($1, 'omniroute', 'OmniRoute free', $2, $3::jsonb, true, NOW(), NULL)
+         ON CONFLICT (user_id, provider)
+         DO UPDATE SET
+           model = EXCLUDED.model,
+           display_name = EXCLUDED.display_name,
+           credentials_meta = EXCLUDED.credentials_meta,
+           is_connected = true,
+           deleted_at = NULL,
+           updated_at = NOW()`,
+        [
+          userId,
+          model,
+          JSON.stringify({
+            has_api_key: false,
+            platform_managed: true,
+            no_auth_required: true,
+          }),
+        ],
+      );
+      const quota = await this.omnirouteUsage.getUsage(userId);
+      return {
+        provider: 'omniroute' as const,
+        connected: true,
+        model,
+        display_name: 'OmniRoute free',
+        base_url: null,
+        project_id: null,
+        location: null,
+        credentials_meta: {
+          has_api_key: false,
+          platform_managed: true,
+          no_auth_required: true,
+        },
+        last_tested_at: null,
+        last_test_status: 'ok',
+        last_test_message: 'Built-in free routing — no API key needed.',
+        default_models: getDefaultModels('omniroute'),
+        setup: PROVIDER_SETUP_GUIDES.omniroute,
+        recommended: true,
+        platform_free: true,
+        daily_quota: quota,
+      };
+    }
+
     if (!hasEncryptionKeyConfigured()) {
       throw new BadRequestException(
         'Server is missing AI_CREDENTIALS_ENCRYPTION_KEY.',
@@ -256,6 +346,17 @@ export class AiSettingsService {
   }
 
   async disconnectProvider(userId: string, provider: AiProviderId) {
+    if (isOmnirouteProvider(provider)) {
+      await this.pgPool.query(
+        `UPDATE user_ai_preferences
+         SET active_provider = CASE WHEN active_provider = $2 THEN NULL ELSE active_provider END,
+             active_model = CASE WHEN active_provider = $2 THEN NULL ELSE active_model END,
+             updated_at = NOW()
+         WHERE user_id = $1`,
+        [userId, provider],
+      );
+      return { provider, disconnected: true };
+    }
     const result = await this.pgPool.query(
       `UPDATE user_ai_provider_configs
        SET deleted_at = NOW(),
@@ -284,6 +385,15 @@ export class AiSettingsService {
   }
 
   async selectActive(userId: string, dto: SelectActiveProviderDto) {
+    if (isOmnirouteProvider(dto.provider)) {
+      const model = dto.model || DEFAULT_MODELS.omniroute[0];
+      await this.upsertProvider(userId, {
+        provider: 'omniroute',
+        model,
+      });
+      return { active_provider: 'omniroute' as const, active_model: model };
+    }
+
     const config = await this.loadProviderConfig(userId, dto.provider);
     if (!config) {
       throw new BadRequestException(
@@ -325,26 +435,32 @@ export class AiSettingsService {
   async testProvider(userId: string, provider: AiProviderId) {
     const config = await this.loadProviderConfig(userId, provider);
     if (!config) {
-      throw new BadRequestException('Save provider credentials first.');
+      throw new BadRequestException(
+        isOmnirouteProvider(provider)
+          ? 'OmniRoute free provider is unavailable.'
+          : 'Save provider credentials first.',
+      );
     }
     const adapter = getProviderAdapter(provider);
     const result = await adapter.testConnection(config);
-    await this.pgPool.query(
-      `UPDATE user_ai_provider_configs
-       SET is_connected = $3,
-           last_tested_at = NOW(),
-           last_test_status = $4,
-           last_test_message = $5,
-           updated_at = NOW()
-       WHERE user_id = $1 AND provider = $2 AND deleted_at IS NULL`,
-      [
-        userId,
-        provider,
-        result.ok,
-        result.ok ? 'ok' : 'failed',
-        result.message,
-      ],
-    );
+    if (!isOmnirouteProvider(provider)) {
+      await this.pgPool.query(
+        `UPDATE user_ai_provider_configs
+         SET is_connected = $3,
+             last_tested_at = NOW(),
+             last_test_status = $4,
+             last_test_message = $5,
+             updated_at = NOW()
+         WHERE user_id = $1 AND provider = $2 AND deleted_at IS NULL`,
+        [
+          userId,
+          provider,
+          result.ok,
+          result.ok ? 'ok' : 'failed',
+          result.message,
+        ],
+      );
+    }
     if (result.ok) {
       await this.ensurePreferences(this.pgPool, userId);
       const prefs = await this.pgPool.query(
@@ -414,6 +530,29 @@ export class AiSettingsService {
     userId: string,
     provider: AiProviderId,
   ): Promise<ProviderConfig | null> {
+    if (isOmnirouteProvider(provider)) {
+      const prefs = await this.pgPool.query(
+        `SELECT active_model FROM user_ai_preferences WHERE user_id = $1`,
+        [userId],
+      );
+      const row = await this.pgPool.query(
+        `SELECT model FROM user_ai_provider_configs
+         WHERE user_id = $1 AND provider = 'omniroute' AND deleted_at IS NULL`,
+        [userId],
+      );
+      return {
+        provider: 'omniroute',
+        model:
+          prefs.rows[0]?.active_model ||
+          row.rows[0]?.model ||
+          DEFAULT_MODELS.omniroute[0],
+        baseUrl: null,
+        projectId: null,
+        location: null,
+        credentials: {},
+      };
+    }
+
     const result = await this.pgPool.query(
       `SELECT * FROM user_ai_provider_configs
        WHERE user_id = $1 AND provider = $2 AND deleted_at IS NULL`,
@@ -455,7 +594,7 @@ export class AiSettingsService {
     return {
       id: row.id,
       provider,
-      connected: Boolean(row.is_connected),
+      connected: Boolean(row.is_connected) || isOmnirouteProvider(provider),
       display_name: row.display_name,
       model: row.model,
       base_url: row.base_url,
@@ -468,7 +607,8 @@ export class AiSettingsService {
       updated_at: row.updated_at,
       default_models: getDefaultModels(provider),
       setup: PROVIDER_SETUP_GUIDES[provider],
-      recommended: provider === 'openrouter',
+      recommended: isOmnirouteProvider(provider),
+      platform_free: isOmnirouteProvider(provider),
     };
   }
 

@@ -7,9 +7,11 @@ import {
 } from '@nestjs/common';
 import { Pool } from 'pg';
 import { AiSettingsService } from './ai-settings.service';
+import { AiOmnirouteUsageService } from './ai-omniroute-usage.service';
 import { AiToolsService, Citation } from './ai-tools.service';
 import { AiWebSearchService } from './ai-web-search.service';
 import { runProviderChat, runProviderChatStream } from './providers';
+import { isOmnirouteProvider } from './providers/omniroute.free-backends';
 import { buildSystemPrompt } from './prompts/finos-master';
 import { ChatMessageDto } from './dto/ai-advisor.dto';
 import { ChatMessage } from './providers/types';
@@ -95,6 +97,7 @@ export class AiAdvisorService {
     private readonly settingsService: AiSettingsService,
     private readonly toolsService: AiToolsService,
     private readonly webSearchService: AiWebSearchService,
+    private readonly omnirouteUsage: AiOmnirouteUsageService,
   ) {}
 
   async listConversations(
@@ -707,7 +710,15 @@ export class AiAdvisorService {
   async chat(userId: string, dto: ChatMessageDto) {
     const prepared = await this.prepareChat(userId, dto);
     const result = await runProviderChat(prepared.config, prepared.messages);
-    return this.persistAssistantTurn(prepared, result.content, result.model);
+    const persisted = await this.persistAssistantTurn(
+      prepared,
+      result.content,
+      result.model,
+    );
+    if (isOmnirouteProvider(prepared.config.provider)) {
+      await this.omnirouteUsage.recordSuccessfulRequest(userId);
+    }
+    return persisted;
   }
 
   async *chatStream(
@@ -755,6 +766,9 @@ export class AiAdvisorService {
         rawContent,
         model,
       );
+      if (isOmnirouteProvider(prepared.config.provider)) {
+        await this.omnirouteUsage.recordSuccessfulRequest(userId);
+      }
       yield {
         type: 'done',
         conversation_id: persisted.conversation_id,
@@ -782,6 +796,10 @@ export class AiAdvisorService {
   private async prepareChat(userId: string, dto: ChatMessageDto) {
     const { config, masterPrompt } =
       await this.settingsService.loadActiveProviderConfig(userId);
+
+    if (isOmnirouteProvider(config.provider)) {
+      await this.omnirouteUsage.assertWithinQuota(userId);
+    }
 
     let conversationId = dto.conversation_id;
     if (conversationId) {

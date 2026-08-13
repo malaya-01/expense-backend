@@ -45,6 +45,9 @@ export default () => ({
     ALLOW_PRIVATE_MODEL_HOSTS:
       (process.env.AI_ALLOW_PRIVATE_MODEL_HOSTS || 'true').toLowerCase() !==
       'false',
+    OMNIROUTE_BASE_URL: process.env.OMNIROUTE_BASE_URL || '',
+    OMNIROUTE_API_KEY: process.env.OMNIROUTE_API_KEY || '',
+    OMNIROUTE_DAILY_LIMIT: parseInt(process.env.OMNIROUTE_DAILY_LIMIT || '20', 10),
   },
   SWAGGER: {
     TITLE: 'Opal APIs',

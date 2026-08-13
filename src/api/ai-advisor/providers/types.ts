@@ -1,4 +1,5 @@
 export const AI_PROVIDERS = [
+  'omniroute',
   'openrouter',
   'openai',
   'anthropic',
@@ -72,6 +73,16 @@ export interface AiProviderAdapter {
 }
 
 export const DEFAULT_MODELS: Record<AiProviderId, string[]> = {
+  /** Built-in free OmniRoute-style routing — no user API key. */
+  omniroute: [
+    'auto',
+    'openai',
+    'openai-fast',
+    'deepseek',
+    'mistral',
+    'llama',
+    'gemini',
+  ],
   /** OpenRouter model slugs — browse more at https://openrouter.ai/models */
   openrouter: [
     'openai/gpt-4o-mini',
