@@ -202,11 +202,15 @@ async function raceRemotes(
     let pending = backends.length;
     const errors: string[] = [];
 
-    const finishNull = () => {
-      if (!settled) {
-        settled = true;
-        resolve(null);
+    const finishNull = (reason?: string) => {
+      if (settled) return;
+      settled = true;
+      if (errors.length || reason) {
+        const detail = [...errors, reason].filter(Boolean).slice(0, 3).join(' | ');
+        console.warn(`[Opal Free] remote race failed: ${detail}`);
+        onProgress?.(`Free route failed — ${detail.slice(0, 160)}`);
       }
+      resolve(null);
     };
 
     for (const backend of backends) {
@@ -225,7 +229,10 @@ async function raceRemotes(
     }
 
     // Hard budget — don't leave the user waiting on slow free hosts.
-    setTimeout(finishNull, FREE_ROUTE_BUDGET_MS + 250);
+    setTimeout(
+      () => finishNull('timed out'),
+      FREE_ROUTE_BUDGET_MS + 250,
+    );
   });
 }
 
@@ -299,31 +306,42 @@ export class OmnirouteAdapter implements AiProviderAdapter {
     }
 
     try {
-      const result = await raceRemotes(
-        remotes,
-        {
-          model: config.model || 'auto',
-          messages: [{ role: 'user', content: 'Reply with exactly: ok' }],
-          maxTokens: 8,
-        },
-        withOpalIdentity([{ role: 'user', content: 'Reply with exactly: ok' }]),
-      );
-      if (result) {
-        return {
-          ok: true,
-          message: `Connected · ${freeRouteSpeedHint()}. Free chat is ready.`,
-          model: result.model,
-        };
+      const probeMessages = withOpalIdentity([
+        { role: 'user', content: 'Reply with exactly: ok' },
+      ]);
+      const errors: string[] = [];
+      for (const backend of remotes) {
+        try {
+          const result = await chatOnce(
+            backend,
+            {
+              model: config.model || 'auto',
+              messages: probeMessages,
+              maxTokens: 8,
+            },
+            probeMessages,
+          );
+          return {
+            ok: true,
+            message: `Connected via ${backend.label} · ${freeRouteSpeedHint()}. Free chat is ready.`,
+            model: result.model,
+          };
+        } catch (err: any) {
+          errors.push(err?.message || String(err));
+        }
       }
-    } catch {
-      /* fall through */
+      return {
+        ok: false,
+        message: `Keys found (${remotes.map((r) => r.label).join(', ')}) but chat failed: ${errors.slice(0, 2).join(' | ')}. Check key validity on Render and redeploy.`,
+        model: 'omniroute/opal-local',
+      };
+    } catch (err: any) {
+      return {
+        ok: false,
+        message: err?.message || 'Free route probe failed',
+        model: 'omniroute/opal-local',
+      };
     }
-
-    return {
-      ok: true,
-      message: `Remote free models did not respond in time. Built-in Opal Advisor still works instantly. Hint: ${freeRouteSpeedHint()}.`,
-      model: 'omniroute/opal-local',
-    };
   }
 
   async listModels(): Promise<string[]> {
