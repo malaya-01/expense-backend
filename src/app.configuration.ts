@@ -45,6 +45,13 @@ export default () => ({
     ALLOW_PRIVATE_MODEL_HOSTS:
       (process.env.AI_ALLOW_PRIVATE_MODEL_HOSTS || 'true').toLowerCase() !==
       'false',
+    /** Fast free LLM for Opal Free (preferred). */
+    GROQ_API_KEY: process.env.GROQ_API_KEY || '',
+    GEMINI_API_KEY:
+      process.env.GEMINI_API_KEY ||
+      process.env.GOOGLE_AI_API_KEY ||
+      process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
+      '',
     OMNIROUTE_BASE_URL: process.env.OMNIROUTE_BASE_URL || '',
     OMNIROUTE_API_KEY: process.env.OMNIROUTE_API_KEY || '',
     /** Optional shared OpenRouter key for free :free models (users never see it). */

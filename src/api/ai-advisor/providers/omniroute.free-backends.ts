@@ -1,12 +1,13 @@
 /**
- * Free backends for built-in OmniRoute (end users never paste keys).
- * Priority: platform OpenRouter free key → Pollinations (retry) → local Opal voice.
+ * Fast free backends for built-in Opal Free (users never paste keys).
+ * Pollinations/OmniRoute cascades were too slow — prefer Groq, then Gemini,
+ * then optional OpenRouter free, then instant local Opal voice.
  */
 
 export type FreeBackend = {
   id: string;
   label: string;
-  kind: 'openai_post' | 'pollinations_get' | 'local_opal';
+  kind: 'openai_post' | 'local_opal';
   chatUrl?: string;
   upstreamModel: string;
   apiKey?: string;
@@ -18,28 +19,34 @@ export const OMNIROUTE_DAILY_SUCCESS_LIMIT = Number(
   process.env.OMNIROUTE_DAILY_LIMIT || 20,
 );
 
-/** Curated free models users can switch between (no signup). */
+/** Hard cap for remote free routing before local Opal answers. */
+export const FREE_ROUTE_BUDGET_MS = Number(
+  process.env.OMNIROUTE_ROUTE_BUDGET_MS || 8_000,
+);
+
 export const OMNIROUTE_FREE_MODELS = [
   'auto',
-  'openai',
-  'mistral',
-  'llama',
-  'deepseek',
+  'fast',
+  'balanced',
   'gemini',
 ] as const;
 
 export type OmnirouteFreeModel = (typeof OMNIROUTE_FREE_MODELS)[number];
 
-const OPENROUTER_FREE_BY_ALIAS: Record<string, string> = {
-  auto: 'openrouter/free',
-  openai: 'nvidia/nemotron-3-nano-30b-a3b:free',
-  mistral: 'mistralai/mistral-small-3.1-24b-instruct:free',
-  llama: 'meta-llama/llama-3.3-70b-instruct:free',
-  deepseek: 'deepseek/deepseek-r1-distill-llama-70b:free',
-  gemini: 'google/gemma-3-27b-it:free',
-};
+function groqKey(): string {
+  return (process.env.GROQ_API_KEY || '').trim();
+}
 
-function platformOpenRouterKey(): string {
+function geminiKey(): string {
+  return (
+    process.env.GEMINI_API_KEY ||
+    process.env.GOOGLE_AI_API_KEY ||
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
+    ''
+  ).trim();
+}
+
+function openRouterKey(): string {
   return (
     process.env.OMNIROUTE_PLATFORM_KEY ||
     process.env.OPENROUTER_API_KEY ||
@@ -47,106 +54,83 @@ function platformOpenRouterKey(): string {
   ).trim();
 }
 
-function pollinationsPost(model: string): FreeBackend {
-  return {
-    id: `pollinations-post:${model}`,
-    label: `Pollinations · ${model}`,
-    kind: 'openai_post',
-    chatUrl: 'https://text.pollinations.ai/openai',
-    upstreamModel: model,
-    noAuth: true,
-    timeoutMs: 55_000,
-  };
+function groqModelFor(alias: string): string {
+  if (alias === 'balanced') return 'llama-3.3-70b-versatile';
+  // auto / fast — tiny + fastest free model
+  return 'llama-3.1-8b-instant';
 }
 
-function pollinationsGet(model: string): FreeBackend {
-  return {
-    id: `pollinations-get:${model}`,
-    label: `Pollinations GET · ${model}`,
-    kind: 'pollinations_get',
-    chatUrl: 'https://text.pollinations.ai',
-    upstreamModel: model,
-    noAuth: true,
-    timeoutMs: 45_000,
-  };
+function openRouterModelFor(alias: string): string {
+  if (alias === 'balanced') return 'meta-llama/llama-3.3-70b-instruct:free';
+  if (alias === 'gemini') return 'google/gemma-3-27b-it:free';
+  return 'nvidia/nemotron-3-nano-30b-a3b:free';
 }
 
 /**
- * Ordered candidates for a user-selected free model.
- * Local Opal voice is always last so chat never hard-fails.
+ * Remote candidates only (no local). Kept short on purpose for speed.
  */
-export function resolveFreeBackends(selectedModel: string): FreeBackend[] {
+export function resolveRemoteFreeBackends(selectedModel: string): FreeBackend[] {
   const model = (selectedModel || 'auto').trim() || 'auto';
   const candidates: FreeBackend[] = [];
-  const platformKey = platformOpenRouterKey();
-  const gateway = (process.env.OMNIROUTE_BASE_URL || '').replace(/\/$/, '');
-  const gatewayKey = (process.env.OMNIROUTE_API_KEY || '').trim();
 
-  if (platformKey) {
-    const orModel =
-      OPENROUTER_FREE_BY_ALIAS[model] || OPENROUTER_FREE_BY_ALIAS.auto;
+  const gKey = groqKey();
+  if (gKey && model !== 'gemini') {
     candidates.push({
-      id: `openrouter-free:${orModel}`,
-      label: `OpenRouter free · ${orModel}`,
+      id: `groq:${groqModelFor(model)}`,
+      label: 'Groq (fast)',
+      kind: 'openai_post',
+      chatUrl: 'https://api.groq.com/openai/v1/chat/completions',
+      upstreamModel: groqModelFor(model),
+      apiKey: gKey,
+      timeoutMs: FREE_ROUTE_BUDGET_MS,
+    });
+  }
+
+  const gemKey = geminiKey();
+  if (gemKey && (model === 'auto' || model === 'gemini' || model === 'fast')) {
+    candidates.push({
+      id: 'gemini:flash',
+      label: 'Gemini Flash',
+      kind: 'openai_post',
+      chatUrl:
+        'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+      upstreamModel: 'gemini-2.0-flash',
+      apiKey: gemKey,
+      timeoutMs: FREE_ROUTE_BUDGET_MS,
+    });
+  }
+
+  const orKey = openRouterKey();
+  if (orKey) {
+    const orModel = openRouterModelFor(model);
+    candidates.push({
+      id: `openrouter:${orModel}`,
+      label: 'OpenRouter free',
       kind: 'openai_post',
       chatUrl: 'https://openrouter.ai/api/v1/chat/completions',
       upstreamModel: orModel,
-      apiKey: platformKey,
-      timeoutMs: 60_000,
-    });
-    if (model === 'auto') {
-      for (const alias of ['mistral', 'llama', 'openai'] as const) {
-        const id = OPENROUTER_FREE_BY_ALIAS[alias];
-        if (id === orModel) continue;
-        candidates.push({
-          id: `openrouter-free:${id}`,
-          label: `OpenRouter free · ${id}`,
-          kind: 'openai_post',
-          chatUrl: 'https://openrouter.ai/api/v1/chat/completions',
-          upstreamModel: id,
-          apiKey: platformKey,
-          timeoutMs: 60_000,
-        });
-      }
-    }
-  }
-
-  const pollModels =
-    model === 'auto'
-      ? ['openai', 'mistral', 'llama', 'deepseek', 'gemini']
-      : [model, 'openai', 'mistral'];
-
-  const seen = new Set<string>();
-  for (const m of pollModels) {
-    if (seen.has(m)) continue;
-    seen.add(m);
-    candidates.push(pollinationsPost(m));
-    candidates.push(pollinationsGet(m));
-  }
-
-  if (gateway) {
-    const path = gateway.endsWith('/v1') ? gateway : `${gateway}/v1`;
-    candidates.push({
-      id: 'omniroute-gateway',
-      label: 'OmniRoute gateway',
-      kind: 'openai_post',
-      chatUrl: `${path}/chat/completions`,
-      upstreamModel: model === 'auto' ? 'auto' : model,
-      apiKey: gatewayKey || 'omniroute',
-      timeoutMs: 60_000,
+      apiKey: orKey,
+      timeoutMs: FREE_ROUTE_BUDGET_MS,
     });
   }
 
-  candidates.push({
+  return candidates;
+}
+
+export function localOpalBackend(): FreeBackend {
+  return {
     id: 'local-opal',
     label: 'Opal Advisor (built-in)',
     kind: 'local_opal',
     upstreamModel: 'opal-local',
     noAuth: true,
-    timeoutMs: 1_000,
-  });
+    timeoutMs: 50,
+  };
+}
 
-  return candidates;
+/** @deprecated Prefer resolveRemoteFreeBackends + race; kept for callers. */
+export function resolveFreeBackends(selectedModel: string): FreeBackend[] {
+  return [...resolveRemoteFreeBackends(selectedModel), localOpalBackend()];
 }
 
 export function isOmnirouteProvider(
@@ -156,5 +140,12 @@ export function isOmnirouteProvider(
 }
 
 export function hasPlatformFreeKey(): boolean {
-  return Boolean(platformOpenRouterKey());
+  return Boolean(groqKey() || geminiKey() || openRouterKey());
+}
+
+export function freeRouteSpeedHint(): string {
+  if (groqKey()) return 'Groq fast free tier';
+  if (geminiKey()) return 'Gemini Flash';
+  if (openRouterKey()) return 'OpenRouter free';
+  return 'Built-in Opal Advisor (instant)';
 }

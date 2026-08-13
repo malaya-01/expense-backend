@@ -99,23 +99,23 @@ Do not invent other action types. Do not invent UUIDs for accounts or categories
 
 export const PROVIDER_SETUP_GUIDES = {
   omniroute: {
-    title: 'OmniRoute (free)',
+    title: 'Opal Free',
     summary:
-      'Built-in free AI — no API key or signup for you. Opal routes across free backends and always falls back to Opal Advisor voice. Limited to 20 successful requests per day.',
+      'Fast free AI — no key for you. Uses Groq (preferred) or Gemini on the server, then built-in Opal Advisor. Limited to 20 successful requests per day.',
     steps: [
-      'Click Use free / Use free AI — Opal checks the connection first.',
-      'Pick a free model (auto switches if one route is busy).',
-      'Chat in AI Advisor. Status updates while Opal finds a route.',
+      'Click Use free — Opal checks the fast route first.',
+      'Pick auto/fast for speed, balanced for stronger answers, or gemini if configured.',
+      'Chat in AI Advisor. Replies should arrive in a few seconds.',
       'After 20 successful replies today, connect OpenRouter or another BYOK provider for unlimited use.',
     ],
     links: [
       {
-        label: 'OmniRoute project',
-        href: 'https://github.com/diegosouzapw/OmniRoute',
+        label: 'Groq free tier',
+        href: 'https://console.groq.com',
       },
       {
-        label: 'Free tiers guide',
-        href: 'https://github.com/diegosouzapw/OmniRoute/blob/release/v3.8.49/docs/getting-started/FREE-TIERS-GUIDE.md',
+        label: 'Google AI Studio (Gemini)',
+        href: 'https://aistudio.google.com/apikey',
       },
     ],
   },

@@ -73,16 +73,8 @@ export interface AiProviderAdapter {
 }
 
 export const DEFAULT_MODELS: Record<AiProviderId, string[]> = {
-  /** Built-in free OmniRoute-style routing — no user API key. */
-  omniroute: [
-    'auto',
-    'openai',
-    'openai-fast',
-    'deepseek',
-    'mistral',
-    'llama',
-    'gemini',
-  ],
+  /** Built-in free routing — Groq/Gemini first (fast), not slow public scrapers. */
+  omniroute: ['auto', 'fast', 'balanced', 'gemini'],
   /** OpenRouter model slugs — browse more at https://openrouter.ai/models */
   openrouter: [
     'openai/gpt-4o-mini',

@@ -757,7 +757,7 @@ export class AiAdvisorService {
       let model = prepared.config.model;
 
       if (isOmnirouteProvider(prepared.config.provider)) {
-        yield { type: 'status', message: 'Finding a free Opal route…' };
+        yield { type: 'status', message: 'Asking a fast free model…' };
         const progressQueue: string[] = [];
         const resultPromise = omnirouteAdapter.chatWithProgress(
           prepared.config,

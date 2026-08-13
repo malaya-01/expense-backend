@@ -46,7 +46,7 @@ export class AiOmnirouteUsageService {
       throw new HttpException(
         {
           statusCode: HttpStatus.TOO_MANY_REQUESTS,
-          message: `Daily free OmniRoute limit reached (${snap.limit} successful requests). Resets at UTC midnight, or connect your own API key in Settings → AI.`,
+          message: `Daily free Opal Free limit reached (${snap.limit} successful requests). Resets at UTC midnight, or connect your own API key in Settings → AI.`,
           provider: 'omniroute',
           code: 'omniroute_daily_limit',
           limit: snap.limit,

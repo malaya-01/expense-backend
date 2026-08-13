@@ -75,7 +75,7 @@ export class AiSettingsService {
               provider: 'omniroute' as const,
               connected: true,
               model: existing?.model || DEFAULT_MODELS.omniroute[0],
-              display_name: existing?.display_name || 'OmniRoute free',
+              display_name: existing?.display_name || 'Opal Free',
               base_url: null,
               project_id: null,
               location: null,
@@ -88,7 +88,7 @@ export class AiSettingsService {
               last_test_status: existing?.last_test_status || 'ok',
               last_test_message:
                 existing?.last_test_message ||
-                'Built-in free routing — no API key needed.',
+                'Fast free routing via Groq/Gemini when configured — no user API key.',
               default_models: getDefaultModels('omniroute'),
               setup: PROVIDER_SETUP_GUIDES.omniroute,
               recommended: true,
@@ -158,7 +158,7 @@ export class AiSettingsService {
       await this.pgPool.query(
         `INSERT INTO user_ai_provider_configs
           (user_id, provider, display_name, model, credentials_meta, is_connected, updated_at, deleted_at)
-         VALUES ($1, 'omniroute', 'OmniRoute free', $2, $3::jsonb, true, NOW(), NULL)
+         VALUES ($1, 'omniroute', 'Opal Free', $2, $3::jsonb, true, NOW(), NULL)
          ON CONFLICT (user_id, provider)
          DO UPDATE SET
            model = EXCLUDED.model,
@@ -182,7 +182,7 @@ export class AiSettingsService {
         provider: 'omniroute' as const,
         connected: true,
         model,
-        display_name: 'OmniRoute free',
+        display_name: 'Opal Free',
         base_url: null,
         project_id: null,
         location: null,
@@ -193,7 +193,7 @@ export class AiSettingsService {
         },
         last_tested_at: null,
         last_test_status: 'ok',
-        last_test_message: 'Built-in free routing — no API key needed.',
+        last_test_message: 'Fast free routing via Groq/Gemini when configured.',
         default_models: getDefaultModels('omniroute'),
         setup: PROVIDER_SETUP_GUIDES.omniroute,
         recommended: true,
@@ -437,7 +437,7 @@ export class AiSettingsService {
     if (!config) {
       throw new BadRequestException(
         isOmnirouteProvider(provider)
-          ? 'OmniRoute free provider is unavailable.'
+          ? 'Opal Free provider is unavailable.'
           : 'Save provider credentials first.',
       );
     }
