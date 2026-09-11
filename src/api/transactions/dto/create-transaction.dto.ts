@@ -80,4 +80,36 @@ export class CreateTransactionDto {
   @IsOptional()
   @IsString()
   notes?: string;
+
+  @ApiPropertyOptional({ example: 'UPI' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(32)
+  payment_method?: string;
+
+  @ApiPropertyOptional({ example: 'merchant@okaxis' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(255)
+  upi_vpa?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  upi_txn_id?: string;
+
+  @ApiPropertyOptional({
+    enum: ['SUCCESS', 'FAILURE', 'SUBMITTED', 'CANCELLED', 'UNKNOWN'],
+  })
+  @IsOptional()
+  @IsIn(['SUCCESS', 'FAILURE', 'SUBMITTED', 'CANCELLED', 'UNKNOWN'])
+  payment_status?: string;
+
+  @ApiPropertyOptional({
+    description: 'ISO timestamp when the UPI app reported the payment.',
+  })
+  @IsOptional()
+  @IsDateString()
+  paid_at?: string;
 }

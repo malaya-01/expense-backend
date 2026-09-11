@@ -86,14 +86,16 @@ export class TransactionsService {
         ? `INSERT INTO ledger_transactions
             (id, user_id, type, amount, description, date, category_id,
              source_container_id, destination_container_id, merchant, currency, notes,
-             exchange_rate, fx_rate_to_base, amount_base)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+             exchange_rate, fx_rate_to_base, amount_base,
+             payment_method, upi_vpa, upi_txn_id, payment_status, paid_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
            RETURNING *`
         : `INSERT INTO ledger_transactions
             (user_id, type, amount, description, date, category_id,
              source_container_id, destination_container_id, merchant, currency, notes,
-             exchange_rate, fx_rate_to_base, amount_base)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+             exchange_rate, fx_rate_to_base, amount_base,
+             payment_method, upi_vpa, upi_txn_id, payment_status, paid_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
            RETURNING *`,
       clientId
         ? [
@@ -112,6 +114,11 @@ export class TransactionsService {
             posted.exchange_rate,
             posted.fx_rate_to_base,
             posted.amount_base,
+            dto.payment_method || null,
+            dto.upi_vpa || null,
+            dto.upi_txn_id || null,
+            dto.payment_status || null,
+            dto.paid_at || null,
           ]
         : [
             userId,
@@ -128,6 +135,11 @@ export class TransactionsService {
             posted.exchange_rate,
             posted.fx_rate_to_base,
             posted.amount_base,
+            dto.payment_method || null,
+            dto.upi_vpa || null,
+            dto.upi_txn_id || null,
+            dto.payment_status || null,
+            dto.paid_at || null,
           ],
     );
     await this.postJournal(
