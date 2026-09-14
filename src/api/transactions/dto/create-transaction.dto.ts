@@ -100,6 +100,24 @@ export class CreateTransactionDto {
   upi_txn_id?: string;
 
   @ApiPropertyOptional({
+    example: 'Google Pay',
+    description: 'App or rail shown on the receipt (Google Pay, PhonePe, Paytm).',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  platform?: string;
+
+  @ApiPropertyOptional({
+    example: 'CICAgPj4rP-IDg',
+    description: 'Platform-specific id (Google transaction ID, PhonePe UTR, etc.).',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  platform_txn_id?: string;
+
+  @ApiPropertyOptional({
     enum: ['SUCCESS', 'FAILURE', 'SUBMITTED', 'CANCELLED', 'UNKNOWN'],
   })
   @IsOptional()

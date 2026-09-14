@@ -87,15 +87,17 @@ export class TransactionsService {
             (id, user_id, type, amount, description, date, category_id,
              source_container_id, destination_container_id, merchant, currency, notes,
              exchange_rate, fx_rate_to_base, amount_base,
-             payment_method, upi_vpa, upi_txn_id, payment_status, paid_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+             payment_method, upi_vpa, upi_txn_id, payment_status, paid_at,
+             platform, platform_txn_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
            RETURNING *`
         : `INSERT INTO ledger_transactions
             (user_id, type, amount, description, date, category_id,
              source_container_id, destination_container_id, merchant, currency, notes,
              exchange_rate, fx_rate_to_base, amount_base,
-             payment_method, upi_vpa, upi_txn_id, payment_status, paid_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+             payment_method, upi_vpa, upi_txn_id, payment_status, paid_at,
+             platform, platform_txn_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
            RETURNING *`,
       clientId
         ? [
@@ -119,6 +121,8 @@ export class TransactionsService {
             dto.upi_txn_id || null,
             dto.payment_status || null,
             dto.paid_at || null,
+            dto.platform || null,
+            dto.platform_txn_id || null,
           ]
         : [
             userId,
@@ -140,6 +144,8 @@ export class TransactionsService {
             dto.upi_txn_id || null,
             dto.payment_status || null,
             dto.paid_at || null,
+            dto.platform || null,
+            dto.platform_txn_id || null,
           ],
     );
     await this.postJournal(
@@ -358,8 +364,15 @@ export class TransactionsService {
            exchange_rate = $11,
            fx_rate_to_base = $12,
            amount_base = $13,
+           payment_method = $14,
+           upi_vpa = $15,
+           upi_txn_id = $16,
+           payment_status = $17,
+           paid_at = $18,
+           platform = $19,
+           platform_txn_id = $20,
            updated_at = NOW()
-         WHERE user_id = $14 AND id = $15 AND deleted_at IS NULL
+         WHERE user_id = $21 AND id = $22 AND deleted_at IS NULL
          RETURNING *`,
         [
           nextPosted.type,
@@ -375,6 +388,21 @@ export class TransactionsService {
           nextPosted.exchange_rate,
           nextPosted.fx_rate_to_base,
           nextPosted.amount_base,
+          dto.payment_method !== undefined
+            ? dto.payment_method || null
+            : currentRow.payment_method,
+          dto.upi_vpa !== undefined ? dto.upi_vpa || null : currentRow.upi_vpa,
+          dto.upi_txn_id !== undefined
+            ? dto.upi_txn_id || null
+            : currentRow.upi_txn_id,
+          dto.payment_status !== undefined
+            ? dto.payment_status || null
+            : currentRow.payment_status,
+          dto.paid_at !== undefined ? dto.paid_at || null : currentRow.paid_at,
+          dto.platform !== undefined ? dto.platform || null : currentRow.platform,
+          dto.platform_txn_id !== undefined
+            ? dto.platform_txn_id || null
+            : currentRow.platform_txn_id,
           userId,
           id,
         ],
