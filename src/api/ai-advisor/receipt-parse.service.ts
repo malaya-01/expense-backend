@@ -201,6 +201,25 @@ function paidAtFrom(date: string | null, time: string | null): string | null {
   return new Date(year, month - 1, day, hour || 0, minute || 0, 0).toISOString();
 }
 
+function describeVisionSource(modelId: string | null | undefined): {
+  provider: string;
+  model: string;
+} {
+  const raw = String(modelId || '').trim();
+  if (!raw) return { provider: 'Opal Free', model: 'unknown' };
+  if (/gemini/i.test(raw)) {
+    const match = raw.match(/gemini-[\w.-]+/i);
+    return { provider: 'Gemini', model: match?.[0] || 'gemini-3.6-flash' };
+  }
+  if (/groq/i.test(raw) || /qwen\//i.test(raw)) {
+    const qwen = raw.match(/qwen\/[\w.-]+/i);
+    if (qwen) return { provider: 'Groq', model: qwen[0] };
+    const after = raw.replace(/^groq:/i, '').split('/')[0];
+    return { provider: 'Groq', model: after || raw };
+  }
+  return { provider: 'Opal Free', model: raw };
+}
+
 function normalizeName(value: string): string {
   return value.trim().toLowerCase().replace(/\s+/g, ' ');
 }
@@ -303,6 +322,7 @@ export class ReceiptParseService {
       account_label: extracted.account_label,
     });
 
+    const source = describeVisionSource(vision.model);
     const hasCore = Boolean(extracted.amount || extracted.merchant);
     return {
       ok: hasCore,
@@ -310,8 +330,8 @@ export class ReceiptParseService {
       warning: hasCore
         ? undefined
         : 'AI ran but could not find a merchant or amount. Review the form before saving.',
-      used_provider: vision.provider,
-      used_model: vision.model,
+      used_provider: source.provider,
+      used_model: source.model,
       category_id: category?.id || null,
       category_name: category?.name || extracted.category_name,
       source_container_id: matched?.id || null,
