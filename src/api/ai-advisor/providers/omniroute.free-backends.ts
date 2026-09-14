@@ -66,6 +66,15 @@ function openRouterModelFor(alias: string): string {
   return 'nvidia/nemotron-3-nano-30b-a3b:free';
 }
 
+/**
+ * Groq on-demand free tier rejects max_tokens above the OTPM cap (1000).
+ * Receipt JSON does not need 1024 tokens — stay well under the gate.
+ */
+export const GROQ_FREE_MAX_OUTPUT_TOKENS = Math.min(
+  Number(process.env.GROQ_MAX_OUTPUT_TOKENS || 768),
+  768,
+);
+
 /** Groq Llama 4 Scout was retired July 2026. Current Groq vision models: */
 export const GROQ_VISION_MODELS = [
   'qwen/qwen3.6-27b',

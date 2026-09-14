@@ -10,6 +10,7 @@ import {
 import {
   FreeBackend,
   FREE_ROUTE_BUDGET_MS,
+  GROQ_FREE_MAX_OUTPUT_TOKENS,
   OMNIROUTE_FREE_MODELS,
   freeRouteSpeedHint,
   localOpalBackend,
@@ -134,9 +135,10 @@ async function chatOpenAiPost(
   signal?: AbortSignal,
 ): Promise<ProviderChatResult> {
   if (!backend.chatUrl) throw new Error(`${backend.label}: missing URL`);
+  const groq = isGroqBackend(backend);
   const tokenBudget = Math.min(
     request.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
-    2048,
+    groq ? GROQ_FREE_MAX_OUTPUT_TOKENS : 2048,
   );
   const wantJson = Boolean(request.json) && !backend.upstreamModel.startsWith('qwen/');
   const res = await fetchWithTimeout(
@@ -149,9 +151,7 @@ async function chatOpenAiPost(
         messages: buildOpenAiMessages(messages),
         temperature: request.temperature ?? 0.35,
         max_tokens: tokenBudget,
-        ...(isGroqBackend(backend)
-          ? { max_completion_tokens: tokenBudget }
-          : {}),
+        ...(groq ? { max_completion_tokens: tokenBudget } : {}),
         stream: false,
         ...(wantJson ? { response_format: { type: 'json_object' } } : {}),
       }),
@@ -327,6 +327,18 @@ async function raceRemotes(
   });
 }
 
+function isGroqQuotaError(detail: string): boolean {
+  const text = detail.toLowerCase();
+  return (
+    text.includes('otpm') ||
+    text.includes('tokens per minute') ||
+    text.includes('request too large') ||
+    text.includes('rate limit') ||
+    text.includes('insufficient_quota') ||
+    text.includes('reduce max_tokens')
+  );
+}
+
 /**
  * Sequential vision OCR: Groq vision, then Gemini. Never uses local Opal
  * (it cannot see images and would invent fields).
@@ -340,7 +352,7 @@ export async function trySequentialVisionChat(
     model: 'auto',
     messages,
     temperature: 0.1,
-    maxTokens: 1024,
+    maxTokens: GROQ_FREE_MAX_OUTPUT_TOKENS,
   };
   const errors: string[] = [];
   if (!backends.length) {
@@ -349,13 +361,24 @@ export async function trySequentialVisionChat(
       errors: ['No Groq or Gemini vision key is configured on the server.'],
     };
   }
+  let skipRemainingGroq = false;
   for (const backend of backends) {
+    if (skipRemainingGroq && isGroqBackend(backend)) {
+      continue;
+    }
     const allowJson =
       backend.kind === 'gemini_native' ||
       (!isGroqBackend(backend) && !backend.upstreamModel.startsWith('qwen/'));
     try {
       const run = async (json: boolean) => {
-        const result = await chatOnce(backend, { ...base, json }, messages);
+        const maxTokens = isGroqBackend(backend)
+          ? GROQ_FREE_MAX_OUTPUT_TOKENS
+          : 1024;
+        const result = await chatOnce(
+          backend,
+          { ...base, maxTokens, json },
+          messages,
+        );
         const start = result.content.indexOf('{');
         const end = result.content.lastIndexOf('}');
         if (start < 0 || end <= start) {
@@ -375,6 +398,9 @@ export async function trySequentialVisionChat(
       const detail = err?.message || String(err);
       errors.push(detail);
       console.warn(`[Opal vision] ${backend.label} failed: ${detail}`);
+      if (isGroqBackend(backend) && isGroqQuotaError(detail)) {
+        skipRemainingGroq = true;
+      }
     }
   }
   if (errors.length) {

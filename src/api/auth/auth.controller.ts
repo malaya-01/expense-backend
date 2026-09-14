@@ -9,6 +9,7 @@ import { Throttle } from '@nestjs/throttler';
 import { errorResponse, successResponse } from 'src/utils/response/response';
 import { Public } from 'src/helper/decorators/public.decorator';
 import { REFRESH_COOKIE_NAME, refreshCookieOptions } from './refresh-cookie';
+import { AccountLockedException } from './auth.service';
 
 @Controller('auth')
 export class AuthController {
@@ -41,9 +42,29 @@ export class AuthController {
       res.cookie(REFRESH_COOKIE_NAME, result.refreshToken, refreshCookieOptions());
       return res.status(HttpStatus.OK).send(successResponse(result, 'User loged in successfully.'))
     }catch(error){
-      const message = error.message || 'An unexpected error occured'
+      const response =
+        typeof error.getResponse === 'function' ? error.getResponse() : null;
+      const message =
+        (typeof response === 'string' && response) ||
+        (response && typeof response.message === 'string' && response.message) ||
+        error.message ||
+        'An unexpected error occured'
       const statusCode = error.statuscode || error.status || HttpStatus.BAD_REQUEST
-      return res.status(statusCode).send(errorResponse(message, statusCode))
+      const lockedUntil =
+        error instanceof AccountLockedException
+          ? error.lockedUntil
+          : typeof error?.lockedUntil === 'string'
+            ? error.lockedUntil
+            : undefined
+      return res
+        .status(statusCode)
+        .send(
+          errorResponse(
+            message,
+            statusCode,
+            lockedUntil ? { lockedUntil } : undefined,
+          ),
+        )
     }
   }
 

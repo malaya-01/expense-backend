@@ -35,8 +35,37 @@ import {
 
 const EMAIL_VERIFY_TTL_MS = 60 * 60 * 1000; // 1 hour
 const EMAIL_VERIFY_TTL_HOURS = 1;
+const LOGIN_LOCK_MS = 15 * 60 * 1000;
 /** Temporarily off: Resend free tier can only send to the account owner. */
 const REQUIRE_EMAIL_VERIFICATION = false;
+
+export function formatLockRemaining(until: Date): string {
+  const totalSeconds = Math.max(
+    0,
+    Math.ceil((until.getTime() - Date.now()) / 1000),
+  );
+  if (totalSeconds <= 0) return 'You can try signing in now.';
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  const parts: string[] = [];
+  if (minutes > 0) {
+    parts.push(`${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`);
+  }
+  if (seconds > 0 || minutes === 0) {
+    parts.push(`${seconds} ${seconds === 1 ? 'second' : 'seconds'}`);
+  }
+  return `Try again in ${parts.join(' ')}.`;
+}
+
+export class AccountLockedException extends ForbiddenException {
+  readonly lockedUntil: string;
+  constructor(until: Date) {
+    super(
+      `Account temporarily locked. ${formatLockRemaining(until)}`,
+    );
+    this.lockedUntil = until.toISOString();
+  }
+}
 
 @Injectable()
 export class AuthService {
@@ -353,7 +382,7 @@ export class AuthService {
 
       // Account lock check
       if (user.locked_until && new Date(user.locked_until) > new Date()) {
-        throw new ForbiddenException('Account temporarily locked. Try later.');
+        throw new AccountLockedException(new Date(user.locked_until));
       }
 
       const isPasswordValid = await bcrypt.compare(
@@ -367,7 +396,7 @@ export class AuthService {
         let lockedUntil: Date | null = null;
 
         if (attempts >= 5) {
-          lockedUntil = new Date(Date.now() + 15 * 60 * 1000); // 15 min
+          lockedUntil = new Date(Date.now() + LOGIN_LOCK_MS);
         }
 
         await client.query(
@@ -381,6 +410,10 @@ export class AuthService {
         );
 
         await client.query('COMMIT');
+
+        if (lockedUntil) {
+          throw new AccountLockedException(lockedUntil);
+        }
 
         throw new UnauthorizedException('Invalid credentials');
       }
