@@ -7,7 +7,7 @@
 export type FreeBackend = {
   id: string;
   label: string;
-  kind: 'openai_post' | 'local_opal';
+  kind: 'openai_post' | 'gemini_native' | 'local_opal';
   chatUrl?: string;
   upstreamModel: string;
   apiKey?: string;
@@ -55,9 +55,9 @@ function openRouterKey(): string {
 }
 
 function groqModelFor(alias: string): string {
-  if (alias === 'balanced') return 'llama-3.3-70b-versatile';
-  // auto / fast — tiny + fastest free model
-  return 'llama-3.1-8b-instant';
+  if (alias === 'balanced') return 'openai/gpt-oss-120b';
+  // Llama 3.x chat models were retired from Groq in 2026.
+  return 'openai/gpt-oss-20b';
 }
 
 function openRouterModelFor(alias: string): string {
@@ -66,17 +66,26 @@ function openRouterModelFor(alias: string): string {
   return 'nvidia/nemotron-3-nano-30b-a3b:free';
 }
 
-/** Groq chat models used for Advisor text cannot see images. */
-export const GROQ_VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
-export const GEMINI_VISION_MODEL = 'gemini-2.0-flash';
+/** Groq Llama 4 Scout was retired July 2026. Current Groq vision models: */
+export const GROQ_VISION_MODELS = [
+  'qwen/qwen3.6-27b',
+  'qwen/qwen3.8-27b',
+] as const;
+export const GROQ_VISION_MODEL = GROQ_VISION_MODELS[0];
+/** Gemini 2.0 Flash was retired; 3.6 is the current vision Flash. */
+export const GEMINI_VISION_MODELS = [
+  'gemini-3.6-flash',
+  'gemini-2.5-flash',
+] as const;
+export const GEMINI_VISION_MODEL = GEMINI_VISION_MODELS[0];
 export const VISION_ROUTE_TIMEOUT_MS = Number(
-  process.env.OMNIROUTE_VISION_TIMEOUT_MS || 25_000,
+  process.env.OMNIROUTE_VISION_TIMEOUT_MS || 45_000,
 );
 
 /**
  * Vision backends for receipt OCR. Text-only Groq chat models are excluded
  * so they cannot "succeed" without seeing the image.
- * Order: Opal Free Groq vision, then Gemini Flash.
+ * Order: Opal Free Groq vision, then Gemini Flash (native image API).
  */
 export function resolveVisionFreeBackends(options?: {
   skipGroq?: boolean;
@@ -84,28 +93,31 @@ export function resolveVisionFreeBackends(options?: {
   const candidates: FreeBackend[] = [];
   const gKey = groqKey();
   if (gKey && !options?.skipGroq) {
-    candidates.push({
-      id: `groq:${GROQ_VISION_MODEL}`,
-      label: 'Groq vision',
-      kind: 'openai_post',
-      chatUrl: 'https://api.groq.com/openai/v1/chat/completions',
-      upstreamModel: GROQ_VISION_MODEL,
-      apiKey: gKey,
-      timeoutMs: VISION_ROUTE_TIMEOUT_MS,
-    });
+    for (const model of GROQ_VISION_MODELS) {
+      candidates.push({
+        id: `groq:${model}`,
+        label: `Groq vision (${model.split('/')[1] || model})`,
+        kind: 'openai_post',
+        chatUrl: 'https://api.groq.com/openai/v1/chat/completions',
+        upstreamModel: model,
+        apiKey: gKey,
+        timeoutMs: VISION_ROUTE_TIMEOUT_MS,
+      });
+    }
   }
   const gemKey = geminiKey();
   if (gemKey) {
-    candidates.push({
-      id: 'gemini:flash-vision',
-      label: 'Gemini Flash',
-      kind: 'openai_post',
-      chatUrl:
-        'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
-      upstreamModel: GEMINI_VISION_MODEL,
-      apiKey: gemKey,
-      timeoutMs: VISION_ROUTE_TIMEOUT_MS,
-    });
+    for (const model of GEMINI_VISION_MODELS) {
+      candidates.push({
+        id: `gemini:${model}`,
+        label: `Gemini (${model})`,
+        kind: 'gemini_native',
+        chatUrl: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        upstreamModel: model,
+        apiKey: gemKey,
+        timeoutMs: VISION_ROUTE_TIMEOUT_MS,
+      });
+    }
   }
   return candidates;
 }
@@ -135,7 +147,7 @@ export function resolveRemoteFreeBackends(selectedModel: string): FreeBackend[] 
       kind: 'openai_post',
       chatUrl:
         'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
-      upstreamModel: 'gemini-2.0-flash',
+      upstreamModel: GEMINI_VISION_MODEL,
       apiKey: gemKey,
       timeoutMs: FREE_ROUTE_BUDGET_MS,
     });

@@ -20,6 +20,17 @@ import { buildLocalOpalReply } from './opal-local-reply';
 
 export type OmnirouteProgress = (message: string) => void;
 
+function stripThink(text: string): string {
+  return String(text || '')
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<think>[\s\S]*$/gi, '')
+    .trim();
+}
+
+function isGroqBackend(backend: FreeBackend): boolean {
+  return Boolean(backend.chatUrl?.includes('api.groq.com'));
+}
+
 async function readErrorText(res: Response): Promise<string> {
   try {
     const data = await res.json();
@@ -123,6 +134,11 @@ async function chatOpenAiPost(
   signal?: AbortSignal,
 ): Promise<ProviderChatResult> {
   if (!backend.chatUrl) throw new Error(`${backend.label}: missing URL`);
+  const tokenBudget = Math.min(
+    request.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+    2048,
+  );
+  const wantJson = Boolean(request.json) && !backend.upstreamModel.startsWith('qwen/');
   const res = await fetchWithTimeout(
     backend.chatUrl,
     {
@@ -132,14 +148,12 @@ async function chatOpenAiPost(
         model: backend.upstreamModel,
         messages: buildOpenAiMessages(messages),
         temperature: request.temperature ?? 0.35,
-        max_tokens: Math.min(
-          request.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
-          2048,
-        ),
-        stream: false,
-        ...(request.json
-          ? { response_format: { type: 'json_object' } }
+        max_tokens: tokenBudget,
+        ...(isGroqBackend(backend)
+          ? { max_completion_tokens: tokenBudget }
           : {}),
+        stream: false,
+        ...(wantJson ? { response_format: { type: 'json_object' } } : {}),
       }),
     },
     backend.timeoutMs || FREE_ROUTE_BUDGET_MS,
@@ -151,18 +165,88 @@ async function chatOpenAiPost(
   }
 
   const data = await res.json();
-  const content = data?.choices?.[0]?.message?.content;
-  if (!content || !String(content).trim()) {
+  const content = stripThink(String(data?.choices?.[0]?.message?.content || ''));
+  if (!content) {
     throw new Error(`${backend.label}: empty response`);
   }
 
   return {
-    content: String(content),
+    content,
     model: `${backend.id}/${data?.model || backend.upstreamModel}`,
     provider: 'omniroute',
     usage: {
       input_tokens: data?.usage?.prompt_tokens,
       output_tokens: data?.usage?.completion_tokens,
+    },
+  };
+}
+
+async function chatGeminiNative(
+  backend: FreeBackend,
+  request: ProviderChatRequest,
+  messages: ChatMessage[],
+  signal?: AbortSignal,
+): Promise<ProviderChatResult> {
+  if (!backend.chatUrl || !backend.apiKey) {
+    throw new Error(`${backend.label}: missing URL or key`);
+  }
+  const parts: Array<Record<string, unknown>> = [];
+  for (const message of messages) {
+    if (message.content?.trim()) {
+      const prefix = message.role === 'system' ? 'Instructions:\n' : '';
+      parts.push({ text: `${prefix}${message.content}` });
+    }
+    for (const file of message.attachments || []) {
+      const mime =
+        file.mimeType === 'image/jpg' ? 'image/jpeg' : file.mimeType;
+      if (mime.startsWith('image/') || mime === 'application/pdf') {
+        parts.push({
+          inline_data: {
+            mime_type: mime,
+            data: file.dataBase64,
+          },
+        });
+      }
+    }
+  }
+  const url = `${backend.chatUrl}?key=${encodeURIComponent(backend.apiKey)}`;
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts }],
+        generationConfig: {
+          temperature: request.temperature ?? 0.1,
+          maxOutputTokens: Math.min(request.maxTokens ?? 1024, 2048),
+          responseMimeType: 'application/json',
+        },
+      }),
+    },
+    backend.timeoutMs || FREE_ROUTE_BUDGET_MS,
+    signal,
+  );
+  if (!res.ok) {
+    throw new Error(`${backend.label}: ${await readErrorText(res)}`);
+  }
+  const data = await res.json();
+  const content = stripThink(
+    (data?.candidates?.[0]?.content?.parts || [])
+      .map((part: { text?: string }) => part?.text || '')
+      .join('\n')
+      .trim(),
+  );
+  if (!content) {
+    throw new Error(`${backend.label}: empty response`);
+  }
+  return {
+    content,
+    model: `${backend.id}/${backend.upstreamModel}`,
+    provider: 'omniroute',
+    usage: {
+      input_tokens: data?.usageMetadata?.promptTokenCount,
+      output_tokens: data?.usageMetadata?.candidatesTokenCount,
     },
   };
 }
@@ -179,6 +263,9 @@ async function chatOnce(
       model: 'omniroute/opal-local',
       provider: 'omniroute',
     };
+  }
+  if (backend.kind === 'gemini_native') {
+    return chatGeminiNative(backend, request, messages, signal);
   }
   return chatOpenAiPost(backend, request, messages, signal);
 }
@@ -247,7 +334,7 @@ async function raceRemotes(
 export async function trySequentialVisionChat(
   messages: ChatMessage[],
   options?: { skipGroq?: boolean },
-): Promise<ProviderChatResult | null> {
+): Promise<{ result: ProviderChatResult | null; errors: string[] }> {
   const backends = resolveVisionFreeBackends({ skipGroq: options?.skipGroq });
   const base: ProviderChatRequest = {
     model: 'auto',
@@ -256,23 +343,44 @@ export async function trySequentialVisionChat(
     maxTokens: 1024,
   };
   const errors: string[] = [];
+  if (!backends.length) {
+    return {
+      result: null,
+      errors: ['No Groq or Gemini vision key is configured on the server.'],
+    };
+  }
   for (const backend of backends) {
+    const allowJson =
+      backend.kind === 'gemini_native' ||
+      (!isGroqBackend(backend) && !backend.upstreamModel.startsWith('qwen/'));
     try {
-      return await chatOpenAiPost(backend, { ...base, json: true }, messages);
-    } catch (jsonErr: any) {
-      try {
-        return await chatOpenAiPost(backend, base, messages);
-      } catch (err: any) {
-        const detail = err?.message || jsonErr?.message || String(err);
-        errors.push(`${backend.label}: ${detail}`);
-        console.warn(`[Opal vision] ${backend.label} failed: ${detail}`);
+      const run = async (json: boolean) => {
+        const result = await chatOnce(backend, { ...base, json }, messages);
+        const start = result.content.indexOf('{');
+        const end = result.content.lastIndexOf('}');
+        if (start < 0 || end <= start) {
+          throw new Error(`${backend.label}: no JSON object in reply`);
+        }
+        return { ...result, content: result.content.slice(start, end + 1) };
+      };
+      if (allowJson) {
+        try {
+          return { result: await run(true), errors };
+        } catch {
+          /* retry without JSON mode */
+        }
       }
+      return { result: await run(false), errors };
+    } catch (err: any) {
+      const detail = err?.message || String(err);
+      errors.push(detail);
+      console.warn(`[Opal vision] ${backend.label} failed: ${detail}`);
     }
   }
   if (errors.length) {
     console.warn(`[Opal vision] all backends failed: ${errors.join(' | ')}`);
   }
-  return null;
+  return { result: null, errors };
 }
 
 /**

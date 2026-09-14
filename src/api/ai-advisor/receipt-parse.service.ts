@@ -173,10 +173,19 @@ export class ReceiptParseService {
       },
     ];
 
-    const vision = await trySequentialVisionChat(messages, { skipGroq });
+    const { result: vision, errors } = await trySequentialVisionChat(
+      messages,
+      { skipGroq },
+    );
     if (!vision) {
+      const hint = errors
+        .map((item) => item.replace(/key[=:][^\s]+/gi, 'key=***'))
+        .slice(0, 2)
+        .join(' · ');
       return emptyResult(
-        'Could not read this receipt with free AI or Gemini. Fill the form manually — the image was not saved.',
+        hint
+          ? `Could not read this receipt (${hint}). Fill the form manually — the image was not saved.`
+          : 'Could not read this receipt with free AI or Gemini. Fill the form manually — the image was not saved.',
       );
     }
 
@@ -207,7 +216,10 @@ export class ReceiptParseService {
 
   private parseModelJson(content: string): ReceiptExtractedFields {
     try {
-      const parsed = JSON.parse(stripJsonFence(content)) as Record<string, unknown>;
+      const cleaned = String(content || '')
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .trim();
+      const parsed = JSON.parse(stripJsonFence(cleaned)) as Record<string, unknown>;
       const lineNotes = Array.isArray(parsed.line_items)
         ? parsed.line_items
             .map((item) => {
