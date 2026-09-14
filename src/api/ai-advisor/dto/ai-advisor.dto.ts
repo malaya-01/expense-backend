@@ -249,3 +249,23 @@ export class SuggestCategoryIconDto {
   @MaxLength(500)
   description?: string;
 }
+
+export class ParseReceiptDto {
+  @ApiProperty({ example: 'gpay-receipt.jpg' })
+  @IsString()
+  @MaxLength(180)
+  name: string;
+
+  @ApiProperty()
+  @IsString()
+  @Matches(
+    /^(image\/(png|jpeg|jpg|webp|gif|heic|heif)|application\/pdf)$/,
+    { message: 'Unsupported receipt type. Use a photo, screenshot, or PDF.' },
+  )
+  mime_type: string;
+
+  @ApiProperty({ description: 'Base64 payload without a data URL prefix' })
+  @IsString()
+  @MaxLength(5_500_000)
+  data_base64: string;
+}

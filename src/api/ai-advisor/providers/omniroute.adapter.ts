@@ -14,6 +14,7 @@ import {
   freeRouteSpeedHint,
   localOpalBackend,
   resolveRemoteFreeBackends,
+  resolveVisionFreeBackends,
 } from './omniroute.free-backends';
 import { buildLocalOpalReply } from './opal-local-reply';
 
@@ -136,6 +137,9 @@ async function chatOpenAiPost(
           2048,
         ),
         stream: false,
+        ...(request.json
+          ? { response_format: { type: 'json_object' } }
+          : {}),
       }),
     },
     backend.timeoutMs || FREE_ROUTE_BUDGET_MS,
@@ -234,6 +238,41 @@ async function raceRemotes(
       FREE_ROUTE_BUDGET_MS + 250,
     );
   });
+}
+
+/**
+ * Sequential vision OCR: Groq vision, then Gemini. Never uses local Opal
+ * (it cannot see images and would invent fields).
+ */
+export async function trySequentialVisionChat(
+  messages: ChatMessage[],
+  options?: { skipGroq?: boolean },
+): Promise<ProviderChatResult | null> {
+  const backends = resolveVisionFreeBackends({ skipGroq: options?.skipGroq });
+  const base: ProviderChatRequest = {
+    model: 'auto',
+    messages,
+    temperature: 0.1,
+    maxTokens: 1024,
+  };
+  const errors: string[] = [];
+  for (const backend of backends) {
+    try {
+      return await chatOpenAiPost(backend, { ...base, json: true }, messages);
+    } catch (jsonErr: any) {
+      try {
+        return await chatOpenAiPost(backend, base, messages);
+      } catch (err: any) {
+        const detail = err?.message || jsonErr?.message || String(err);
+        errors.push(`${backend.label}: ${detail}`);
+        console.warn(`[Opal vision] ${backend.label} failed: ${detail}`);
+      }
+    }
+  }
+  if (errors.length) {
+    console.warn(`[Opal vision] all backends failed: ${errors.join(' | ')}`);
+  }
+  return null;
 }
 
 /**

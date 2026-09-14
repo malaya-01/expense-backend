@@ -27,6 +27,8 @@ export type ProviderChatRequest = {
   messages: ChatMessage[];
   temperature?: number;
   maxTokens?: number;
+  /** Ask OpenAI-compatible backends for a JSON object (vision extraction). */
+  json?: boolean;
 };
 
 /** Default completion budget for advisor replies (was 2048 and cut long answers short). */

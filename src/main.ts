@@ -30,8 +30,8 @@ async function bootstrap() {
 
   // cookie-parser is CommonJS; Nest/TS resolves it as a namespace import.
   app.use((cookieParser as unknown as () => ReturnType<typeof cookieParser>)());
-  app.use(json({ limit: '2mb' }));
-  app.use(urlencoded({ extended: true, limit: '2mb' }));
+  app.use(json({ limit: '6mb' }));
+  app.use(urlencoded({ extended: true, limit: '6mb' }));
   app.setGlobalPrefix('api');
   app.useGlobalPipes(
     new ValidationPipe({

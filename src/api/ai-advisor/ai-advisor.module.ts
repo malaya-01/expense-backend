@@ -14,6 +14,7 @@ import { ReportsModule } from '../reports/reports.module';
 import { TransactionsModule } from '../transactions/transactions.module';
 import { AiOmnirouteUsageService } from './ai-omniroute-usage.service';
 import { AiWebSearchService } from './ai-web-search.service';
+import { ReceiptParseService } from './receipt-parse.service';
 import { SpacesModule } from '../spaces/spaces.module';
 
 @Module({
@@ -36,6 +37,7 @@ import { SpacesModule } from '../spaces/spaces.module';
     AiToolsService,
     AiWebSearchService,
     AiOmnirouteUsageService,
+    ReceiptParseService,
   ],
   exports: [AiAdvisorService, AiSettingsService],
 })

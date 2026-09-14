@@ -66,9 +66,50 @@ function openRouterModelFor(alias: string): string {
   return 'nvidia/nemotron-3-nano-30b-a3b:free';
 }
 
+/** Groq chat models used for Advisor text cannot see images. */
+export const GROQ_VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
+export const GEMINI_VISION_MODEL = 'gemini-2.0-flash';
+export const VISION_ROUTE_TIMEOUT_MS = Number(
+  process.env.OMNIROUTE_VISION_TIMEOUT_MS || 25_000,
+);
+
 /**
- * Remote candidates only (no local). Kept short on purpose for speed.
+ * Vision backends for receipt OCR. Text-only Groq chat models are excluded
+ * so they cannot "succeed" without seeing the image.
+ * Order: Opal Free Groq vision, then Gemini Flash.
  */
+export function resolveVisionFreeBackends(options?: {
+  skipGroq?: boolean;
+}): FreeBackend[] {
+  const candidates: FreeBackend[] = [];
+  const gKey = groqKey();
+  if (gKey && !options?.skipGroq) {
+    candidates.push({
+      id: `groq:${GROQ_VISION_MODEL}`,
+      label: 'Groq vision',
+      kind: 'openai_post',
+      chatUrl: 'https://api.groq.com/openai/v1/chat/completions',
+      upstreamModel: GROQ_VISION_MODEL,
+      apiKey: gKey,
+      timeoutMs: VISION_ROUTE_TIMEOUT_MS,
+    });
+  }
+  const gemKey = geminiKey();
+  if (gemKey) {
+    candidates.push({
+      id: 'gemini:flash-vision',
+      label: 'Gemini Flash',
+      kind: 'openai_post',
+      chatUrl:
+        'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+      upstreamModel: GEMINI_VISION_MODEL,
+      apiKey: gemKey,
+      timeoutMs: VISION_ROUTE_TIMEOUT_MS,
+    });
+  }
+  return candidates;
+}
+
 export function resolveRemoteFreeBackends(selectedModel: string): FreeBackend[] {
   const model = (selectedModel || 'auto').trim() || 'auto';
   const candidates: FreeBackend[] = [];

@@ -25,6 +25,7 @@ import {
   BulkProposalsDto,
   ChatMessageDto,
   CreateAiMemoryDto,
+  ParseReceiptDto,
   PinConversationDto,
   RenameConversationDto,
   SelectActiveProviderDto,
@@ -34,9 +35,10 @@ import {
   UploadAiDocumentDto,
   UpsertProviderConfigDto,
 } from './dto/ai-advisor.dto';
+import { ReceiptParseService } from './receipt-parse.service';
 import { AI_PROVIDERS, AiProviderId } from './providers/types';
 import { errorResponse, successResponse } from 'src/utils/response/response';
-import { RequirePermissions } from 'src/helper/decorators/permissions.decorator';
+import { RequireAnyPermission, RequirePermissions } from 'src/helper/decorators/permissions.decorator';
 
 @ApiBearerAuth('bearer')
 @ApiTags('ai-advisor')
@@ -46,6 +48,7 @@ export class AiAdvisorController {
   constructor(
     private readonly settingsService: AiSettingsService,
     private readonly advisorService: AiAdvisorService,
+    private readonly receiptParse: ReceiptParseService,
   ) {}
 
   @Get('settings')
@@ -552,6 +555,36 @@ export class AiAdvisorController {
       return res
         .status(HttpStatus.OK)
         .send(successResponse(data, 'Document deleted.'));
+    } catch (error) {
+      return this.fail(res, error);
+    }
+  }
+
+  @Post('receipts/parse')
+  @ApiOperation({
+    summary:
+      'Extract receipt fields with free vision then Gemini. Image is not stored.',
+  })
+  @ApiBody({ type: ParseReceiptDto })
+  @RequireAnyPermission('ai.create', 'expenses.create')
+  async parseReceipt(
+    @Body() dto: ParseReceiptDto,
+    @Req() req: ExpressRequest,
+    @Res() res: Response,
+  ) {
+    try {
+      const userId = (req as any).user.id as string;
+      const data = await this.receiptParse.parse(userId, dto);
+      return res
+        .status(HttpStatus.OK)
+        .send(
+          successResponse(
+            data,
+            data.ok
+              ? 'Receipt fields extracted. Review before saving.'
+              : data.warning || 'Could not extract receipt fields.',
+          ),
+        );
     } catch (error) {
       return this.fail(res, error);
     }
