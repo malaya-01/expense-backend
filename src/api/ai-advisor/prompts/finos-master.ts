@@ -101,12 +101,12 @@ export const PROVIDER_SETUP_GUIDES = {
   omniroute: {
     title: 'Opal Free',
     summary:
-      'Fast free AI — no key for you. Uses Groq (preferred) or Gemini on the server, then built-in Opal Advisor. Limited to 20 successful requests per day.',
+      'Fast free AI — no key for you. Uses Groq (preferred) or Gemini on the server, then built-in Opal Advisor. Limited to 20 successful requests per day (admins unlimited).',
     steps: [
       'Click Use free — Opal checks the fast route first.',
       'Pick auto/fast for speed, balanced for stronger answers, or gemini if configured.',
       'Chat in AI Advisor. Replies should arrive in a few seconds.',
-      'After 20 successful replies today, connect OpenRouter or another BYOK provider for unlimited use.',
+      'After 20 successful replies today, connect OpenRouter or another BYOK provider for unlimited use (super-admins and staff admins are not capped).',
     ],
     links: [
       {

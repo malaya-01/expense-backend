@@ -8,6 +8,63 @@ import {
   ProviderConfig,
 } from './types';
 
+/**
+ * Vertex / Gemini advisor replies need a large visible-token budget.
+ * Gemini 2.5+ "thinking" shares maxOutputTokens — keep thinking modest
+ * and default the total high enough that long FinOS answers finish.
+ */
+export const VERTEX_MAX_OUTPUT_TOKENS = Math.min(
+  Math.max(
+    Number(process.env.VERTEX_MAX_OUTPUT_TOKENS || DEFAULT_MAX_OUTPUT_TOKENS),
+    8192,
+  ),
+  65536,
+);
+
+function usesThinkingModel(model: string): boolean {
+  const id = String(model || '').toLowerCase();
+  return (
+    id.includes('2.5') ||
+    id.includes('gemini-3') ||
+    id.includes('thinking')
+  );
+}
+
+function resolveMaxOutputTokens(request: ProviderChatRequest): number {
+  const requested = Number(request.maxTokens || 0);
+  if (Number.isFinite(requested) && requested > 0) {
+    return Math.min(Math.max(requested, 256), 65536);
+  }
+  return VERTEX_MAX_OUTPUT_TOKENS;
+}
+
+function thinkingBudgetFor(maxOutputTokens: number, model: string): number | null {
+  if (!usesThinkingModel(model)) return null;
+  // Leave most of the budget for visible reply text.
+  return Math.min(2048, Math.max(512, Math.floor(maxOutputTokens * 0.12)));
+}
+
+function extractVisibleText(data: unknown): string {
+  const parts =
+    (data as { candidates?: Array<{ content?: { parts?: unknown[] } }> })
+      ?.candidates?.[0]?.content?.parts || [];
+  return parts
+    .filter((part: any) => part && !part.thought)
+    .map((part: any) => part.text || '')
+    .join('');
+}
+
+function finishReasonOf(data: unknown): string {
+  return String(
+    (data as { candidates?: Array<{ finishReason?: string }> })?.candidates?.[0]
+      ?.finishReason || '',
+  ).toUpperCase();
+}
+
+function isMaxTokensStop(reason: string): boolean {
+  return reason === 'MAX_TOKENS' || reason === 'LENGTH';
+}
+
 export class VertexAdapter implements AiProviderAdapter {
   readonly id = 'vertex' as const;
 
@@ -36,6 +93,9 @@ export class VertexAdapter implements AiProviderAdapter {
   }
 
   private requestBody(request: ProviderChatRequest) {
+    const model = request.model || '';
+    const maxOutputTokens = resolveMaxOutputTokens(request);
+    const thinkingBudget = thinkingBudgetFor(maxOutputTokens, model);
     const system = request.messages
       .filter((message) => message.role === 'system')
       .map((message) => message.content)
@@ -62,11 +122,14 @@ export class VertexAdapter implements AiProviderAdapter {
       contents,
       generationConfig: {
         temperature: request.temperature ?? 0.3,
-        maxOutputTokens: request.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
-        // Gemini 2.5 thinking shares the output budget; cap it so replies
-        // don't die mid-sentence after internal reasoning.
-        ...(String(request.model || '').includes('2.5')
-          ? { thinkingConfig: { thinkingBudget: 1024 } }
+        maxOutputTokens,
+        ...(thinkingBudget != null
+          ? {
+              thinkingConfig: {
+                thinkingBudget,
+                includeThoughts: false,
+              },
+            }
           : {}),
       },
     };
@@ -93,29 +156,35 @@ export class VertexAdapter implements AiProviderAdapter {
     };
   }
 
-  async chat(
-    config: ProviderConfig,
-    request: ProviderChatRequest,
-  ): Promise<ProviderChatResult> {
-    const sa = config.credentials.serviceAccountJson;
-    if (!sa) {
-      throw new BadRequestException('Vertex service-account JSON is required.');
-    }
-    const { projectId, location } = this.resolveProject(config, sa);
+  private endpoint(
+    projectId: string,
+    location: string,
+    model: string,
+    stream: boolean,
+  ) {
+    const base =
+      `https://${location}-aiplatform.googleapis.com/v1/projects/${projectId}` +
+      `/locations/${location}/publishers/google/models/${model}`;
+    return stream
+      ? `${base}:streamGenerateContent?alt=sse`
+      : `${base}:generateContent`;
+  }
 
-    const accessToken = await this.getAccessToken(sa);
-    const model = request.model || config.model;
-    const url = `https://${location}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${location}/publishers/google/models/${model}:generateContent`;
-
+  private async generateOnce(
+    url: string,
+    accessToken: string,
+    body: unknown,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
     const res = await fetch(url, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify(this.requestBody(request)),
+      signal,
+      body: JSON.stringify(body),
     });
-
     if (!res.ok) {
       let message = `${res.status} ${res.statusText}`;
       try {
@@ -126,22 +195,83 @@ export class VertexAdapter implements AiProviderAdapter {
       }
       throw new BadRequestException(`Provider error (vertex): ${message}`);
     }
+    return res.json();
+  }
 
-    const data = await res.json();
-    const content = (data?.candidates?.[0]?.content?.parts || [])
-      .map((p: any) => p.text || '')
-      .join('')
-      .trim();
+  /**
+   * If Vertex stopped early on MAX_TOKENS, ask once to continue so long
+   * advisor answers are not left mid-sentence.
+   */
+  private async continueIfTruncated(
+    url: string,
+    accessToken: string,
+    request: ProviderChatRequest,
+    partial: string,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const continuationRequest: ProviderChatRequest = {
+      ...request,
+      messages: [
+        ...request.messages,
+        { role: 'assistant', content: partial },
+        {
+          role: 'user',
+          content:
+            'Continue the previous reply from exactly where it stopped. Do not restart or repeat earlier text — only finish the remaining answer.',
+        },
+      ],
+      // Fresh budget for the continuation segment.
+      maxTokens: Math.max(4096, Math.floor(resolveMaxOutputTokens(request) / 2)),
+    };
+    const data = await this.generateOnce(
+      url,
+      accessToken,
+      this.requestBody(continuationRequest),
+      signal,
+    );
+    return extractVisibleText(data).trim();
+  }
+
+  async chat(
+    config: ProviderConfig,
+    request: ProviderChatRequest,
+  ): Promise<ProviderChatResult> {
+    const sa = config.credentials.serviceAccountJson;
+    if (!sa) {
+      throw new BadRequestException('Vertex service-account JSON is required.');
+    }
+    const { projectId, location } = this.resolveProject(config, sa);
+    const accessToken = await this.getAccessToken(sa);
+    const model = request.model || config.model;
+    const url = this.endpoint(projectId, location, model, false);
+
+    const data = await this.generateOnce(
+      url,
+      accessToken,
+      this.requestBody({ ...request, model }),
+    );
+    let content = extractVisibleText(data).trim();
     if (!content) {
       throw new BadRequestException('Vertex returned an empty response.');
     }
+
+    if (isMaxTokensStop(finishReasonOf(data))) {
+      const more = await this.continueIfTruncated(
+        url,
+        accessToken,
+        { ...request, model },
+        content,
+      ).catch(() => '');
+      if (more) content = `${content}${more.startsWith('\n') ? '' : '\n'}${more}`.trim();
+    }
+
     return {
       content,
       model,
       provider: 'vertex',
       usage: {
-        input_tokens: data?.usageMetadata?.promptTokenCount,
-        output_tokens: data?.usageMetadata?.candidatesTokenCount,
+        input_tokens: (data as any)?.usageMetadata?.promptTokenCount,
+        output_tokens: (data as any)?.usageMetadata?.candidatesTokenCount,
       },
     };
   }
@@ -158,10 +288,7 @@ export class VertexAdapter implements AiProviderAdapter {
     const { projectId, location } = this.resolveProject(config, sa);
     const accessToken = await this.getAccessToken(sa);
     const model = request.model || config.model;
-    const url =
-      `https://${location}-aiplatform.googleapis.com/v1/projects/${projectId}` +
-      `/locations/${location}/publishers/google/models/${model}` +
-      ':streamGenerateContent?alt=sse';
+    const url = this.endpoint(projectId, location, model, true);
     const res = await fetch(url, {
       method: 'POST',
       headers: {
@@ -169,7 +296,7 @@ export class VertexAdapter implements AiProviderAdapter {
         'Content-Type': 'application/json',
       },
       signal,
-      body: JSON.stringify(this.requestBody(request)),
+      body: JSON.stringify(this.requestBody({ ...request, model })),
     });
     if (!res.ok) {
       let message = `${res.status} ${res.statusText}`;
@@ -189,6 +316,7 @@ export class VertexAdapter implements AiProviderAdapter {
     const decoder = new TextDecoder();
     let buffer = '';
     let content = '';
+    let lastFinishReason = '';
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -200,10 +328,9 @@ export class VertexAdapter implements AiProviderAdapter {
         if (!line.startsWith('data:')) continue;
         try {
           const data = JSON.parse(line.slice(5).trim());
-          const delta = (data?.candidates?.[0]?.content?.parts || [])
-            .filter((part: any) => !part.thought)
-            .map((part: any) => part.text || '')
-            .join('');
+          const reason = finishReasonOf(data);
+          if (reason) lastFinishReason = reason;
+          const delta = extractVisibleText(data);
           if (delta) {
             content += delta;
             yield delta;
@@ -216,6 +343,23 @@ export class VertexAdapter implements AiProviderAdapter {
     if (!content) {
       throw new BadRequestException('Vertex returned an empty response.');
     }
+
+    if (isMaxTokensStop(lastFinishReason) && !signal?.aborted) {
+      const continueUrl = this.endpoint(projectId, location, model, false);
+      const more = await this.continueIfTruncated(
+        continueUrl,
+        accessToken,
+        { ...request, model },
+        content,
+        signal,
+      ).catch(() => '');
+      if (more) {
+        const glue = more.startsWith('\n') ? '' : '\n';
+        content += `${glue}${more}`;
+        yield `${glue}${more}`;
+      }
+    }
+
     return { content, model, provider: 'vertex' };
   }
 

@@ -33,7 +33,7 @@ export type ProviderChatRequest = {
 
 /** Default completion budget for advisor replies (was 2048 and cut long answers short). */
 export const DEFAULT_MAX_OUTPUT_TOKENS = Number(
-  process.env.AI_MAX_OUTPUT_TOKENS || 8192,
+  process.env.AI_MAX_OUTPUT_TOKENS || 16384,
 );
 
 export type ProviderChatResult = {
