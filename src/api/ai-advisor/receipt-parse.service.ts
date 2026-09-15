@@ -8,6 +8,8 @@ import { trySequentialVisionChat } from './providers/omniroute.adapter';
 import { ChatMessage } from './providers/types';
 import { matchExpenseSource } from './match-container';
 
+export type ReceiptTransactionType = 'expense' | 'income' | 'transfer';
+
 export type ReceiptExtractedFields = {
   merchant: string | null;
   description: string | null;
@@ -18,6 +20,7 @@ export type ReceiptExtractedFields = {
   paid_at: string | null;
   payment_method: string | null;
   payment_status: string | null;
+  transaction_type: ReceiptTransactionType | null;
   upi_vpa: string | null;
   upi_txn_id: string | null;
   platform: string | null;
@@ -28,17 +31,23 @@ export type ReceiptExtractedFields = {
   bank_name: string | null;
   account_last4: string | null;
   account_label: string | null;
+  destination_container_name: string | null;
+  destination_bank_name: string | null;
+  destination_account_last4: string | null;
+  destination_account_label: string | null;
 };
 
 export type ReceiptParseResult = {
   ok: boolean;
   stored: false;
   warning?: string;
+  blocked_reason?: 'failed_payment' | 'pending_payment';
   used_provider: string | null;
   used_model: string | null;
   category_id: string | null;
   category_name: string | null;
   source_container_id: string | null;
+  destination_container_id: string | null;
   extracted: ReceiptExtractedFields;
 };
 
@@ -52,6 +61,7 @@ const EMPTY_FIELDS: ReceiptExtractedFields = {
   paid_at: null,
   payment_method: null,
   payment_status: null,
+  transaction_type: null,
   upi_vpa: null,
   upi_txn_id: null,
   platform: null,
@@ -62,6 +72,10 @@ const EMPTY_FIELDS: ReceiptExtractedFields = {
   bank_name: null,
   account_last4: null,
   account_label: null,
+  destination_container_name: null,
+  destination_bank_name: null,
+  destination_account_last4: null,
+  destination_account_label: null,
 };
 
 const MONTHS: Record<string, string> = {
@@ -91,6 +105,21 @@ const MONTHS: Record<string, string> = {
   december: '12',
 };
 
+const FAILED_STATUS_RE =
+  /\b(fail(?:ed|ure)?|declin(?:ed|e)|unsuccessful|not\s+successful|couldn['’]?t\s+pay|payment\s+not\s+done|transaction\s+not\s+complet|rejected|cancelled|canceled|error|timed?\s*out|debit\s+failed|insufficient)\b/i;
+
+const PENDING_STATUS_RE =
+  /\b(pending|processing|in\s+progress|awaiting|initiated|submitted)\b/i;
+
+const SUCCESS_STATUS_RE =
+  /\b(success(?:ful)?|completed?|paid|done|credited|received|debited|settled)\b/i;
+
+const INCOME_HINT_RE =
+  /\b(received|credited|credit\s+alert|money\s+received|payment\s+received|you\s+got|got\s+paid|salary|refund\s+received|incoming)\b/i;
+
+const TRANSFER_HINT_RE =
+  /\b(self\s*transfer|transfer\s+to\s+self|paid\s+to\s+self|to\s+yourself|own\s+account|between\s+accounts|account\s+to\s+account|moved\s+to|fund\s+transfer)\b/i;
+
 function emptyResult(
   warning: string,
   extra?: Partial<ReceiptParseResult>,
@@ -104,6 +133,7 @@ function emptyResult(
     category_id: null,
     category_name: null,
     source_container_id: null,
+    destination_container_id: null,
     extracted: { ...EMPTY_FIELDS },
     ...extra,
   };
@@ -176,8 +206,19 @@ function asDate(value: unknown): string | null {
 function asTime(value: unknown): string | null {
   const raw = asString(value);
   if (!raw) return null;
-  const match = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)?$/i);
-  if (!match) return null;
+  // Prefer the wall-clock time printed on the receipt; ignore trailing timezone labels.
+  const match = raw.match(
+    /^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)?(?:\s*(?:ist|india|in|utc|gmt|[+-]\d{2}:?\d{2}))?$/i,
+  );
+  if (!match) {
+    const embedded = raw.match(
+      /(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)?/i,
+    );
+    if (!embedded) return null;
+    return asTime(
+      `${embedded[1]}:${embedded[2]}${embedded[4] ? ` ${embedded[4]}` : ''}`,
+    );
+  }
   let hour = Number(match[1]);
   const minute = match[2];
   const meridian = (match[4] || '').toLowerCase();
@@ -193,12 +234,27 @@ function asLast4(value: unknown): string | null {
   return digits.slice(-4);
 }
 
+/**
+ * Preserve the receipt's printed wall-clock time.
+ * Do not use `new Date(y,m,d,h,min)` on the server — Render/UTC would shift IST by ~5.5h.
+ * UPI / Indian bank receipts are treated as Asia/Kolkata.
+ */
 function paidAtFrom(date: string | null, time: string | null): string | null {
   if (!date || !time) return null;
   const [year, month, day] = date.split('-').map(Number);
   const [hour, minute] = time.split(':').map(Number);
   if (!year || !month || !day) return null;
-  return new Date(year, month - 1, day, hour || 0, minute || 0, 0).toISOString();
+  if (
+    hour == null ||
+    minute == null ||
+    Number.isNaN(hour) ||
+    Number.isNaN(minute) ||
+    hour > 23 ||
+    minute > 59
+  ) {
+    return null;
+  }
+  return `${date}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00+05:30`;
 }
 
 function describeVisionSource(modelId: string | null | undefined): {
@@ -228,6 +284,40 @@ function cleanDescription(description: string | null, merchant: string | null) {
   if (!description) return merchant;
   if (/^(to|from)\s+/i.test(description) && merchant) return merchant;
   return description;
+}
+
+function joinHaystack(parts: Array<string | null | undefined>): string {
+  return parts.filter(Boolean).join(' · ');
+}
+
+function asPaymentStatus(value: unknown, haystack: string): string | null {
+  const raw = asString(value);
+  const text = joinHaystack([raw, haystack]);
+  if (!text) return raw;
+  if (FAILED_STATUS_RE.test(text)) return 'failed';
+  if (PENDING_STATUS_RE.test(text) && !SUCCESS_STATUS_RE.test(text)) {
+    return 'pending';
+  }
+  if (raw && SUCCESS_STATUS_RE.test(raw)) return 'success';
+  if (SUCCESS_STATUS_RE.test(text)) return 'success';
+  return raw ? raw.toLowerCase() : null;
+}
+
+function asTransactionType(
+  value: unknown,
+  haystack: string,
+  hasDestination: boolean,
+): ReceiptTransactionType | null {
+  const raw = asString(value)?.toLowerCase();
+  if (raw === 'expense' || raw === 'income' || raw === 'transfer') return raw;
+  if (TRANSFER_HINT_RE.test(haystack) || (hasDestination && /self|own/i.test(haystack))) {
+    return 'transfer';
+  }
+  if (INCOME_HINT_RE.test(haystack)) return 'income';
+  if (/\b(paid|sent|debited|payment\s+to|spent)\b/i.test(haystack)) {
+    return 'expense';
+  }
+  return null;
 }
 
 @Injectable()
@@ -262,15 +352,28 @@ export class ReceiptParseService {
       {
         role: 'system',
         content: [
-          'You extract UPI payment screenshots, GPay/PhonePe/Paytm receipts, invoices, and bills.',
+          'You extract UPI payment screenshots, GPay/PhonePe/Paytm receipts, bank PDFs, invoices, and bills.',
           'Return a JSON object only. Never invent IDs, accounts, amounts, or times that are not visible.',
-          'Use null for any field you cannot read. Amount is the total paid.',
-          'Dates as YYYY-MM-DD. Times as 24-hour HH:mm (8:39 pm -> 20:39).',
+          'Use null for any field you cannot read. Amount is the total shown.',
+          'Dates as YYYY-MM-DD. Times as 24-hour HH:mm exactly as printed on the receipt (8:39 pm -> 20:39).',
+          'Do NOT convert the printed time to UTC or any other timezone. Keep the wall-clock time shown.',
+          'payment_status must be one of: success, failed, pending (or null).',
+          '  failed = Failed / Declined / Unsuccessful / Payment not done / Cancelled / Error.',
+          '  pending = Pending / Processing / In progress.',
+          '  success = Successful / Paid / Completed / Credited / Received.',
+          'transaction_type must be one of: expense, income, transfer.',
+          '  expense = user paid / sent money to a merchant or another person.',
+          '  income = user received / was credited money (salary, refund received, money received).',
+          '  transfer = self-pay / money moved between the user\'s own accounts or wallets (Paid to self, Self transfer).',
+          'For expense: container_* / bank_name / account_* describe the paying (source) account.',
+          'For income: destination_* fields describe where money was credited; container_* may be null.',
+          'For transfer: container_* is the debit/source account; destination_* is the credit/destination account.',
+          'merchant is the counterparty name (payee for expense, payer for income). For self-transfer use null or "Self".',
           'upi_txn_id is the UPI transaction ID. platform_txn_id is the app id (Google transaction ID, PhonePe UTR, Paytm order id). They are different.',
-          'platform is the app: Google Pay, PhonePe, Paytm, BHIM, etc.',
-          'account_label is the paying bank/account as shown (e.g. Karur Vysya Bank 2324). account_last4 is the last 4 digits if shown.',
+          'platform is the app: Google Pay, PhonePe, Paytm, BHIM, bank PDF, etc.',
+          'account_label is the bank/account as shown (e.g. Karur Vysya Bank 2324). account_last4 is the last 4 digits if shown.',
           'notes is any remark/message on the screenshot, else null.',
-          'container_name must be one of these user accounts when it matches the paying account, else null:',
+          'container_name / destination_container_name must be one of these user accounts when it matches, else null:',
           containerNames.slice(0, 40).join(', ') || '(none)',
           'category_name must be one of these user categories when it reasonably matches, else null:',
           categoryNames.slice(0, 80).join(', ') || '(none)',
@@ -279,7 +382,7 @@ export class ReceiptParseService {
       {
         role: 'user',
         content:
-          'Extract JSON keys: merchant, description, amount, currency, date, time, payment_method, payment_status, upi_vpa, upi_txn_id, platform, platform_txn_id, notes, category_name, container_name, bank_name, account_last4, account_label.',
+          'Extract JSON keys: merchant, description, amount, currency, date, time, payment_method, payment_status, transaction_type, upi_vpa, upi_txn_id, platform, platform_txn_id, notes, category_name, container_name, bank_name, account_last4, account_label, destination_container_name, destination_bank_name, destination_account_last4, destination_account_label.',
         attachments: [
           {
             name: dto.name || 'receipt',
@@ -301,26 +404,67 @@ export class ReceiptParseService {
         .join(' · ');
       return emptyResult(
         hint
-          ? `Could not read this receipt (${hint}). Fill the form manually — the image was not saved.`
-          : 'Could not read this receipt with free AI or Gemini. Fill the form manually — the image was not saved.',
+          ? `Could not read this receipt (${hint}). Fill the form manually — the file was not saved.`
+          : 'Could not read this receipt with free AI or Gemini. Fill the form manually — the file was not saved.',
       );
     }
 
     await this.omnirouteUsage.recordSuccessfulRequest(userId).catch(() => undefined);
 
     const extracted = this.parseModelJson(vision.content);
+    const status = extracted.payment_status;
+    if (status === 'failed') {
+      const source = describeVisionSource(vision.model);
+      return emptyResult(
+        'This looks like a failed payment. It was not added as a transaction — nothing was stored.',
+        {
+          blocked_reason: 'failed_payment',
+          used_provider: source.provider,
+          used_model: source.model,
+          extracted,
+        },
+      );
+    }
+    if (status === 'pending') {
+      const source = describeVisionSource(vision.model);
+      return emptyResult(
+        'This payment is still pending. Wait for success before adding it — nothing was stored.',
+        {
+          blocked_reason: 'pending_payment',
+          used_provider: source.provider,
+          used_model: source.model,
+          extracted,
+        },
+      );
+    }
+
     const category = await this.resolveCategory(
       userId,
       categories,
       extracted.category_name,
       extracted.merchant,
+      extracted.transaction_type,
     );
-    const matched = matchExpenseSource(containers, {
+    const sourceMatched = matchExpenseSource(containers, {
       container_name: extracted.container_name,
       bank_name: extracted.bank_name,
       account_last4: extracted.account_last4,
       account_label: extracted.account_label,
     });
+    let destinationMatched = matchExpenseSource(containers, {
+      container_name: extracted.destination_container_name,
+      bank_name: extracted.destination_bank_name,
+      account_last4: extracted.destination_account_last4,
+      account_label: extracted.destination_account_label,
+    });
+    // Income receipts often only show the credited account once — reuse source hints.
+    if (
+      extracted.transaction_type === 'income' &&
+      !destinationMatched &&
+      sourceMatched
+    ) {
+      destinationMatched = sourceMatched;
+    }
 
     const source = describeVisionSource(vision.model);
     const hasCore = Boolean(extracted.amount || extracted.merchant);
@@ -334,7 +478,8 @@ export class ReceiptParseService {
       used_model: source.model,
       category_id: category?.id || null,
       category_name: category?.name || extracted.category_name,
-      source_container_id: matched?.id || null,
+      source_container_id: sourceMatched?.id || null,
+      destination_container_id: destinationMatched?.id || null,
       extracted,
     };
   }
@@ -359,28 +504,54 @@ export class ReceiptParseService {
             .join(', ')
         : null;
       const merchant = asString(parsed.merchant);
+      const description = cleanDescription(asString(parsed.description), merchant);
+      const notes = asString(parsed.notes) || lineNotes;
       const date = asDate(parsed.date) || asDate(parsed.paid_at);
       const time = asTime(parsed.time) || asTime(parsed.paid_at);
+      const destinationContainer = asString(parsed.destination_container_name);
+      const destinationBank = asString(parsed.destination_bank_name);
+      const destinationLabel = asString(parsed.destination_account_label);
+      const destinationLast4 =
+        asLast4(parsed.destination_account_last4) ||
+        asLast4(parsed.destination_account_label);
+      const haystack = joinHaystack([
+        asString(parsed.payment_status),
+        description,
+        notes,
+        merchant,
+        asString(parsed.transaction_type),
+      ]);
+      const paymentStatus = asPaymentStatus(parsed.payment_status, haystack);
+      const transactionType = asTransactionType(
+        parsed.transaction_type,
+        haystack,
+        Boolean(destinationContainer || destinationBank || destinationLabel),
+      );
       return {
         merchant,
-        description: cleanDescription(asString(parsed.description), merchant),
+        description,
         amount: asAmount(parsed.amount),
         currency: asCurrency(parsed.currency),
         date,
         time,
         paid_at: paidAtFrom(date, time),
         payment_method: asString(parsed.payment_method),
-        payment_status: asString(parsed.payment_status),
+        payment_status: paymentStatus,
+        transaction_type: transactionType,
         upi_vpa: asString(parsed.upi_vpa),
         upi_txn_id: asString(parsed.upi_txn_id),
         platform: asString(parsed.platform),
         platform_txn_id: asString(parsed.platform_txn_id),
-        notes: asString(parsed.notes) || lineNotes,
+        notes,
         category_name: asString(parsed.category_name),
         container_name: asString(parsed.container_name),
         bank_name: asString(parsed.bank_name),
         account_last4: asLast4(parsed.account_last4) || asLast4(parsed.account_label),
         account_label: asString(parsed.account_label),
+        destination_container_name: destinationContainer,
+        destination_bank_name: destinationBank,
+        destination_account_last4: destinationLast4,
+        destination_account_label: destinationLabel,
       };
     } catch {
       return { ...EMPTY_FIELDS };
@@ -392,20 +563,22 @@ export class ReceiptParseService {
     categories: Array<{ id: string; name: string }>,
     suggestedName: string | null,
     merchant: string | null,
+    transactionType: ReceiptTransactionType | null,
   ): Promise<{ id: string; name: string } | null> {
-    if (merchant) {
+    const historyType = transactionType || 'expense';
+    if (merchant && historyType !== 'transfer') {
       const history = await this.pgPool.query(
         `SELECT category_id
          FROM ledger_transactions
          WHERE user_id = $1
            AND deleted_at IS NULL
-           AND type = 'expense'
+           AND type = $3
            AND category_id IS NOT NULL
            AND lower(trim(coalesce(merchant, ''))) = lower($2)
          GROUP BY category_id
          ORDER BY COUNT(*) DESC, MAX(date) DESC
          LIMIT 1`,
-        [userId, merchant.trim()],
+        [userId, merchant.trim(), historyType],
       );
       const historyId = history.rows[0]?.category_id as string | undefined;
       if (historyId) {
