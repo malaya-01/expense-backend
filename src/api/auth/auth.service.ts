@@ -28,9 +28,12 @@ import {
 import appConfiguration from 'src/app.configuration';
 import { REFRESH_COOKIE_NAME, refreshCookieOptions } from './refresh-cookie';
 import {
+  buildRecoveryEmailHtml,
   buildVerificationEmailHtml,
+  hasReliableMailTransport,
   isMailConfigured,
   sendMail,
+  shouldOfferInlineRecoveryCode,
 } from 'src/utils/mail/mail.util';
 
 const EMAIL_VERIFY_TTL_MS = 60 * 60 * 1000; // 1 hour
@@ -273,37 +276,70 @@ export class AuthService {
 
   async generateOtp(dto: OtpGenerateDto) {
     const email = dto.email.trim().toLowerCase();
-    if (
-      !isMailConfigured()
-    ) {
+    const allowInline = shouldOfferInlineRecoveryCode();
+    const canEmail = isMailConfigured();
+
+    if (!canEmail && !allowInline) {
       throw new ServiceUnavailableException(
         'Password recovery email is not configured. Contact the application administrator.',
       );
     }
+
     const user = await this.pgPool.query(
       'SELECT id FROM users WHERE email = $1',
-      [email]
-    )
+      [email],
+    );
+    // Same generic message when the account is missing (avoid email enumeration).
     if (user.rowCount === 0) {
       return {
         message:
           'If an account exists for this email, a recovery code has been sent.',
+        delivery: 'email' as const,
       };
     }
+
     const otp = randomInt(100000, 1_000_000).toString();
     const key = `${email}-otp`;
     await this.cacheManager.set(key, otp, 10 * 60 * 1000);
-    try {
-      await this.sendRecoveryCode(email, otp);
-    } catch {
-      await this.cacheManager.del(key);
-      throw new ServiceUnavailableException(
-        'Recovery email could not be sent. Please try again later.',
-      );
+
+    // Prefer HTTPS mail (Resend). Skip SMTP on Render — free dynos block it.
+    const tryEmail =
+      canEmail && (hasReliableMailTransport() || !allowInline);
+
+    if (tryEmail) {
+      try {
+        await this.sendRecoveryCode(email, otp);
+        return {
+          message:
+            'If an account exists for this email, a recovery code has been sent.',
+          delivery: 'email' as const,
+        };
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(
+          '[Opal] Recovery email failed:',
+          err instanceof Error ? err.message : err,
+        );
+        if (!allowInline) {
+          await this.cacheManager.del(key);
+          throw new ServiceUnavailableException(
+            'Recovery email could not be sent. Please try again later.',
+          );
+        }
+      }
     }
+
+    // Inline fallback for live (Render) when SMTP/Resend cannot deliver
+    // (e.g. Resend free tier only delivers to the account owner).
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[Opal] Inline recovery code issued for ${email} (mail unavailable on this host).`,
+    );
     return {
       message:
-        'If an account exists for this email, a recovery code has been sent.',
+        'Email delivery is unavailable on this server. Use the on-screen recovery code to reset your password.',
+      delivery: 'inline' as const,
+      recovery_code: otp,
     };
   }
 
@@ -312,20 +348,23 @@ export class AuthService {
     const email = dto.email.trim().toLowerCase();
 
     if (newPassword !== confirmNewPassword) {
-      throw new BadRequestException('New password and confirm new password do not match');
+      throw new BadRequestException(
+        'New password and confirm new password do not match',
+      );
     }
 
     const key = `${email}-otp`;
     const cachedOtp = await this.cacheManager.get<string>(key);
-    if (cachedOtp !== otp) {
+    if (!cachedOtp || cachedOtp !== String(otp || '').trim()) {
       throw new BadRequestException('Invalid OTP');
     }
+
     const passwordHash = await bcrypt.hash(newPassword, 10);
     const client = await this.pgPool.connect();
     try {
       await client.query(
         'UPDATE users SET password_hash = $1 WHERE email = $2',
-        [passwordHash, email]
+        [passwordHash, email],
       );
       await this.cacheManager.del(key);
       return { message: 'Password reset successfully' };
@@ -345,8 +384,8 @@ export class AuthService {
     await sendMail({
       to: email,
       subject: 'Your Opal password recovery code',
-      text: `Your Opal recovery code is ${otp}. It expires in 10 minutes. If you did not request this, ignore this email.`,
-      html: `<p>Your Opal recovery code is:</p><p style="font-size:24px;font-weight:700;letter-spacing:4px">${otp}</p><p>It expires in 10 minutes. If you did not request this, ignore this email.</p>`,
+      text: `Your Opal recovery code is ${otp}. It expires in 10 minutes. Enter this 6-digit code on the reset page (not your email address). If you did not request this, ignore this email.`,
+      html: buildRecoveryEmailHtml({ otp }),
     });
   }
 

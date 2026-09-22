@@ -43,102 +43,99 @@ export class AiSettingsService {
   ) {}
 
   async getSettings(userId: string) {
-    const client = await this.pgPool.connect();
-    try {
-      await this.ensurePreferences(client, userId);
-      const prefs = await client.query(
-        `SELECT active_provider, active_model, master_prompt, updated_at
-         FROM user_ai_preferences WHERE user_id = $1`,
-        [userId],
-      );
-      const configs = await client.query(
-        `SELECT id, provider, display_name, model, base_url, project_id, location,
-                credentials_meta, is_connected, last_tested_at, last_test_status,
-                last_test_message, updated_at
-         FROM user_ai_provider_configs
-         WHERE user_id = $1 AND deleted_at IS NULL
-         ORDER BY provider ASC`,
-        [userId],
-      );
+    // Use pool.query (not a held client) so we do not occupy a session-mode
+    // connection while also calling getUsage / other pool work.
+    await this.ensurePreferences(this.pgPool, userId);
+    const prefs = await this.pgPool.query(
+      `SELECT active_provider, active_model, master_prompt, updated_at
+       FROM user_ai_preferences WHERE user_id = $1`,
+      [userId],
+    );
+    const configs = await this.pgPool.query(
+      `SELECT id, provider, display_name, model, base_url, project_id, location,
+              credentials_meta, is_connected, last_tested_at, last_test_status,
+              last_test_message, updated_at
+       FROM user_ai_provider_configs
+       WHERE user_id = $1 AND deleted_at IS NULL
+       ORDER BY provider ASC`,
+      [userId],
+    );
 
-      const byProvider = new Map(
-        configs.rows.map((row) => [row.provider, this.publicConfig(row)]),
-      );
+    const byProvider = new Map(
+      configs.rows.map((row) => [row.provider, this.publicConfig(row)]),
+    );
 
-      const omnirouteQuota = await this.omnirouteUsage.getUsage(userId);
+    const omnirouteQuota = await this.omnirouteUsage.getUsage(userId);
 
-      const providers = (AI_PROVIDERS as readonly AiProviderId[]).map(
-        (provider) => {
-          if (provider === 'omniroute') {
-            const existing = byProvider.get('omniroute');
-            return {
-              provider: 'omniroute' as const,
-              connected: true,
-              model: existing?.model || DEFAULT_MODELS.omniroute[0],
-              display_name: existing?.display_name || 'Opal Free',
-              base_url: null,
-              project_id: null,
-              location: null,
-              credentials_meta: {
-                has_api_key: false,
-                platform_managed: true,
-                no_auth_required: true,
-              },
-              last_tested_at: existing?.last_tested_at || null,
-              last_test_status: existing?.last_test_status || 'ok',
-              last_test_message:
-                existing?.last_test_message ||
-                'Fast free routing via Groq/Gemini when configured — no user API key.',
-              default_models: getDefaultModels('omniroute'),
-              setup: PROVIDER_SETUP_GUIDES.omniroute,
-              recommended: true,
-              platform_free: true,
-              daily_quota: omnirouteQuota,
-            };
+    const providers = (AI_PROVIDERS as readonly AiProviderId[]).map(
+      (provider) => {
+        if (provider === 'omniroute') {
+          const existing = byProvider.get('omniroute');
+          return {
+            provider: 'omniroute' as const,
+            connected: true,
+            model: existing?.model || DEFAULT_MODELS.omniroute[0],
+            display_name: existing?.display_name || 'Opal Free',
+            base_url: null,
+            project_id: null,
+            location: null,
+            credentials_meta: {
+              has_api_key: false,
+              platform_managed: true,
+              no_auth_required: true,
+            },
+            last_tested_at: existing?.last_tested_at || null,
+            last_test_status: existing?.last_test_status || 'ok',
+            last_test_message:
+              existing?.last_test_message ||
+              'Fast free routing via Groq/Gemini when configured — no user API key.',
+            default_models: getDefaultModels('omniroute'),
+            setup: PROVIDER_SETUP_GUIDES.omniroute,
+            recommended: true,
+            platform_free: true,
+            daily_quota: omnirouteQuota,
+          };
+        }
+
+        return (
+          byProvider.get(provider) || {
+            provider,
+            connected: false,
+            model: DEFAULT_MODELS[provider][0],
+            display_name: null,
+            base_url:
+              provider === 'local'
+                ? 'http://127.0.0.1:11434/v1'
+                : provider === 'openrouter'
+                  ? 'https://openrouter.ai/api/v1'
+                  : null,
+            project_id: null,
+            location: provider === 'vertex' ? 'us-central1' : null,
+            credentials_meta: {},
+            last_tested_at: null,
+            last_test_status: null,
+            last_test_message: null,
+            default_models: getDefaultModels(provider),
+            setup: PROVIDER_SETUP_GUIDES[provider],
+            recommended: false,
           }
+        );
+      },
+    );
 
-          return (
-            byProvider.get(provider) || {
-              provider,
-              connected: false,
-              model: DEFAULT_MODELS[provider][0],
-              display_name: null,
-              base_url:
-                provider === 'local'
-                  ? 'http://127.0.0.1:11434/v1'
-                  : provider === 'openrouter'
-                    ? 'https://openrouter.ai/api/v1'
-                    : null,
-              project_id: null,
-              location: provider === 'vertex' ? 'us-central1' : null,
-              credentials_meta: {},
-              last_tested_at: null,
-              last_test_status: null,
-              last_test_message: null,
-              default_models: getDefaultModels(provider),
-              setup: PROVIDER_SETUP_GUIDES[provider],
-              recommended: false,
-            }
-          );
-        },
-      );
-
-      const pref = prefs.rows[0];
-      return {
-        encryption_ready: hasEncryptionKeyConfigured(),
-        active_provider: pref?.active_provider || null,
-        active_model: pref?.active_model || null,
-        master_prompt: pref?.master_prompt || '',
-        master_prompt_default: FINOS_DEFAULT_MASTER_PROMPT,
-        safety_layer_preview: FINOS_IMMUTABLE_SAFETY_LAYER.slice(0, 280) + '…',
-        prompt_version: FINOS_PROMPT_VERSION,
-        providers,
-        setup_guides: PROVIDER_SETUP_GUIDES,
-        omniroute_quota: omnirouteQuota,
-      };
-    } finally {
-      client.release();
-    }
+    const pref = prefs.rows[0];
+    return {
+      encryption_ready: hasEncryptionKeyConfigured(),
+      active_provider: pref?.active_provider || null,
+      active_model: pref?.active_model || null,
+      master_prompt: pref?.master_prompt || '',
+      master_prompt_default: FINOS_DEFAULT_MASTER_PROMPT,
+      safety_layer_preview: FINOS_IMMUTABLE_SAFETY_LAYER.slice(0, 280) + '…',
+      prompt_version: FINOS_PROMPT_VERSION,
+      providers,
+      setup_guides: PROVIDER_SETUP_GUIDES,
+      omniroute_quota: omnirouteQuota,
+    };
   }
 
   async upsertProvider(userId: string, dto: UpsertProviderConfigDto) {

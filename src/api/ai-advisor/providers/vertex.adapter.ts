@@ -11,7 +11,7 @@ import {
 /**
  * Vertex / Gemini advisor replies need a large visible-token budget.
  * Gemini 2.5+ "thinking" shares maxOutputTokens — keep thinking modest
- * and default the total high enough that long FinOS answers finish.
+ * and default the total high enough that long Opal answers finish.
  */
 export const VERTEX_MAX_OUTPUT_TOKENS = Math.min(
   Math.max(

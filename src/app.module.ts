@@ -38,7 +38,7 @@ import { PermissionsGuard } from './helper/guards/permissions.guard';
       useFactory: async () => {
         const redisUrl = appConfiguration().CACHE.REDIS_URL;
         const store = createKeyv(redisUrl, {
-          namespace: 'finos',
+          namespace: 'opal',
         });
         store.on('error', (error: Error) => {
           console.error('Redis cache error:', error.message);
