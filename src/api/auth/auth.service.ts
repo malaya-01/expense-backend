@@ -35,6 +35,7 @@ import {
   sendMail,
   shouldOfferInlineRecoveryCode,
 } from 'src/utils/mail/mail.util';
+import { buildAppPathUrl } from 'src/utils/url/public-app-url';
 
 const EMAIL_VERIFY_TTL_MS = 60 * 60 * 1000; // 1 hour
 const EMAIL_VERIFY_TTL_HOURS = 1;
@@ -246,12 +247,9 @@ export class AuthService {
       EMAIL_VERIFY_TTL_MS,
     );
 
-    const clientHost = (
-      process.env.CLIENT_HOST ||
-      process.env.FRONTEND_URL ||
-      'http://localhost:3000'
-    ).replace(/\/$/, '');
-    const verifyUrl = `${clientHost}/verify-email?token=${token}`;
+    const verifyUrl = buildAppPathUrl('/verify-email', { token });
+    // eslint-disable-next-line no-console
+    console.info(`[Opal] Verification link host: ${new URL(verifyUrl).origin}`);
     const text = `Hi ${fullName || 'there'},\n\nVerify your Opal email by opening this link (expires in ${EMAIL_VERIFY_TTL_HOURS} hour):\n${verifyUrl}\n\nIf you did not create this account, ignore this email.`;
 
     try {

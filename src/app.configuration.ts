@@ -5,7 +5,14 @@ export default () => ({
   PORT: parseInt(process.env.PORT || '9000'),
 
   ENVIRONMENT: process.env.NODE_ENV || 'development',
+  /** Comma-separated CORS origins (may include Capacitor). */
   CLIENT_HOST: process.env.CLIENT_HOST || 'http://localhost:3000',
+  /** Single public web URL for email links (verification, etc.). */
+  FRONTEND_URL:
+    process.env.FRONTEND_URL ||
+    process.env.PUBLIC_APP_URL ||
+    process.env.WEB_APP_URL ||
+    '',
   JWT: {
     SECRET:
       process.env.JWT_ACCESS_SECRET ||
