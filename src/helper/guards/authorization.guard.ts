@@ -4,11 +4,14 @@ import {
   Inject,
   ExecutionContext,
   UnauthorizedException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { JwtService } from '@nestjs/jwt';
 import { Cache } from 'cache-manager';
+import { Pool } from 'pg';
 import appConfiguration from 'src/app.configuration';
+import { isEmailVerificationRequired } from 'src/api/auth/auth.service';
 
 @Injectable()
 export class AuthorizationGuard implements CanActivate {
@@ -16,6 +19,7 @@ export class AuthorizationGuard implements CanActivate {
     private readonly reflector: Reflector,
     private readonly jwtService: JwtService,
     @Inject('CACHE_MANAGER') private cache: Cache,
+    @Inject('PG_POOL') private readonly pgPool: Pool,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -49,8 +53,26 @@ export class AuthorizationGuard implements CanActivate {
       }
 
       const allUsers: any[] = (await this.cache.get('all_users')) || [];
-      const profile =
+      let profile =
         allUsers.find((obj: any) => obj.id === payload.sub) || null;
+
+      if (isEmailVerificationRequired()) {
+        let verified = profile?.email_verified;
+        if (verified === undefined || verified === null) {
+          const row = await this.pgPool.query(
+            `SELECT email_verified FROM users
+             WHERE id = $1 AND deleted_at IS NULL`,
+            [payload.sub],
+          );
+          verified = Boolean(row.rows[0]?.email_verified);
+          profile = { ...(profile || { id: payload.sub }), email_verified: verified };
+        }
+        if (!verified) {
+          throw new ForbiddenException(
+            'EMAIL_NOT_VERIFIED: Please verify your email before continuing.',
+          );
+        }
+      }
 
       request['user'] = {
         id: payload.sub,
@@ -58,7 +80,8 @@ export class AuthorizationGuard implements CanActivate {
         profile,
       };
       return true;
-    } catch {
+    } catch (error) {
+      if (error instanceof ForbiddenException) throw error;
       throw new UnauthorizedException('Unauthorized access');
     }
   }

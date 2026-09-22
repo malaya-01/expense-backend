@@ -29,6 +29,7 @@ import appConfiguration from 'src/app.configuration';
 import { REFRESH_COOKIE_NAME, refreshCookieOptions } from './refresh-cookie';
 import {
   buildRecoveryEmailHtml,
+  buildRecoveryEmailText,
   buildVerificationEmailHtml,
   isMailConfigured,
   sendMail,
@@ -38,8 +39,12 @@ import {
 const EMAIL_VERIFY_TTL_MS = 60 * 60 * 1000; // 1 hour
 const EMAIL_VERIFY_TTL_HOURS = 1;
 const LOGIN_LOCK_MS = 15 * 60 * 1000;
-/** Temporarily off: Resend free tier can only send to the account owner. */
-const REQUIRE_EMAIL_VERIFICATION = false;
+/** Require a verified email before sign-in / API access (Brevo SMTP delivers to any inbox). */
+const REQUIRE_EMAIL_VERIFICATION = true;
+
+export function isEmailVerificationRequired() {
+  return REQUIRE_EMAIL_VERIFICATION;
+}
 
 export function formatLockRemaining(until: Date): string {
   const totalSeconds = Math.max(
@@ -84,18 +89,19 @@ export class AuthService {
 
 
   async register(registerAuthDto: RegisterAuthDto) {
-    const { full_name, email, password, confirmPassword, country, currency } =
+    const { full_name, password, confirmPassword, country, currency } =
       registerAuthDto;
+    const email = registerAuthDto.email.trim().toLowerCase();
 
     if (password !== confirmPassword) {
       throw new BadRequestException('Password and confirm password do not match');
     }
 
-    // if (REQUIRE_EMAIL_VERIFICATION && !isMailConfigured()) {
-    //   throw new ServiceUnavailableException(
-    //     'Email delivery is not configured. Contact the application administrator.',
-    //   );
-    // }
+    if (REQUIRE_EMAIL_VERIFICATION && !isMailConfigured()) {
+      throw new ServiceUnavailableException(
+        'Email delivery is not configured. Contact the application administrator.',
+      );
+    }
 
     const countryCode = country.toUpperCase();
     const countryMeta = getCountry(countryCode);
@@ -130,13 +136,14 @@ export class AuthService {
       await this.permissionsService.markAdminIfBootstrapEmail(user.id, user.email);
       await this.permissionsService.ensureFirstUserIsAdmin();
       const access = await this.permissionsService.mePayload(user.id);
-      // if (REQUIRE_EMAIL_VERIFICATION) {
-      //   await this.sendVerificationEmail(user.id, user.email, user.full_name);
-      // }
+      if (REQUIRE_EMAIL_VERIFICATION) {
+        await this.sendVerificationEmail(user.id, user.email, user.full_name);
+      }
       return {
         ...user,
         is_admin: access.is_admin,
         permissions: access.permissions,
+        requires_email_verification: REQUIRE_EMAIL_VERIFICATION,
         message: REQUIRE_EMAIL_VERIFICATION
           ? 'Account created. Please verify your email before signing in.'
           : 'Account created. You can sign in now.',
@@ -417,13 +424,14 @@ export class AuthService {
     await sendMail({
       to: email,
       subject: 'Your Opal password recovery code',
-      text: `Your Opal recovery code is ${otp}. It expires in 10 minutes. Enter this 6-digit code on the reset page (not your email address). If you did not request this, ignore this email.`,
+      text: buildRecoveryEmailText(otp),
       html: buildRecoveryEmailHtml({ otp }),
     });
   }
 
   async login(dto: LoginAuthDto, req: Request) {
-    const { email, password } = dto;
+    const email = dto.email.trim().toLowerCase();
+    const { password } = dto;
 
     const client = await this.pgPool.connect();
 
@@ -491,17 +499,17 @@ export class AuthService {
       }
 
       // Only after a valid password: block unverified accounts and resend link.
-      // if (REQUIRE_EMAIL_VERIFICATION && !user.email_verified) {
-      //   await client.query('ROLLBACK');
-      //   try {
-      //     await this.sendVerificationEmail(user.id, user.email, user.full_name);
-      //   } catch {
-      //     // Still block login even if resend fails.
-      //   }
-      //   throw new ForbiddenException(
-      //     'EMAIL_NOT_VERIFIED: Please verify your email. We sent a fresh verification link.',
-      //   );
-      // }
+      if (REQUIRE_EMAIL_VERIFICATION && !user.email_verified) {
+        await client.query('ROLLBACK');
+        try {
+          await this.sendVerificationEmail(user.id, user.email, user.full_name);
+        } catch {
+          // Still block login even if resend fails.
+        }
+        throw new ForbiddenException(
+          'EMAIL_NOT_VERIFIED: Please verify your email. We sent a fresh verification link.',
+        );
+      }
 
       // Reset failed attempts
       await client.query(

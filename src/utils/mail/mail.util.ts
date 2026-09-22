@@ -360,24 +360,85 @@ export function buildVerificationEmailHtml(params: {
 }
 
 export function buildRecoveryEmailHtml(params: { otp: string }) {
+  const otp = String(params.otp || '').replace(/\D/g, '').slice(0, 6);
+  // Visual digit chips — each chip is a digit with NO spaces between table cells'
+  // text nodes that would break paste; the continuous code sits in a select-all block too.
+  const chips = otp
+    .split('')
+    .map(
+      (digit) =>
+        `<td align="center" style="padding:0 4px;">
+          <div style="width:40px;height:48px;line-height:48px;border-radius:10px;background:#0f172a;color:#ffffff;font-size:22px;font-weight:700;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;">
+            ${escapeHtml(digit)}
+          </div>
+        </td>`,
+    )
+    .join('');
+
   const bodyHtml = `
-    <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#334155;">
-      Use this one-time code to reset your Opal password:
+    <p style="margin:0 0 8px;font-size:15px;line-height:1.6;color:#334155;">
+      Your one-time Opal recovery code:
     </p>
-    <p style="margin:0 0 8px;font-size:32px;line-height:1.2;font-weight:700;letter-spacing:8px;color:#0f172a;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;">
-      ${escapeHtml(params.otp)}
+    <p style="margin:0 0 20px;font-size:13px;line-height:1.5;color:#64748b;">
+      Tap or click the code to select it, copy, then paste into the 6 boxes on the reset page.
     </p>
-    <p style="margin:24px 0 0;font-size:13px;line-height:1.6;color:#64748b;">
-      This code expires in <strong>10 minutes</strong> and can only be used once.
-      Enter the 6-digit code on the reset page — not your email address.
+
+    <table role="presentation" cellspacing="0" cellpadding="0" align="center" style="margin:0 auto 16px;">
+      <tr>${chips}</tr>
+    </table>
+
+    <!-- Continuous digits for one-tap select / copy (no spaces — pastes cleanly into Opal). -->
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin:0 0 12px;">
+      <tr>
+        <td align="center" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:14px 16px;">
+          <div style="font-size:11px;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;color:#94a3b8;margin-bottom:8px;">
+            Copy this code
+          </div>
+          <div style="font-size:28px;line-height:1.2;font-weight:700;letter-spacing:0.35em;color:#0f172a;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;-webkit-user-select:all;user-select:all;-moz-user-select:all;ms-user-select:all;">
+            ${escapeHtml(otp)}
+          </div>
+          <div style="margin-top:10px;font-size:12px;color:#64748b;">
+            Long-press or triple-click → Copy → paste on the reset page
+          </div>
+        </td>
+      </tr>
+    </table>
+
+    <table role="presentation" cellspacing="0" cellpadding="0" align="center" style="margin:0 auto 20px;">
+      <tr>
+        <td align="center" style="background:#0f172a;border-radius:10px;padding:10px 18px;">
+          <span style="font-size:13px;font-weight:600;color:#ffffff;letter-spacing:0.02em;">
+            Code is 6 digits · no spaces · paste works
+          </span>
+        </td>
+      </tr>
+    </table>
+
+    <p style="margin:0;font-size:13px;line-height:1.6;color:#64748b;">
+      Expires in <strong>10 minutes</strong> and can only be used once.
+      Never share this code. If you did not request a reset, you can ignore this email.
     </p>`;
 
   return emailShell({
     title: 'Your Opal recovery code',
     heading: 'Password recovery',
     bodyHtml,
-    footer: 'If you did not request a password reset, you can ignore this email.',
+    footer: 'Sent by Opal — your personal financial operating system.',
   });
+}
+
+export function buildRecoveryEmailText(otpRaw: string) {
+  const otp = String(otpRaw || '').replace(/\D/g, '').slice(0, 6);
+  return [
+    'Your Opal password recovery code:',
+    '',
+    otp,
+    '',
+    'Copy the 6 digits above (no spaces) and paste them into the boxes on the reset page.',
+    'The code expires in 10 minutes and can only be used once.',
+    '',
+    'If you did not request this, ignore this email.',
+  ].join('\n');
 }
 
 function escapeHtml(value: string) {

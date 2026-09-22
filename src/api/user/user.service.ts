@@ -39,7 +39,7 @@ export class UserService {
   async syncUsersToCache() {
     const cacheKey = 'all_users';
     const users = await this.pgPool.query(
-      `SELECT id FROM users
+      `SELECT id, email_verified FROM users
        WHERE COALESCE(is_delete, false) = false
          AND COALESCE(is_active, true) = true
          AND deleted_at IS NULL`,
