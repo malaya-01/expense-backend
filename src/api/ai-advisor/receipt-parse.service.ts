@@ -6,7 +6,8 @@ import { ParseReceiptDto } from './dto/ai-advisor.dto';
 import { AiOmnirouteUsageService } from './ai-omniroute-usage.service';
 import { trySequentialVisionChat } from './providers/omniroute.adapter';
 import { ChatMessage } from './providers/types';
-import { matchExpenseSource } from './match-container';
+import { matchExpenseSource, rankAccountMatches } from './match-container';
+import type { ReceiptAccountHint } from './match-container';
 
 export type ReceiptTransactionType = 'expense' | 'income' | 'transfer';
 
@@ -118,7 +119,10 @@ const INCOME_HINT_RE =
   /\b(received|credited|credit\s+alert|money\s+received|payment\s+received|you\s+got|got\s+paid|salary|refund\s+received|incoming)\b/i;
 
 const TRANSFER_HINT_RE =
-  /\b(self\s*transfer|transfer\s+to\s+self|paid\s+to\s+self|to\s+yourself|own\s+account|between\s+accounts|account\s+to\s+account|moved\s+to|fund\s+transfer)\b/i;
+  /\b(self\s*transfer|transfer\s+to\s*self|paid\s+to\s*self|to\s+yourself|own\s+account|between\s+(?:my\s+)?accounts|account\s+to\s+account|moved\s+to|fund\s+transfer|bank\s+transfer|neft|imps|rtgs|self\s*pay|money\s+sent\s+to\s+(?:your|own)|credited\s+to\s+your|transferred\s+to\s+(?:your|bank)|wallet\s+to\s+bank|bank\s+to\s+bank)\b/i;
+
+const SELF_PAYEE_RE =
+  /\b(self|myself|yourself|my\s+account|own\s+upi|to\s+self)\b/i;
 
 function emptyResult(
   warning: string,
@@ -307,17 +311,90 @@ function asTransactionType(
   value: unknown,
   haystack: string,
   hasDestination: boolean,
+  looksLikeSelfPayee: boolean,
 ): ReceiptTransactionType | null {
   const raw = asString(value)?.toLowerCase();
-  if (raw === 'expense' || raw === 'income' || raw === 'transfer') return raw;
-  if (TRANSFER_HINT_RE.test(haystack) || (hasDestination && /self|own/i.test(haystack))) {
+  if (raw === 'expense' || raw === 'income' || raw === 'transfer') {
+    // Model often mislabels self-pay as expense — override when evidence is strong.
+    if (
+      raw === 'expense' &&
+      (TRANSFER_HINT_RE.test(haystack) ||
+        looksLikeSelfPayee ||
+        (hasDestination && SELF_PAYEE_RE.test(haystack)))
+    ) {
+      return 'transfer';
+    }
+    return raw;
+  }
+  if (
+    TRANSFER_HINT_RE.test(haystack) ||
+    looksLikeSelfPayee ||
+    (hasDestination && SELF_PAYEE_RE.test(haystack))
+  ) {
     return 'transfer';
   }
-  if (INCOME_HINT_RE.test(haystack)) return 'income';
+  if (INCOME_HINT_RE.test(haystack) && !/\b(paid\s+to|sent\s+to|debited)\b/i.test(haystack)) {
+    return 'income';
+  }
   if (/\b(paid|sent|debited|payment\s+to|spent)\b/i.test(haystack)) {
     return 'expense';
   }
   return null;
+}
+
+function namesLikelySamePerson(a: string | null, b: string | null): boolean {
+  if (!a || !b) return false;
+  const left = normalizeName(a).replace(/\b(mr|mrs|ms|shri|smt)\b/g, '').trim();
+  const right = normalizeName(b).replace(/\b(mr|mrs|ms|shri|smt)\b/g, '').trim();
+  if (!left || !right) return false;
+  if (left === right) return true;
+  const leftParts = left.split(' ').filter((p) => p.length > 1);
+  const rightParts = right.split(' ').filter((p) => p.length > 1);
+  if (!leftParts.length || !rightParts.length) return false;
+  // "Ravi Kumar" vs "Ravi K" / same first+last token overlap
+  const shared = leftParts.filter((p) => rightParts.includes(p));
+  if (shared.length >= 2) return true;
+  if (
+    leftParts[0] === rightParts[0] &&
+    leftParts[0].length >= 3 &&
+    (left.includes(right) || right.includes(left))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** Split "From HDFC ••••1234 to SBI ••••5678" style blurbs into two account hints. */
+function splitFromToAccounts(text: string | null | undefined): {
+  sourceLabel: string | null;
+  destinationLabel: string | null;
+} {
+  const raw = String(text || '').trim();
+  if (!raw) return { sourceLabel: null, destinationLabel: null };
+  const match =
+    raw.match(
+      /(?:from|debited\s+from|paid\s+using|using)\s+(.+?)\s+(?:to|credited\s+to|into|towards)\s+(.+)$/i,
+    ) ||
+    raw.match(/^(.+?)\s*(?:→|->|➜|»)\s*(.+)$/);
+  if (!match) return { sourceLabel: null, destinationLabel: null };
+  return {
+    sourceLabel: match[1].trim() || null,
+    destinationLabel: match[2].trim() || null,
+  };
+}
+
+function hintFromParts(
+  container: string | null,
+  bank: string | null,
+  last4: string | null,
+  label: string | null,
+): ReceiptAccountHint {
+  return {
+    container_name: container,
+    bank_name: bank,
+    account_last4: last4,
+    account_label: label,
+  };
 }
 
 @Injectable()
@@ -346,6 +423,11 @@ export class ReceiptParseService {
       (row: { name: string; institution?: string | null }) =>
         row.institution ? `${row.name} (${row.institution})` : row.name,
     );
+    const userNameRow = await this.pgPool.query(
+      `SELECT full_name FROM users WHERE id = $1 AND deleted_at IS NULL`,
+      [userId],
+    );
+    const userFullName = asString(userNameRow.rows[0]?.full_name);
     const skipGroq = mime === 'application/pdf';
 
     const messages: ChatMessage[] = [
@@ -362,27 +444,36 @@ export class ReceiptParseService {
           '  pending = Pending / Processing / In progress.',
           '  success = Successful / Paid / Completed / Credited / Received.',
           'transaction_type must be one of: expense, income, transfer.',
-          '  expense = user paid / sent money to a merchant or another person.',
-          '  income = user received / was credited money (salary, refund received, money received).',
-          '  transfer = self-pay / money moved between the user\'s own accounts or wallets (Paid to self, Self transfer).',
-          'For expense: container_* / bank_name / account_* describe the paying (source) account.',
-          'For income: destination_* fields describe where money was credited; container_* may be null.',
-          'For transfer: container_* is the debit/source account; destination_* is the credit/destination account.',
-          'merchant is the counterparty name (payee for expense, payer for income). For self-transfer use null or "Self".',
+          '  expense = user paid / sent money to a merchant or another person (not themselves).',
+          '  income = user received / was credited money from someone else (salary, refund, money received).',
+          '  transfer = money moved between the user\'s OWN banks/wallets (self-pay / bank-to-bank / Paid to self).',
+          'CRITICAL — bank-to-bank / self-transfer (very common in India):',
+          '  - GPay/PhonePe "Paid to [user\'s own name]", "Transfer to self", "Self transfer", NEFT/IMPS between own accounts → transaction_type = transfer.',
+          '  - If payee name matches the account holder / looks like the same person paying themselves → transfer (not expense).',
+          '  - Always fill BOTH sides when two accounts are shown:',
+          '      container_*/bank_name/account_* = debit / From / Paid using / Debited from account.',
+          '      destination_* = credit / To / Credited to / Transferred to account.',
+          '  - Example: From "HDFC ••••4521" to "SBI ••••8890" → bank_name=HDFC, account_last4=4521, destination_bank_name=SBI, destination_account_last4=8890, transaction_type=transfer.',
+          '  - merchant for self-transfer: null or "Self" (never invent a shop name).',
+          'For expense: container_* describe the paying account; destination_* usually null.',
+          'For income: destination_* = credited account; container_* may be null.',
+          userFullName
+            ? `The app user\'s name is "${userFullName}". If the receipt payee/payer is this person (or clearly the same person), prefer transaction_type=transfer when money moved between banks/wallets.`
+            : 'If the payee looks like the same person as the payer (self), use transaction_type=transfer.',
           'upi_txn_id is the UPI transaction ID. platform_txn_id is the app id (Google transaction ID, PhonePe UTR, Paytm order id). They are different.',
           'platform is the app: Google Pay, PhonePe, Paytm, BHIM, bank PDF, etc.',
-          'account_label is the bank/account as shown (e.g. Karur Vysya Bank 2324). account_last4 is the last 4 digits if shown.',
+          'account_label / destination_account_label are the bank/account strings exactly as shown (e.g. "Karur Vysya Bank 2324").',
           'notes is any remark/message on the screenshot, else null.',
           'container_name / destination_container_name must be one of these user accounts when it matches, else null:',
           containerNames.slice(0, 40).join(', ') || '(none)',
-          'category_name must be one of these user categories when it reasonably matches, else null:',
+          'category_name must be one of these user categories when it reasonably matches, else null. Prefer "Transfers" for self-transfers:',
           categoryNames.slice(0, 80).join(', ') || '(none)',
         ].join('\n'),
       },
       {
         role: 'user',
         content:
-          'Extract JSON keys: merchant, description, amount, currency, date, time, payment_method, payment_status, transaction_type, upi_vpa, upi_txn_id, platform, platform_txn_id, notes, category_name, container_name, bank_name, account_last4, account_label, destination_container_name, destination_bank_name, destination_account_last4, destination_account_label.',
+          'Extract JSON keys: merchant, description, amount, currency, date, time, payment_method, payment_status, transaction_type, upi_vpa, upi_txn_id, platform, platform_txn_id, notes, category_name, container_name, bank_name, account_last4, account_label, destination_container_name, destination_bank_name, destination_account_last4, destination_account_label. If this is a self/bank-to-bank transfer, set transaction_type to transfer and fill both source and destination account fields.',
         attachments: [
           {
             name: dto.name || 'receipt',
@@ -411,7 +502,7 @@ export class ReceiptParseService {
 
     await this.omnirouteUsage.recordSuccessfulRequest(userId).catch(() => undefined);
 
-    const extracted = this.parseModelJson(vision.content);
+    const extracted = this.parseModelJson(vision.content, userFullName);
     const status = extracted.payment_status;
     if (status === 'failed') {
       const source = describeVisionSource(vision.model);
@@ -438,6 +529,9 @@ export class ReceiptParseService {
       );
     }
 
+    const resolved = this.resolveTransferAccounts(containers, extracted);
+    Object.assign(extracted, resolved.extracted);
+
     const category = await this.resolveCategory(
       userId,
       categories,
@@ -445,46 +539,185 @@ export class ReceiptParseService {
       extracted.merchant,
       extracted.transaction_type,
     );
-    const sourceMatched = matchExpenseSource(containers, {
-      container_name: extracted.container_name,
-      bank_name: extracted.bank_name,
-      account_last4: extracted.account_last4,
-      account_label: extracted.account_label,
-    });
-    let destinationMatched = matchExpenseSource(containers, {
-      container_name: extracted.destination_container_name,
-      bank_name: extracted.destination_bank_name,
-      account_last4: extracted.destination_account_last4,
-      account_label: extracted.destination_account_label,
-    });
-    // Income receipts often only show the credited account once — reuse source hints.
-    if (
-      extracted.transaction_type === 'income' &&
-      !destinationMatched &&
-      sourceMatched
-    ) {
-      destinationMatched = sourceMatched;
-    }
 
     const source = describeVisionSource(vision.model);
-    const hasCore = Boolean(extracted.amount || extracted.merchant);
+    const hasCore = Boolean(
+      extracted.amount ||
+        extracted.merchant ||
+        extracted.transaction_type === 'transfer',
+    );
     return {
       ok: hasCore,
       stored: false,
       warning: hasCore
-        ? undefined
+        ? resolved.warning
         : 'AI ran but could not find a merchant or amount. Review the form before saving.',
       used_provider: source.provider,
       used_model: source.model,
       category_id: category?.id || null,
       category_name: category?.name || extracted.category_name,
-      source_container_id: sourceMatched?.id || null,
-      destination_container_id: destinationMatched?.id || null,
+      source_container_id: resolved.sourceId,
+      destination_container_id: resolved.destinationId,
       extracted,
     };
   }
 
-  private parseModelJson(content: string): ReceiptExtractedFields {
+  /**
+   * Force bank-to-bank / self-pay into transfer and map From/To onto two
+   * different user containers whenever the receipt evidence allows.
+   */
+  private resolveTransferAccounts(
+    containers: Array<{
+      id: string;
+      name: string;
+      type?: string;
+      institution?: string | null;
+    }>,
+    extracted: ReceiptExtractedFields,
+  ): {
+    extracted: ReceiptExtractedFields;
+    sourceId: string | null;
+    destinationId: string | null;
+    warning?: string;
+  } {
+    let next = { ...extracted };
+    const paymentMethodHint = hintFromParts(
+      null,
+      null,
+      null,
+      next.payment_method,
+    );
+    let sourceHint = hintFromParts(
+      next.container_name,
+      next.bank_name,
+      next.account_last4,
+      next.account_label || next.payment_method,
+    );
+    let destinationHint = hintFromParts(
+      next.destination_container_name,
+      next.destination_bank_name,
+      next.destination_account_last4,
+      next.destination_account_label,
+    );
+
+    // Recover From → To when the model stuffed both sides into one field.
+    if (!destinationHint.account_label && !destinationHint.bank_name) {
+      for (const blob of [
+        next.description,
+        next.notes,
+        next.account_label,
+        next.payment_method,
+      ]) {
+        const split = splitFromToAccounts(blob);
+        if (split.sourceLabel && split.destinationLabel) {
+          if (!sourceHint.account_label && !sourceHint.bank_name) {
+            sourceHint = hintFromParts(null, null, null, split.sourceLabel);
+          }
+          destinationHint = hintFromParts(
+            null,
+            null,
+            null,
+            split.destinationLabel,
+          );
+          break;
+        }
+      }
+    }
+
+    let sourceMatched = matchExpenseSource(containers, sourceHint);
+    if (!sourceMatched && paymentMethodHint.account_label) {
+      sourceMatched = matchExpenseSource(containers, paymentMethodHint);
+    }
+
+    let destinationMatched = matchExpenseSource(containers, destinationHint, {
+      excludeIds: sourceMatched ? [sourceMatched.id] : [],
+    });
+
+    // If destination hint was empty/weak but source matched, try ranking the
+    // destination label and the source label's second-best against other accounts.
+    if (!destinationMatched && sourceMatched) {
+      const alt = rankAccountMatches(containers, destinationHint, {
+        excludeIds: [sourceMatched.id],
+        minScore: 35,
+      })[0];
+      if (alt) destinationMatched = alt.row;
+    }
+
+    // Both banks visible but AI only filled one side — use second-best on a
+    // combined "all text" hint excluding the source.
+    if (sourceMatched && !destinationMatched) {
+      const combined = hintFromParts(
+        null,
+        null,
+        null,
+        [
+          next.destination_account_label,
+          next.destination_bank_name,
+          next.description,
+          next.notes,
+          next.account_label,
+          next.payment_method,
+        ]
+          .filter(Boolean)
+          .join(' · '),
+      );
+      destinationMatched = matchExpenseSource(containers, combined, {
+        excludeIds: [sourceMatched.id],
+        minScore: 45,
+      });
+    }
+
+    // Two different user accounts matched → this is a transfer even if the
+    // model said expense.
+    if (
+      sourceMatched &&
+      destinationMatched &&
+      sourceMatched.id !== destinationMatched.id
+    ) {
+      next.transaction_type = 'transfer';
+      if (!next.category_name) next.category_name = 'Transfers';
+      if (next.merchant && /^self$/i.test(next.merchant)) next.merchant = null;
+    } else if (
+      next.transaction_type === 'transfer' &&
+      sourceMatched &&
+      destinationMatched &&
+      sourceMatched.id === destinationMatched.id
+    ) {
+      // Avoid same-account transfer — clear destination so the user can pick.
+      destinationMatched = null;
+    }
+
+    let warning: string | undefined;
+    if (next.transaction_type === 'transfer') {
+      if (!sourceMatched || !destinationMatched) {
+        warning =
+          'Detected a bank-to-bank / self transfer. Confirm the From and To accounts before saving.';
+      }
+      if (!next.description || /^self$/i.test(next.description)) {
+        const fromName = sourceMatched?.name;
+        const toName = destinationMatched?.name;
+        next.description =
+          fromName && toName
+            ? `Transfer · ${fromName} → ${toName}`
+            : 'Account transfer';
+      }
+    }
+
+    return {
+      extracted: next,
+      sourceId: sourceMatched?.id || null,
+      destinationId:
+        next.transaction_type === 'income'
+          ? destinationMatched?.id || sourceMatched?.id || null
+          : destinationMatched?.id || null,
+      warning,
+    };
+  }
+
+  private parseModelJson(
+    content: string,
+    userFullName?: string | null,
+  ): ReceiptExtractedFields {
     try {
       const cleaned = String(content || '')
         .replace(/<think>[\s\S]*?<\/think>/gi, '')
@@ -503,30 +736,74 @@ export class ReceiptParseService {
             .filter(Boolean)
             .join(', ')
         : null;
-      const merchant = asString(parsed.merchant);
+      let merchant = asString(parsed.merchant);
       const description = cleanDescription(asString(parsed.description), merchant);
       const notes = asString(parsed.notes) || lineNotes;
       const date = asDate(parsed.date) || asDate(parsed.paid_at);
       const time = asTime(parsed.time) || asTime(parsed.paid_at);
-      const destinationContainer = asString(parsed.destination_container_name);
-      const destinationBank = asString(parsed.destination_bank_name);
-      const destinationLabel = asString(parsed.destination_account_label);
-      const destinationLast4 =
+      let destinationContainer = asString(parsed.destination_container_name);
+      let destinationBank = asString(parsed.destination_bank_name);
+      let destinationLabel = asString(parsed.destination_account_label);
+      let destinationLast4 =
         asLast4(parsed.destination_account_last4) ||
         asLast4(parsed.destination_account_label);
+      let containerName = asString(parsed.container_name);
+      let bankName = asString(parsed.bank_name);
+      let accountLabel = asString(parsed.account_label);
+      let accountLast4 =
+        asLast4(parsed.account_last4) || asLast4(parsed.account_label);
+      const paymentMethod = asString(parsed.payment_method);
+
+      // Recover From/To if packed into description / payment method.
+      if (!destinationLabel && !destinationBank) {
+        for (const blob of [description, notes, accountLabel, paymentMethod]) {
+          const split = splitFromToAccounts(blob);
+          if (split.sourceLabel && split.destinationLabel) {
+            if (!accountLabel && !bankName) {
+              accountLabel = split.sourceLabel;
+              accountLast4 = asLast4(split.sourceLabel);
+            }
+            destinationLabel = split.destinationLabel;
+            destinationLast4 = asLast4(split.destinationLabel);
+            break;
+          }
+        }
+      }
+
       const haystack = joinHaystack([
         asString(parsed.payment_status),
         description,
         notes,
         merchant,
         asString(parsed.transaction_type),
+        paymentMethod,
+        accountLabel,
+        destinationLabel,
+        bankName,
+        destinationBank,
       ]);
+      const looksLikeSelfPayee =
+        SELF_PAYEE_RE.test(haystack) ||
+        namesLikelySamePerson(merchant, userFullName || null) ||
+        /^self$/i.test(merchant || '');
+      const hasDestination = Boolean(
+        destinationContainer || destinationBank || destinationLabel,
+      );
       const paymentStatus = asPaymentStatus(parsed.payment_status, haystack);
-      const transactionType = asTransactionType(
+      let transactionType = asTransactionType(
         parsed.transaction_type,
         haystack,
-        Boolean(destinationContainer || destinationBank || destinationLabel),
+        hasDestination,
+        looksLikeSelfPayee,
       );
+
+      if (looksLikeSelfPayee && transactionType !== 'income') {
+        transactionType = 'transfer';
+        if (merchant && (namesLikelySamePerson(merchant, userFullName || null) || /^self$/i.test(merchant))) {
+          merchant = 'Self';
+        }
+      }
+
       return {
         merchant,
         description,
@@ -535,7 +812,7 @@ export class ReceiptParseService {
         date,
         time,
         paid_at: paidAtFrom(date, time),
-        payment_method: asString(parsed.payment_method),
+        payment_method: paymentMethod,
         payment_status: paymentStatus,
         transaction_type: transactionType,
         upi_vpa: asString(parsed.upi_vpa),
@@ -544,10 +821,10 @@ export class ReceiptParseService {
         platform_txn_id: asString(parsed.platform_txn_id),
         notes,
         category_name: asString(parsed.category_name),
-        container_name: asString(parsed.container_name),
-        bank_name: asString(parsed.bank_name),
-        account_last4: asLast4(parsed.account_last4) || asLast4(parsed.account_label),
-        account_label: asString(parsed.account_label),
+        container_name: containerName,
+        bank_name: bankName,
+        account_last4: accountLast4,
+        account_label: accountLabel,
         destination_container_name: destinationContainer,
         destination_bank_name: destinationBank,
         destination_account_last4: destinationLast4,
@@ -585,6 +862,13 @@ export class ReceiptParseService {
         const match = categories.find((row) => row.id === historyId);
         if (match) return match;
       }
+    }
+
+    if (!suggestedName && transactionType === 'transfer') {
+      const transfers = categories.find(
+        (row) => normalizeName(row.name) === 'transfers',
+      );
+      if (transfers) return transfers;
     }
 
     if (!suggestedName) return null;

@@ -6,6 +6,7 @@ import {
   HttpStatus,
   Patch,
   Post,
+  Put,
   Req,
   Res,
   UploadedFile,
@@ -25,6 +26,7 @@ import {
   ChangePasswordDto,
   UpdateProfileDto,
 } from './dto/update-profile.dto';
+import { UpdateThemePreferencesDto } from './dto/theme-preferences.dto';
 import { errorResponse, successResponse } from 'src/utils/response/response';
 import { RequirePermissions } from 'src/helper/decorators/permissions.decorator';
 
@@ -174,6 +176,49 @@ export class UserController {
       return res
         .status(statusCode)
         .send(errorResponse(error.message || 'Failed to save preferences', statusCode));
+    }
+  }
+
+  @Get('theme-preferences')
+  @ApiOperation({ summary: 'Get saved UI theme preference' })
+  @RequirePermissions('dashboard.access')
+  async getThemePreferences(@Req() req: Request, @Res() res: Response) {
+    try {
+      const data = await this.userService.getThemePreferences(
+        (req as any).user.id as string,
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Theme preferences'));
+    } catch (error) {
+      const statusCode = error.status || error.statusCode || HttpStatus.BAD_REQUEST;
+      return res
+        .status(statusCode)
+        .send(errorResponse(error.message || 'Failed to load theme', statusCode));
+    }
+  }
+
+  @Put('theme-preferences')
+  @ApiOperation({ summary: 'Save UI theme preference (active theme + customs)' })
+  @RequirePermissions('dashboard.access')
+  async saveThemePreferences(
+    @Req() req: Request,
+    @Body() dto: UpdateThemePreferencesDto,
+    @Res() res: Response,
+  ) {
+    try {
+      const data = await this.userService.saveThemePreferences(
+        (req as any).user.id as string,
+        dto,
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Theme preferences saved'));
+    } catch (error) {
+      const statusCode = error.status || error.statusCode || HttpStatus.BAD_REQUEST;
+      return res
+        .status(statusCode)
+        .send(errorResponse(error.message || 'Failed to save theme', statusCode));
     }
   }
 

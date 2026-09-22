@@ -219,4 +219,56 @@ export class UserService {
     );
     return { preferences: result.rows[0]?.preferences || preferences };
   }
+
+  async getThemePreferences(userId: string) {
+    const result = await this.pgPool.query(
+      `SELECT active_theme_id, custom_themes
+       FROM user_ui_preferences
+       WHERE user_id = $1 AND deleted_at IS NULL`,
+      [userId],
+    );
+    const row = result.rows[0];
+    const customThemes = Array.isArray(row?.custom_themes)
+      ? row.custom_themes
+      : [];
+    return {
+      active_theme_id: (row?.active_theme_id as string) || null,
+      custom_themes: customThemes,
+      has_preference: Boolean(row),
+    };
+  }
+
+  async saveThemePreferences(
+    userId: string,
+    dto: {
+      active_theme_id: string;
+      custom_themes?: unknown[];
+    },
+  ) {
+    const activeThemeId = String(dto.active_theme_id || '').trim();
+    if (!activeThemeId) {
+      throw new BadRequestException('active_theme_id is required');
+    }
+    const customThemes = Array.isArray(dto.custom_themes)
+      ? dto.custom_themes.slice(0, 40)
+      : [];
+    const result = await this.pgPool.query(
+      `INSERT INTO user_ui_preferences
+         (user_id, active_theme_id, custom_themes, updated_at)
+       VALUES ($1, $2, $3::jsonb, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET
+         active_theme_id = EXCLUDED.active_theme_id,
+         custom_themes = EXCLUDED.custom_themes,
+         updated_at = NOW(),
+         deleted_at = NULL
+       RETURNING active_theme_id, custom_themes`,
+      [userId, activeThemeId, JSON.stringify(customThemes)],
+    );
+    const row = result.rows[0];
+    return {
+      active_theme_id: row?.active_theme_id as string,
+      custom_themes: Array.isArray(row?.custom_themes) ? row.custom_themes : [],
+      has_preference: true,
+    };
+  }
 }
