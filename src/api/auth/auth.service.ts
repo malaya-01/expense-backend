@@ -30,7 +30,6 @@ import { REFRESH_COOKIE_NAME, refreshCookieOptions } from './refresh-cookie';
 import {
   buildRecoveryEmailHtml,
   buildVerificationEmailHtml,
-  hasReliableMailTransport,
   isMailConfigured,
   sendMail,
   shouldOfferInlineRecoveryCode,
@@ -302,11 +301,9 @@ export class AuthService {
     const key = `${email}-otp`;
     await this.cacheManager.set(key, otp, 10 * 60 * 1000);
 
-    // Prefer HTTPS mail (Resend). Skip SMTP on Render — free dynos block it.
-    const tryEmail =
-      canEmail && (hasReliableMailTransport() || !allowInline);
-
-    if (tryEmail) {
+    // Always attempt mail when configured (Brevo SMTP can send to any inbox).
+    // Inline OTP is only a fallback after send fails (e.g. host blocks SMTP).
+    if (canEmail) {
       try {
         await this.sendRecoveryCode(email, otp);
         return {
@@ -329,11 +326,16 @@ export class AuthService {
       }
     }
 
-    // Inline fallback for live (Render) when SMTP/Resend cannot deliver
-    // (e.g. Resend free tier only delivers to the account owner).
+    if (!allowInline) {
+      await this.cacheManager.del(key);
+      throw new ServiceUnavailableException(
+        'Password recovery email is not configured. Contact the application administrator.',
+      );
+    }
+
     // eslint-disable-next-line no-console
     console.warn(
-      `[Opal] Inline recovery code issued for ${email} (mail unavailable on this host).`,
+      `[Opal] Inline recovery code issued for ${email} (mail send failed or not configured).`,
     );
     return {
       message:

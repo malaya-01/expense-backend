@@ -13,7 +13,7 @@ function createTransporter() {
     secure:
       process.env.SMTP_SECURE === 'true' ||
       (process.env.SMTP_SECURE !== 'false' && port === 465),
-    requireTLS: port === 587,
+    requireTLS: port === 587 || port === 2525,
     auth: {
       user: process.env.SMTP_USER,
       pass: smtpPassword(),
@@ -32,13 +32,36 @@ export function isSmtpConfigured() {
   );
 }
 
-/** Prefer Resend (HTTPS) or SMTP (e.g. Brevo) when configured. */
+export function isBrevoApiConfigured() {
+  return Boolean(
+    process.env.BREVO_API_KEY?.trim() || process.env.SENDINBLUE_API_KEY?.trim(),
+  );
+}
+
+function brevoApiKey() {
+  return (
+    process.env.BREVO_API_KEY?.trim() ||
+    process.env.SENDINBLUE_API_KEY?.trim() ||
+    ''
+  );
+}
+
+function isBrevoSmtpHost() {
+  const host = (process.env.SMTP_HOST || '').toLowerCase();
+  return host.includes('brevo') || host.includes('sendinblue');
+}
+
+/** Mail is configured when any transport is available. */
 export function isMailConfigured() {
-  return Boolean(process.env.RESEND_API_KEY?.trim() || isSmtpConfigured());
+  return Boolean(
+    isBrevoApiConfigured() ||
+      process.env.RESEND_API_KEY?.trim() ||
+      isSmtpConfigured(),
+  );
 }
 
 /**
- * Inline recovery codes when mail cannot be delivered (e.g. host blocks SMTP).
+ * Inline recovery codes when mail cannot be delivered.
  * Set PASSWORD_RESET_INLINE_CODE=false to disable.
  */
 export function shouldOfferInlineRecoveryCode() {
@@ -52,36 +75,85 @@ export function shouldOfferInlineRecoveryCode() {
   );
 }
 
-/** Transports we expect to work on restricted hosts (HTTPS or Brevo SMTP). */
 export function hasReliableMailTransport() {
-  const host = (process.env.SMTP_HOST || '').toLowerCase();
-  const brevoSmtp =
-    isSmtpConfigured() &&
-    (host.includes('brevo') || host.includes('sendinblue'));
-  return Boolean(process.env.RESEND_API_KEY?.trim() || brevoSmtp);
+  return Boolean(isBrevoApiConfigured() || process.env.RESEND_API_KEY?.trim());
+}
+
+function stripWrappingQuotes(value: string) {
+  return value.trim().replace(/^['"]+|['"]+$/g, '').trim();
 }
 
 /**
  * Always brand outbound mail as Opal. Accepts "Name <email>" or bare email.
  */
 export function resolveMailFrom(): string {
-  const raw = (
+  const raw = stripWrappingQuotes(
     process.env.SMTP_FROM ||
-    process.env.RESEND_FROM ||
-    process.env.SMTP_USER ||
-    ''
-  ).trim();
+      process.env.BREVO_FROM ||
+      process.env.RESEND_FROM ||
+      process.env.SMTP_USER ||
+      '',
+  );
   if (!raw) return 'Opal <noreply@opal.app>';
 
   const angled = raw.match(/^(.*?)\s*<([^>]+)>\s*$/);
   if (angled) {
-    const email = angled[2].trim();
-    return `Opal <${email}>`;
+    return `Opal <${angled[2].trim()}>`;
   }
   if (raw.includes('@')) {
-    return `Opal <${raw.replace(/^["']|["']$/g, '')}>`;
+    return `Opal <${raw}>`;
   }
   return `Opal <${raw}>`;
+}
+
+export function parseMailFrom(from = resolveMailFrom()): {
+  name: string;
+  email: string;
+} {
+  const angled = from.match(/^(.*?)\s*<([^>]+)>\s*$/);
+  if (angled) {
+    return {
+      name: stripWrappingQuotes(angled[1]) || 'Opal',
+      email: angled[2].trim(),
+    };
+  }
+  return { name: 'Opal', email: from };
+}
+
+async function sendViaBrevoApi(options: {
+  to: string;
+  subject: string;
+  text: string;
+  html: string;
+}) {
+  const apiKey = brevoApiKey();
+  if (!apiKey) {
+    throw new Error('BREVO_API_KEY is not set');
+  }
+  const sender = parseMailFrom();
+
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+      'api-key': apiKey,
+    },
+    body: JSON.stringify({
+      sender: { name: sender.name, email: sender.email },
+      to: [{ email: options.to }],
+      subject: options.subject,
+      htmlContent: options.html,
+      textContent: options.text,
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw new Error(
+      `Brevo API ${response.status}: ${body || response.statusText}`,
+    );
+  }
 }
 
 async function sendViaResend(options: {
@@ -134,6 +206,15 @@ async function sendViaSmtp(options: {
   });
 }
 
+/**
+ * Priority:
+ * 1. Brevo HTTPS API (works on Render free — SMTP ports are often blocked)
+ * 2. SMTP (Brevo relay / other)
+ * 3. Resend only when explicitly chosen, or as last resort when Brevo is not configured
+ *
+ * When Brevo SMTP/API is configured we do NOT fall back to Resend — Resend free
+ * only delivers to the account owner and masks real Brevo failures.
+ */
 export async function sendMail(options: {
   to: string;
   subject: string;
@@ -143,38 +224,60 @@ export async function sendMail(options: {
   const prefer =
     (process.env.MAIL_PROVIDER || '').trim().toLowerCase() || 'auto';
   const errors: string[] = [];
+  const brevoConfigured = isBrevoApiConfigured() || isBrevoSmtpHost();
 
-  const trySmtp = async () => {
-    await sendViaSmtp(options);
-  };
-  const tryResend = async () => {
-    await sendViaResend(options);
+  const run = async (label: string, fn: () => Promise<void>) => {
+    try {
+      await fn();
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      errors.push(`${label}: ${message}`);
+      // eslint-disable-next-line no-console
+      console.error(`[Opal] mail transport ${label} failed:`, message);
+      return false;
+    }
   };
 
   try {
+    if (prefer === 'brevo' || prefer === 'brevo_api') {
+      if (!(await run('brevo-api', () => sendViaBrevoApi(options)))) {
+        throw new Error(errors.join(' | '));
+      }
+      return;
+    }
     if (prefer === 'smtp') {
-      await trySmtp();
+      if (!(await run('smtp', () => sendViaSmtp(options)))) {
+        // On Render, SMTP is often blocked — try Brevo HTTPS if available.
+        if (
+          isBrevoApiConfigured() &&
+          (await run('brevo-api', () => sendViaBrevoApi(options)))
+        ) {
+          return;
+        }
+        throw new Error(errors.join(' | '));
+      }
       return;
     }
     if (prefer === 'resend') {
-      await tryResend();
+      if (!(await run('resend', () => sendViaResend(options)))) {
+        throw new Error(errors.join(' | '));
+      }
       return;
     }
 
-    // auto: Brevo/SMTP first when configured, then Resend.
+    // auto
+    if (isBrevoApiConfigured()) {
+      if (await run('brevo-api', () => sendViaBrevoApi(options))) return;
+    }
     if (isSmtpConfigured()) {
-      try {
-        await trySmtp();
-        return;
-      } catch (err) {
-        errors.push(err instanceof Error ? err.message : String(err));
-        if (!process.env.RESEND_API_KEY?.trim()) throw err;
-      }
+      if (await run('smtp', () => sendViaSmtp(options))) return;
     }
-    if (process.env.RESEND_API_KEY?.trim()) {
-      await tryResend();
-      return;
+    // Only use Resend when Brevo is not the configured provider.
+    if (!brevoConfigured && process.env.RESEND_API_KEY?.trim()) {
+      if (await run('resend', () => sendViaResend(options))) return;
     }
+
     throw new Error(errors[0] || 'No mail transport configured');
   } catch (error) {
     const message =
