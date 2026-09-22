@@ -4,6 +4,7 @@ import { LoginAuthDto, PasswordResetDto, RegisterAuthDto } from './dto/create-au
 // import { UpdateAuthDto } from './dto/update-auth.dto';
 import { ApiOperation } from '@nestjs/swagger';
 import { OtpGenerateDto } from './dto/generat-otp.dto';
+import { VerifyRecoveryOtpDto } from './dto/verify-recovery-otp.dto';
 import { Request, Response } from 'express';
 import { Throttle } from '@nestjs/throttler';
 import { errorResponse, successResponse } from 'src/utils/response/response';
@@ -81,6 +82,24 @@ export class AuthController {
       const message = error.message || 'An unexpected error occured'
       const statusCode = error.statuscode || error.status || HttpStatus.BAD_REQUEST
       return res.status(statusCode).send(errorResponse(message, statusCode))
+    }
+  }
+
+  @Public()
+  @Post('verify-otp')
+  @Throttle({ default: { limit: 8, ttl: 60_000 } })
+  @ApiOperation({ summary: 'Verify password recovery OTP' })
+  async verifyOtp(@Body() dto: VerifyRecoveryOtpDto, @Res() res: Response) {
+    try {
+      const result = await this.authService.verifyRecoveryOtp(dto);
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(result, 'OTP verified'));
+    } catch (error) {
+      const message = error.message || 'An unexpected error occured';
+      const statusCode =
+        error.statuscode || error.status || HttpStatus.BAD_REQUEST;
+      return res.status(statusCode).send(errorResponse(message, statusCode));
     }
   }
 

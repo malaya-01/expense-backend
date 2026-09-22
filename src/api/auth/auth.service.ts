@@ -345,8 +345,36 @@ export class AuthService {
     };
   }
 
+  async verifyRecoveryOtp(dto: {
+    email: string;
+    otp: string;
+  }) {
+    const email = dto.email.trim().toLowerCase();
+    const otp = String(dto.otp || '').trim();
+    const key = `${email}-otp`;
+    const cachedOtp = await this.cacheManager.get<string>(key);
+
+    if (!cachedOtp || cachedOtp !== otp) {
+      throw new BadRequestException('Invalid OTP');
+    }
+
+    const resetToken = randomUUID();
+    await this.cacheManager.set(
+      `${email}-reset-token`,
+      resetToken,
+      10 * 60 * 1000,
+    );
+    // OTP is single-use once verified.
+    await this.cacheManager.del(key);
+
+    return {
+      message: 'Code verified. You can set a new password.',
+      reset_token: resetToken,
+    };
+  }
+
   async resetPassword(dto: PasswordResetDto) {
-    const { newPassword, confirmNewPassword, otp } = dto;
+    const { newPassword, confirmNewPassword, resetToken } = dto;
     const email = dto.email.trim().toLowerCase();
 
     if (newPassword !== confirmNewPassword) {
@@ -355,10 +383,12 @@ export class AuthService {
       );
     }
 
-    const key = `${email}-otp`;
-    const cachedOtp = await this.cacheManager.get<string>(key);
-    if (!cachedOtp || cachedOtp !== String(otp || '').trim()) {
-      throw new BadRequestException('Invalid OTP');
+    const tokenKey = `${email}-reset-token`;
+    const cachedToken = await this.cacheManager.get<string>(tokenKey);
+    if (!cachedToken || cachedToken !== String(resetToken || '').trim()) {
+      throw new BadRequestException(
+        'Reset session expired or invalid. Request a new recovery code.',
+      );
     }
 
     const passwordHash = await bcrypt.hash(newPassword, 10);
@@ -368,7 +398,8 @@ export class AuthService {
         'UPDATE users SET password_hash = $1 WHERE email = $2',
         [passwordHash, email],
       );
-      await this.cacheManager.del(key);
+      await this.cacheManager.del(tokenKey);
+      await this.cacheManager.del(`${email}-otp`);
       return { message: 'Password reset successfully' };
     } catch (error) {
       throw new InternalServerErrorException('Failed to reset password');

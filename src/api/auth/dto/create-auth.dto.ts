@@ -103,9 +103,10 @@ export class PasswordResetDto {
     confirmNewPassword: string;
 
     @ApiProperty({
-        description: 'OTP code sent to user email',
-        example: '123456'
+        description: 'One-time reset token from OTP verification',
+        example: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
     })
     @IsString()
-    otp: string;
+    @MinLength(16)
+    resetToken: string;
 }
