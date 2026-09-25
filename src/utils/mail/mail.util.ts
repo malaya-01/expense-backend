@@ -1,21 +1,39 @@
+import { MailtrapClient } from 'mailtrap';
 import * as nodemailer from 'nodemailer';
+import appConfiguration from 'src/app.configuration';
+
+function realSecret(...values: Array<string | undefined>) {
+  for (const value of values) {
+    const trimmed = (value || '').trim();
+    if (!trimmed || trimmed === '<YOUR_API_TOKEN>') continue;
+    return trimmed.replace(/\s+/g, '');
+  }
+  return '';
+}
 
 function smtpPassword() {
-  // Gmail app passwords / Brevo keys are often pasted with spaces from the UI.
-  return (process.env.SMTP_PASSWORD || '').replace(/\s+/g, '');
+  // Mailtrap SMTP password is the same API token.
+  return realSecret(
+    process.env.SMTP_PASSWORD,
+    process.env.MAILTRAP_API_TOKEN,
+    process.env.MAILTRAP_API_KEY,
+  );
+}
+
+function smtpUser() {
+  return (appConfiguration().MAIL.SMTP_USER || '').trim();
 }
 
 function createTransporter() {
-  const port = Number(process.env.SMTP_PORT || 587);
+  const mail = appConfiguration().MAIL;
+  const port = Number(mail.SMTP_PORT || 587);
   return nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
+    host: mail.SMTP_HOST,
     port,
-    secure:
-      process.env.SMTP_SECURE === 'true' ||
-      (process.env.SMTP_SECURE !== 'false' && port === 465),
-    requireTLS: port === 587 || port === 2525,
+    secure: mail.SMTP_SECURE || port === 465,
+    requireTLS: !mail.SMTP_SECURE && (port === 587 || port === 2525 || port === 25),
     auth: {
-      user: process.env.SMTP_USER,
+      user: smtpUser(),
       pass: smtpPassword(),
     },
     connectionTimeout: 15_000,
@@ -26,38 +44,46 @@ function createTransporter() {
 
 export function isSmtpConfigured() {
   return Boolean(
-    process.env.SMTP_HOST?.trim() &&
-      process.env.SMTP_USER?.trim() &&
-      process.env.SMTP_PASSWORD?.trim(),
+    appConfiguration().MAIL.SMTP_HOST?.trim() && smtpUser() && smtpPassword(),
   );
 }
 
-export function isBrevoApiConfigured() {
-  return Boolean(
-    process.env.BREVO_API_KEY?.trim() || process.env.SENDINBLUE_API_KEY?.trim(),
-  );
+function mailtrapToken() {
+  return realSecret(process.env.MAILTRAP_API_TOKEN, process.env.MAILTRAP_API_KEY);
 }
 
-function brevoApiKey() {
-  return (
-    process.env.BREVO_API_KEY?.trim() ||
-    process.env.SENDINBLUE_API_KEY?.trim() ||
-    ''
-  );
+export function isMailtrapConfigured() {
+  return Boolean(mailtrapToken());
 }
 
-function isBrevoSmtpHost() {
-  const host = (process.env.SMTP_HOST || '').toLowerCase();
-  return host.includes('brevo') || host.includes('sendinblue');
+function mailtrapSender(): { email: string; name: string } {
+  const mail = appConfiguration().MAIL;
+  return {
+    email: mail.MAILTRAP_FROM_EMAIL.trim(),
+    name: mail.MAILTRAP_FROM_NAME.trim() || 'Opal',
+  };
+}
+
+function getMailtrapClient() {
+  const token = mailtrapToken();
+  if (!token) {
+    throw new Error('MAILTRAP_API_TOKEN is not set');
+  }
+  const mail = appConfiguration().MAIL;
+  const sandbox = mail.MAILTRAP_USE_SANDBOX;
+  const inboxId = Number(mail.MAILTRAP_INBOX_ID);
+  return new MailtrapClient({
+    token,
+    sandbox,
+    testInboxId: sandbox && Number.isFinite(inboxId) && inboxId > 0
+      ? inboxId
+      : undefined,
+  });
 }
 
 /** Mail is configured when any transport is available. */
 export function isMailConfigured() {
-  return Boolean(
-    isBrevoApiConfigured() ||
-      process.env.RESEND_API_KEY?.trim() ||
-      isSmtpConfigured(),
-  );
+  return Boolean(isMailtrapConfigured() || isSmtpConfigured());
 }
 
 /**
@@ -76,7 +102,7 @@ export function shouldOfferInlineRecoveryCode() {
 }
 
 export function hasReliableMailTransport() {
-  return Boolean(isBrevoApiConfigured() || process.env.RESEND_API_KEY?.trim());
+  return isMailtrapConfigured();
 }
 
 function stripWrappingQuotes(value: string) {
@@ -87,12 +113,12 @@ function stripWrappingQuotes(value: string) {
  * Always brand outbound mail as Opal. Accepts "Name <email>" or bare email.
  */
 export function resolveMailFrom(): string {
+  const mail = appConfiguration().MAIL;
   const raw = stripWrappingQuotes(
-    process.env.SMTP_FROM ||
-      process.env.BREVO_FROM ||
-      process.env.RESEND_FROM ||
-      process.env.SMTP_USER ||
-      '',
+    mail.SMTP_FROM ||
+      (mail.MAILTRAP_FROM_EMAIL
+        ? `${mail.MAILTRAP_FROM_NAME} <${mail.MAILTRAP_FROM_EMAIL}>`
+        : ''),
   );
   if (!raw) return 'Opal <noreply@opal.app>';
 
@@ -120,74 +146,25 @@ export function parseMailFrom(from = resolveMailFrom()): {
   return { name: 'Opal', email: from };
 }
 
-async function sendViaBrevoApi(options: {
+async function sendViaMailtrap(options: {
   to: string;
   subject: string;
   text: string;
   html: string;
 }) {
-  const apiKey = brevoApiKey();
-  if (!apiKey) {
-    throw new Error('BREVO_API_KEY is not set');
+  if (!isMailtrapConfigured()) {
+    throw new Error('MAILTRAP_API_TOKEN is not set');
   }
-  const sender = parseMailFrom();
-
-  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-    method: 'POST',
-    headers: {
-      accept: 'application/json',
-      'content-type': 'application/json',
-      'api-key': apiKey,
-    },
-    body: JSON.stringify({
-      sender: { name: sender.name, email: sender.email },
-      to: [{ email: options.to }],
-      subject: options.subject,
-      htmlContent: options.html,
-      textContent: options.text,
-    }),
+  const mail = appConfiguration().MAIL;
+  const client = getMailtrapClient();
+  await client.send({
+    from: mailtrapSender(),
+    to: [{ email: options.to }],
+    subject: options.subject,
+    text: options.text,
+    html: options.html,
+    category: mail.MAILTRAP_CATEGORY,
   });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new Error(
-      `Brevo API ${response.status}: ${body || response.statusText}`,
-    );
-  }
-}
-
-async function sendViaResend(options: {
-  to: string;
-  subject: string;
-  text: string;
-  html: string;
-}) {
-  const apiKey = process.env.RESEND_API_KEY?.trim();
-  if (!apiKey) {
-    throw new Error('RESEND_API_KEY is not set');
-  }
-
-  const response = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      from: resolveMailFrom(),
-      to: [options.to],
-      subject: options.subject,
-      text: options.text,
-      html: options.html,
-    }),
-  });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new Error(
-      `Resend API ${response.status}: ${body || response.statusText}`,
-    );
-  }
 }
 
 async function sendViaSmtp(options: {
@@ -208,12 +185,10 @@ async function sendViaSmtp(options: {
 
 /**
  * Priority:
- * 1. Brevo HTTPS API (works on Render free — SMTP ports are often blocked)
- * 2. SMTP (Brevo relay / other)
- * 3. Resend only when explicitly chosen, or as last resort when Brevo is not configured
+ * 1. Mailtrap Email API (send.api.mailtrap.io — HTTPS, preferred on Render)
+ * 2. Mailtrap SMTP (live.smtp.mailtrap.io)
  *
- * When Brevo SMTP/API is configured we do NOT fall back to Resend — Resend free
- * only delivers to the account owner and masks real Brevo failures.
+ * MAIL_PROVIDER=mailtrap pins the API. MAIL_PROVIDER=smtp pins SMTP.
  */
 export async function sendMail(options: {
   to: string;
@@ -221,10 +196,8 @@ export async function sendMail(options: {
   text: string;
   html: string;
 }) {
-  const prefer =
-    (process.env.MAIL_PROVIDER || '').trim().toLowerCase() || 'auto';
+  const prefer = appConfiguration().MAIL.PROVIDER || 'auto';
   const errors: string[] = [];
-  const brevoConfigured = isBrevoApiConfigured() || isBrevoSmtpHost();
 
   const run = async (label: string, fn: () => Promise<void>) => {
     try {
@@ -240,42 +213,25 @@ export async function sendMail(options: {
   };
 
   try {
-    if (prefer === 'brevo' || prefer === 'brevo_api') {
-      if (!(await run('brevo-api', () => sendViaBrevoApi(options)))) {
+    if (prefer === 'mailtrap') {
+      if (!(await run('mailtrap', () => sendViaMailtrap(options)))) {
         throw new Error(errors.join(' | '));
       }
       return;
     }
     if (prefer === 'smtp') {
       if (!(await run('smtp', () => sendViaSmtp(options)))) {
-        // On Render, SMTP is often blocked — try Brevo HTTPS if available.
-        if (
-          isBrevoApiConfigured() &&
-          (await run('brevo-api', () => sendViaBrevoApi(options)))
-        ) {
-          return;
-        }
-        throw new Error(errors.join(' | '));
-      }
-      return;
-    }
-    if (prefer === 'resend') {
-      if (!(await run('resend', () => sendViaResend(options)))) {
         throw new Error(errors.join(' | '));
       }
       return;
     }
 
     // auto
-    if (isBrevoApiConfigured()) {
-      if (await run('brevo-api', () => sendViaBrevoApi(options))) return;
+    if (isMailtrapConfigured()) {
+      if (await run('mailtrap', () => sendViaMailtrap(options))) return;
     }
     if (isSmtpConfigured()) {
       if (await run('smtp', () => sendViaSmtp(options))) return;
-    }
-    // Only use Resend when Brevo is not the configured provider.
-    if (!brevoConfigured && process.env.RESEND_API_KEY?.trim()) {
-      if (await run('resend', () => sendViaResend(options))) return;
     }
 
     throw new Error(errors[0] || 'No mail transport configured');

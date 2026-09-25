@@ -40,7 +40,7 @@ import { buildAppPathUrl } from 'src/utils/url/public-app-url';
 const EMAIL_VERIFY_TTL_MS = 60 * 60 * 1000; // 1 hour
 const EMAIL_VERIFY_TTL_HOURS = 1;
 const LOGIN_LOCK_MS = 15 * 60 * 1000;
-/** Require a verified email before sign-in / API access (Brevo SMTP delivers to any inbox). */
+/** Require a verified email before sign-in / API access. */
 const REQUIRE_EMAIL_VERIFICATION = true;
 
 export function isEmailVerificationRequired() {
@@ -306,7 +306,7 @@ export class AuthService {
     const key = `${email}-otp`;
     await this.cacheManager.set(key, otp, 10 * 60 * 1000);
 
-    // Always attempt mail when configured (Brevo SMTP can send to any inbox).
+    // Always attempt mail when configured.
     // Inline OTP is only a fallback after send fails (e.g. host blocks SMTP).
     if (canEmail) {
       try {

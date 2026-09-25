@@ -74,4 +74,30 @@ export default () => ({
     VERSION: '1.0.0',
   },
   ADMIN_EMAILS: process.env.ADMIN_EMAILS || '',
+  MAIL: {
+    /** `mailtrap` (API) | `smtp` | `auto` (API first, then SMTP). */
+    PROVIDER: (process.env.MAIL_PROVIDER || 'auto').trim().toLowerCase(),
+    MAILTRAP_API_HOST:
+      process.env.MAILTRAP_API_HOST || 'send.api.mailtrap.io',
+    MAILTRAP_FROM_EMAIL:
+      process.env.MAILTRAP_FROM_EMAIL || 'hello@demomailtrap.co',
+    MAILTRAP_FROM_NAME: process.env.MAILTRAP_FROM_NAME || 'Opal',
+    MAILTRAP_USE_SANDBOX:
+      String(process.env.MAILTRAP_USE_SANDBOX || '')
+        .trim()
+        .toLowerCase() === 'true',
+    MAILTRAP_INBOX_ID: process.env.MAILTRAP_INBOX_ID || '',
+    MAILTRAP_CATEGORY: process.env.MAILTRAP_CATEGORY || 'Transactional',
+    SMTP_HOST: process.env.SMTP_HOST || 'live.smtp.mailtrap.io',
+    SMTP_PORT: parseInt(process.env.SMTP_PORT || '587', 10),
+    SMTP_SECURE:
+      String(process.env.SMTP_SECURE || '')
+        .trim()
+        .toLowerCase() === 'true',
+    /** Dashboard username is often `apismtp@mailtrap.io`; Mailtrap's Node sample uses `api`. */
+    SMTP_USER: process.env.SMTP_USER || 'apismtp@mailtrap.io',
+    SMTP_FROM:
+      process.env.SMTP_FROM ||
+      `Opal <${process.env.MAILTRAP_FROM_EMAIL || 'hello@demomailtrap.co'}>`,
+  },
 });
