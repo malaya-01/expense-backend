@@ -1,6 +1,7 @@
 import { MailtrapClient } from 'mailtrap';
 import * as nodemailer from 'nodemailer';
 import appConfiguration from 'src/app.configuration';
+import { resolvePublicAppOrigin } from 'src/utils/url/public-app-url';
 
 function realSecret(...values: Array<string | undefined>) {
   for (const value of values) {
@@ -244,38 +245,89 @@ export async function sendMail(options: {
   }
 }
 
+function emailAsset(path: string) {
+  const origin = resolvePublicAppOrigin();
+  const clean = path.startsWith('/') ? path : `/${path}`;
+  return `${origin}${clean}`;
+}
+
+function emailButton(href: string, label: string) {
+  return `<table role="presentation" cellspacing="0" cellpadding="0">
+  <tr>
+    <td class="email-btn" bgcolor="#0072f5" style="border-radius:10px;background:#0072f5;">
+      <a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer"
+         style="display:inline-block;padding:12px 22px;font-size:14px;line-height:20px;font-weight:600;color:#ffffff;text-decoration:none;border-radius:10px;">
+        ${escapeHtml(label)}
+      </a>
+    </td>
+  </tr>
+</table>`;
+}
+
 function emailShell(params: {
   title: string;
   heading: string;
   bodyHtml: string;
-  footer?: string;
+  footer: string;
 }) {
+  const logoLight = emailAsset('/brand/themes/vercel-light.png?v=4');
+  const logoDark = emailAsset('/brand/themes/midnight.png?v=4');
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="supported-color-schemes" content="light dark" />
   <title>${escapeHtml(params.title)}</title>
+  <style>
+    :root { color-scheme: light dark; }
+    @media (prefers-color-scheme: dark) {
+      .email-bg { background:#0c0d12 !important; }
+      .email-card { background:#161821 !important; border-color:#1e2030 !important; }
+      .email-header { background:#161821 !important; border-color:#1e2030 !important; }
+      .email-heading { color:#f3f4f8 !important; }
+      .email-brand { color:#b0b4c4 !important; }
+      .email-text { color:#f3f4f8 !important; }
+      .email-muted { color:#b0b4c4 !important; }
+      .email-code { background:#0c0d12 !important; border-color:#1e2030 !important; color:#f3f4f8 !important; }
+      .email-footer { border-color:#1e2030 !important; color:#8b90a4 !important; }
+      .email-btn { background:#8b7cf7 !important; }
+      .logo-light { display:none !important; width:0 !important; height:0 !important; overflow:hidden !important; }
+      .logo-dark { display:block !important; width:40px !important; height:40px !important; }
+    }
+  </style>
 </head>
-<body style="margin:0;padding:0;background:#f4f5f7;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#171717;">
-  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f4f5f7;padding:32px 16px;">
+<body class="email-bg" style="margin:0;padding:0;background:#fafafa;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <table role="presentation" class="email-bg" width="100%" cellspacing="0" cellpadding="0" style="background:#fafafa;padding:32px 16px;">
     <tr>
       <td align="center">
-        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:520px;background:#ffffff;border-radius:16px;overflow:hidden;border:1px solid #e8e8e8;">
+        <table role="presentation" class="email-card" width="100%" cellspacing="0" cellpadding="0" style="max-width:480px;background:#ffffff;border-radius:16px;overflow:hidden;border:1px solid #ececec;">
           <tr>
-            <td style="background:#0f172a;padding:28px 32px;">
-              <div style="font-size:13px;letter-spacing:0.18em;text-transform:uppercase;color:#94a3b8;font-weight:600;">Opal</div>
-              <div style="margin-top:8px;font-size:22px;line-height:1.3;font-weight:700;color:#ffffff;">${escapeHtml(params.heading)}</div>
+            <td class="email-header" style="padding:24px 28px 20px;border-bottom:1px solid #ececec;">
+              <table role="presentation" cellspacing="0" cellpadding="0">
+                <tr>
+                  <td style="width:40px;height:40px;vertical-align:middle;">
+                    <img class="logo-light" src="${escapeHtml(logoLight)}" alt="Opal" width="40" height="40" style="display:block;border-radius:10px;border:0;" />
+                    <img class="logo-dark" src="${escapeHtml(logoDark)}" alt="Opal" width="40" height="40" style="display:none;border-radius:10px;border:0;width:0;height:0;overflow:hidden;" />
+                  </td>
+                  <td style="padding-left:12px;vertical-align:middle;">
+                    <div class="email-brand" style="font-size:16px;line-height:20px;font-weight:700;letter-spacing:-0.3px;color:#171717;">Opal</div>
+                  </td>
+                </tr>
+              </table>
             </td>
           </tr>
           <tr>
-            <td style="padding:32px;">
+            <td style="padding:28px;">
+              <h1 class="email-heading" style="margin:0 0 12px;font-size:22px;line-height:28px;font-weight:700;letter-spacing:-0.4px;color:#171717;">${escapeHtml(params.heading)}</h1>
               ${params.bodyHtml}
             </td>
           </tr>
           <tr>
-            <td style="padding:16px 32px 28px;border-top:1px solid #f1f5f9;font-size:11px;line-height:1.5;color:#94a3b8;">
-              ${escapeHtml(params.footer || 'Sent by Opal — your personal financial operating system.')}
+            <td class="email-footer" style="padding:16px 28px 24px;border-top:1px solid #ececec;font-size:12px;line-height:18px;color:#6b6b6b;">
+              ${escapeHtml(params.footer)}
             </td>
           </tr>
         </table>
@@ -291,109 +343,61 @@ export function buildVerificationEmailHtml(params: {
   verifyUrl: string;
   expiresHours: number;
 }) {
-  const name = params.fullName?.trim() || 'there';
+  const name = params.fullName?.trim();
+  const greeting = name
+    ? `<p class="email-text" style="margin:0 0 12px;font-size:15px;line-height:22px;color:#171717;">Hello ${escapeHtml(name)},</p>`
+    : '';
+  const hours = `${params.expiresHours} hour${params.expiresHours === 1 ? '' : 's'}`;
   const bodyHtml = `
-    <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#334155;">Hi ${escapeHtml(name)},</p>
-    <p style="margin:0 0 24px;font-size:15px;line-height:1.6;color:#475569;">
-      Confirm this email to unlock Opal. The link expires in
-      <strong>${params.expiresHours} hour${params.expiresHours === 1 ? '' : 's'}</strong>.
+    ${greeting}
+    <p class="email-muted" style="margin:0 0 24px;font-size:15px;line-height:22px;color:#4d4d4d;">
+      Confirm this email address to continue. This link expires in ${hours}.
     </p>
-    <a href="${params.verifyUrl}"
-       style="display:inline-block;background:#0072f5;color:#ffffff;text-decoration:none;font-size:14px;font-weight:600;padding:12px 22px;border-radius:10px;">
-      Verify email address
-    </a>
-    <p style="margin:28px 0 0;font-size:12px;line-height:1.6;color:#94a3b8;">
-      If the button does not work, paste this link into your browser:<br />
-      <a href="${params.verifyUrl}" style="color:#0072f5;word-break:break-all;">${params.verifyUrl}</a>
-    </p>`;
+    ${emailButton(params.verifyUrl, 'Verify email')}`;
 
   return emailShell({
-    title: 'Verify your Opal email',
+    title: 'Verify your email',
     heading: 'Verify your email',
     bodyHtml,
-    footer: 'If you did not create an Opal account, you can ignore this message.',
+    footer: 'If you did not create this account, you can ignore this email.',
   });
 }
 
 export function buildRecoveryEmailHtml(params: { otp: string }) {
   const otp = String(params.otp || '').replace(/\D/g, '').slice(0, 6);
-  // Visual digit chips — each chip is a digit with NO spaces between table cells'
-  // text nodes that would break paste; the continuous code sits in a select-all block too.
-  const chips = otp
-    .split('')
-    .map(
-      (digit) =>
-        `<td align="center" style="padding:0 4px;">
-          <div style="width:40px;height:48px;line-height:48px;border-radius:10px;background:#0f172a;color:#ffffff;font-size:22px;font-weight:700;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;">
-            ${escapeHtml(digit)}
-          </div>
-        </td>`,
-    )
-    .join('');
-
   const bodyHtml = `
-    <p style="margin:0 0 8px;font-size:15px;line-height:1.6;color:#334155;">
-      Your one-time Opal recovery code:
+    <p class="email-muted" style="margin:0 0 20px;font-size:15px;line-height:22px;color:#4d4d4d;">
+      Use this code to reset your password. It expires in 10 minutes.
     </p>
-    <p style="margin:0 0 20px;font-size:13px;line-height:1.5;color:#64748b;">
-      Tap or click the code to select it, copy, then paste into the 6 boxes on the reset page.
-    </p>
-
-    <table role="presentation" cellspacing="0" cellpadding="0" align="center" style="margin:0 auto 16px;">
-      <tr>${chips}</tr>
-    </table>
-
-    <!-- Continuous digits for one-tap select / copy (no spaces — pastes cleanly into Opal). -->
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin:0 0 12px;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
       <tr>
-        <td align="center" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:14px 16px;">
-          <div style="font-size:11px;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;color:#94a3b8;margin-bottom:8px;">
-            Copy this code
-          </div>
-          <div style="font-size:28px;line-height:1.2;font-weight:700;letter-spacing:0.35em;color:#0f172a;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;-webkit-user-select:all;user-select:all;-moz-user-select:all;ms-user-select:all;">
-            ${escapeHtml(otp)}
-          </div>
-          <div style="margin-top:10px;font-size:12px;color:#64748b;">
-            Long-press or triple-click → Copy → paste on the reset page
-          </div>
+        <td class="email-code" align="center" style="background:#f4f4f5;border:1px solid #ececec;border-radius:12px;padding:18px 16px;font-size:28px;line-height:34px;font-weight:700;letter-spacing:0.28em;color:#171717;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;-webkit-user-select:all;user-select:all;">
+          ${escapeHtml(otp)}
         </td>
       </tr>
     </table>
-
-    <table role="presentation" cellspacing="0" cellpadding="0" align="center" style="margin:0 auto 20px;">
-      <tr>
-        <td align="center" style="background:#0f172a;border-radius:10px;padding:10px 18px;">
-          <span style="font-size:13px;font-weight:600;color:#ffffff;letter-spacing:0.02em;">
-            Code is 6 digits · no spaces · paste works
-          </span>
-        </td>
-      </tr>
-    </table>
-
-    <p style="margin:0;font-size:13px;line-height:1.6;color:#64748b;">
-      Expires in <strong>10 minutes</strong> and can only be used once.
-      Never share this code. If you did not request a reset, you can ignore this email.
+    <p class="email-muted" style="margin:20px 0 0;font-size:13px;line-height:20px;color:#6b6b6b;">
+      Enter the code on the password reset page. Do not share it.
     </p>`;
 
   return emailShell({
-    title: 'Your Opal recovery code',
+    title: 'Password recovery',
     heading: 'Password recovery',
     bodyHtml,
-    footer: 'Sent by Opal — your personal financial operating system.',
+    footer: 'If you did not request this, you can ignore this email.',
   });
 }
 
 export function buildRecoveryEmailText(otpRaw: string) {
   const otp = String(otpRaw || '').replace(/\D/g, '').slice(0, 6);
   return [
-    'Your Opal password recovery code:',
+    'Password recovery',
     '',
-    otp,
+    `Your code: ${otp}`,
     '',
-    'Copy the 6 digits above (no spaces) and paste them into the boxes on the reset page.',
-    'The code expires in 10 minutes and can only be used once.',
+    'This code expires in 10 minutes. Enter it on the password reset page.',
     '',
-    'If you did not request this, ignore this email.',
+    'If you did not request this, you can ignore this email.',
   ].join('\n');
 }
 

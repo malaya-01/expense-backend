@@ -250,12 +250,21 @@ export class AuthService {
     const verifyUrl = buildAppPathUrl('/verify-email', { token });
     // eslint-disable-next-line no-console
     console.info(`[Opal] Verification link host: ${new URL(verifyUrl).origin}`);
-    const text = `Hi ${fullName || 'there'},\n\nVerify your Opal email by opening this link (expires in ${EMAIL_VERIFY_TTL_HOURS} hour):\n${verifyUrl}\n\nIf you did not create this account, ignore this email.`;
+    const greeting = fullName?.trim() ? `Hello ${fullName.trim()},` : 'Hello,';
+    const text = [
+      greeting,
+      '',
+      `Confirm this email address to continue. This link expires in ${EMAIL_VERIFY_TTL_HOURS} hour.`,
+      '',
+      verifyUrl,
+      '',
+      'If you did not create this account, you can ignore this email.',
+    ].join('\n');
 
     try {
       await sendMail({
         to: email,
-        subject: 'Verify your Opal email',
+        subject: 'Verify your email',
         text,
         html: buildVerificationEmailHtml({
           fullName,
@@ -421,7 +430,7 @@ export class AuthService {
     }
     await sendMail({
       to: email,
-      subject: 'Your Opal password recovery code',
+      subject: 'Password recovery code',
       text: buildRecoveryEmailText(otp),
       html: buildRecoveryEmailHtml({ otp }),
     });
