@@ -5,6 +5,8 @@ import {
 } from '@nestjs/common';
 import { Pool, PoolClient } from 'pg';
 import { convertAmount } from 'src/common/currency/currency.data';
+import { addDaysIso, diffDaysInclusive } from './report-schedule';
+import type { PeriodSnapshot } from './report-period.types';
 
 const LIABILITY_TYPES = new Set([
   'credit_card',
@@ -413,6 +415,349 @@ export class ReportsService {
       merchant: row.merchant,
       amount: this.round(Number(row.amount)),
       tx_count: Number(row.tx_count),
+    }));
+  }
+
+  async periodReport(
+    userId: string,
+    start: string,
+    end: string,
+    periodLabel: string,
+    frequency = 'weekly',
+  ): Promise<PeriodSnapshot> {
+    const client = await this.pgPool.connect();
+    try {
+      const userRes = await client.query(
+        `SELECT id, full_name, email, currency, timezone
+         FROM users WHERE id = $1 AND deleted_at IS NULL`,
+        [userId],
+      );
+      if (!userRes.rowCount) {
+        throw new BadRequestException('User not found');
+      }
+      const user = userRes.rows[0];
+      const baseCurrency = String(user.currency || 'USD').toUpperCase();
+      const days = Math.max(1, diffDaysInclusive(start, end));
+      const prevEnd = addDaysIso(start, -1);
+      const prevStart = addDaysIso(prevEnd, -(days - 1));
+
+      const [totals, prevTotals, twin, cashFlow, spend, income, merchants, budgets, accounts, goals, loans, investments, largest, transactions] =
+        await Promise.all([
+          this.periodTotals(client, userId, start, end),
+          this.periodTotals(client, userId, prevStart, prevEnd),
+          this.netWorthSnapshot(client, userId, baseCurrency),
+          this.periodCashFlow(client, userId, start, end, days),
+          this.periodByCategory(client, userId, start, end, 'expense'),
+          this.periodByCategory(client, userId, start, end, 'income'),
+          this.periodMerchants(client, userId, start, end),
+          this.budgetSnapshot(client, userId, baseCurrency),
+          this.periodAccounts(client, userId),
+          this.periodGoals(client, userId, baseCurrency),
+          this.periodLoans(client, userId, baseCurrency),
+          this.investmentSnapshot(client, userId, baseCurrency),
+          this.periodTransactions(client, userId, start, end, 25, 'expense'),
+          this.periodTransactions(client, userId, start, end, 1000),
+        ]);
+
+      const savingsRate =
+        totals.income > 0
+          ? this.round(((totals.income - totals.expense) / totals.income) * 100)
+          : 0;
+
+      return {
+        user: {
+          id: user.id,
+          full_name: user.full_name,
+          email: user.email,
+          currency: baseCurrency,
+          timezone: user.timezone || 'UTC',
+        },
+        period: { start, end, label: periodLabel, frequency },
+        previous: {
+          start: prevStart,
+          end: prevEnd,
+          income: prevTotals.income,
+          expense: prevTotals.expense,
+          net: prevTotals.net,
+        },
+        totals: {
+          ...totals,
+          savings_rate: savingsRate,
+          income_change_pct: this.changePct(totals.income, prevTotals.income),
+          expense_change_pct: this.changePct(totals.expense, prevTotals.expense),
+        },
+        twin,
+        cash_flow: cashFlow,
+        spending_by_category: spend,
+        income_by_category: income,
+        top_merchants: merchants,
+        budgets,
+        accounts,
+        goals,
+        loans,
+        investments,
+        largest_expenses: largest,
+        transactions,
+      };
+    } finally {
+      client.release();
+    }
+  }
+
+  private changePct(current: number, previous: number): number | null {
+    if (previous === 0) return current === 0 ? 0 : null;
+    return this.round(((current - previous) / Math.abs(previous)) * 100);
+  }
+
+  private async periodTotals(
+    client: PoolClient,
+    userId: string,
+    start: string,
+    end: string,
+  ) {
+    const result = await client.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN type = 'income' THEN COALESCE(amount_base, amount) ELSE 0 END), 0) AS income,
+         COALESCE(SUM(CASE WHEN type = 'expense' THEN COALESCE(amount_base, amount) ELSE 0 END), 0) AS expense,
+         COALESCE(SUM(CASE WHEN type = 'transfer' THEN COALESCE(amount_base, amount) ELSE 0 END), 0) AS transfers,
+         COUNT(*) FILTER (WHERE type IN ('income', 'expense', 'transfer'))::int AS tx_count
+       FROM ledger_transactions
+       WHERE user_id = $1
+         AND deleted_at IS NULL
+         AND date >= $2::date
+         AND date <= $3::date`,
+      [userId, start, end],
+    );
+    const row = result.rows[0] || {};
+    const income = this.round(Number(row.income || 0));
+    const expense = this.round(Number(row.expense || 0));
+    return {
+      income,
+      expense,
+      transfers: this.round(Number(row.transfers || 0)),
+      net: this.round(income - expense),
+      tx_count: Number(row.tx_count || 0),
+    };
+  }
+
+  private async periodCashFlow(
+    client: PoolClient,
+    userId: string,
+    start: string,
+    end: string,
+    days: number,
+  ) {
+    const groupWeekly = days > 45;
+    const result = await client.query(
+      groupWeekly
+        ? `SELECT to_char(date_trunc('week', date), 'YYYY-MM-DD') AS bucket,
+                  COALESCE(SUM(CASE WHEN type = 'income' THEN COALESCE(amount_base, amount) ELSE 0 END), 0) AS income,
+                  COALESCE(SUM(CASE WHEN type = 'expense' THEN COALESCE(amount_base, amount) ELSE 0 END), 0) AS expense
+           FROM ledger_transactions
+           WHERE user_id = $1 AND deleted_at IS NULL
+             AND type IN ('income', 'expense')
+             AND date >= $2::date AND date <= $3::date
+           GROUP BY 1 ORDER BY 1`
+        : `SELECT to_char(date, 'YYYY-MM-DD') AS bucket,
+                  COALESCE(SUM(CASE WHEN type = 'income' THEN COALESCE(amount_base, amount) ELSE 0 END), 0) AS income,
+                  COALESCE(SUM(CASE WHEN type = 'expense' THEN COALESCE(amount_base, amount) ELSE 0 END), 0) AS expense
+           FROM ledger_transactions
+           WHERE user_id = $1 AND deleted_at IS NULL
+             AND type IN ('income', 'expense')
+             AND date >= $2::date AND date <= $3::date
+           GROUP BY 1 ORDER BY 1`,
+      [userId, start, end],
+    );
+    return result.rows.map((row) => {
+      const income = this.round(Number(row.income));
+      const expense = this.round(Number(row.expense));
+      return {
+        bucket: row.bucket,
+        income,
+        expense,
+        net: this.round(income - expense),
+      };
+    });
+  }
+
+  private async periodByCategory(
+    client: PoolClient,
+    userId: string,
+    start: string,
+    end: string,
+    type: 'expense' | 'income',
+  ) {
+    const result = await client.query(
+      `SELECT COALESCE(c.name, 'Uncategorized') AS category_name,
+              c.color AS category_color,
+              COALESCE(SUM(COALESCE(t.amount_base, t.amount)), 0) AS amount
+       FROM ledger_transactions t
+       LEFT JOIN categories c ON c.id = t.category_id
+       WHERE t.user_id = $1
+         AND t.deleted_at IS NULL
+         AND t.type = $2
+         AND t.date >= $3::date
+         AND t.date <= $4::date
+       GROUP BY c.name, c.color
+       ORDER BY amount DESC
+       LIMIT 12`,
+      [userId, type, start, end],
+    );
+    const total = result.rows.reduce((sum, row) => sum + Number(row.amount), 0);
+    return result.rows.map((row) => {
+      const amount = this.round(Number(row.amount));
+      return {
+        category_name: row.category_name,
+        category_color: row.category_color || null,
+        amount,
+        percent:
+          total > 0 ? this.round((amount / total) * 100) : 0,
+      };
+    });
+  }
+
+  private async periodMerchants(
+    client: PoolClient,
+    userId: string,
+    start: string,
+    end: string,
+  ) {
+    const result = await client.query(
+      `SELECT merchant,
+              COALESCE(SUM(COALESCE(amount_base, amount)), 0) AS amount,
+              COUNT(*)::int AS tx_count
+       FROM ledger_transactions
+       WHERE user_id = $1
+         AND deleted_at IS NULL
+         AND type = 'expense'
+         AND merchant IS NOT NULL
+         AND merchant <> ''
+         AND date >= $2::date
+         AND date <= $3::date
+       GROUP BY merchant
+       ORDER BY amount DESC
+       LIMIT 10`,
+      [userId, start, end],
+    );
+    return result.rows.map((row) => ({
+      merchant: row.merchant,
+      amount: this.round(Number(row.amount)),
+      tx_count: Number(row.tx_count),
+    }));
+  }
+
+  private async periodAccounts(client: PoolClient, userId: string) {
+    const result = await client.query(
+      `SELECT name, type, balance, currency, include_in_net_worth
+       FROM financial_containers
+       WHERE user_id = $1 AND deleted_at IS NULL
+       ORDER BY name ASC`,
+      [userId],
+    );
+    return result.rows.map((row) => ({
+      name: row.name,
+      type: row.type,
+      balance: this.round(Number(row.balance)),
+      currency: String(row.currency || 'USD').toUpperCase(),
+      include_in_net_worth: row.include_in_net_worth !== false,
+    }));
+  }
+
+  private async periodGoals(
+    client: PoolClient,
+    userId: string,
+    baseCurrency: string,
+  ) {
+    const result = await client.query(
+      `SELECT name, target_amount, current_amount, currency, target_date
+       FROM goals
+       WHERE user_id = $1 AND deleted_at IS NULL
+       ORDER BY name ASC`,
+      [userId],
+    );
+    return result.rows.map((row) => {
+      const currency = String(row.currency || baseCurrency).toUpperCase();
+      const target = convertAmount(Number(row.target_amount), currency, baseCurrency);
+      const current = convertAmount(Number(row.current_amount), currency, baseCurrency);
+      return {
+        name: row.name,
+        target: this.round(target),
+        current: this.round(current),
+        percent: target > 0 ? this.round((current / target) * 100) : 0,
+        currency: baseCurrency,
+        target_date: row.target_date
+          ? String(row.target_date).slice(0, 10)
+          : null,
+      };
+    });
+  }
+
+  private async periodLoans(
+    client: PoolClient,
+    userId: string,
+    baseCurrency: string,
+  ) {
+    const result = await client.query(
+      `SELECT l.name, l.lender, l.principal, l.annual_interest_rate, l.status,
+              fc.balance, fc.currency
+       FROM loans l
+       JOIN financial_containers fc ON fc.id = l.container_id
+       WHERE l.user_id = $1 AND l.deleted_at IS NULL
+       ORDER BY l.name ASC`,
+      [userId],
+    );
+    return result.rows.map((row) => {
+      const currency = String(row.currency || baseCurrency).toUpperCase();
+      return {
+        name: row.name,
+        lender: row.lender || null,
+        principal: this.round(
+          convertAmount(Number(row.principal), currency, baseCurrency),
+        ),
+        balance: this.round(
+          convertAmount(Number(row.balance), currency, baseCurrency),
+        ),
+        rate: this.round(Number(row.annual_interest_rate || 0)),
+        status: row.status,
+        currency: baseCurrency,
+      };
+    });
+  }
+
+  private async periodTransactions(
+    client: PoolClient,
+    userId: string,
+    start: string,
+    end: string,
+    limit: number,
+    type?: 'expense' | 'income',
+  ) {
+    const typeFilter = type ? 'AND t.type = $4' : '';
+    const limitIdx = type ? 5 : 4;
+    const result = await client.query(
+      `SELECT to_char(t.date, 'YYYY-MM-DD') AS date,
+              t.type, t.description, t.merchant, c.name AS category_name,
+              COALESCE(t.amount_base, t.amount) AS amount,
+              t.currency
+       FROM ledger_transactions t
+       LEFT JOIN categories c ON c.id = t.category_id
+       WHERE t.user_id = $1
+         AND t.deleted_at IS NULL
+         AND t.date >= $2::date
+         AND t.date <= $3::date
+         ${typeFilter}
+       ORDER BY COALESCE(t.amount_base, t.amount) DESC, t.date DESC
+       LIMIT $${limitIdx}`,
+      type ? [userId, start, end, type, limit] : [userId, start, end, limit],
+    );
+    return result.rows.map((row) => ({
+      date: row.date,
+      type: row.type,
+      description: row.description,
+      merchant: row.merchant || null,
+      category_name: row.category_name || null,
+      amount: this.round(Number(row.amount)),
+      currency: String(row.currency || 'USD').toUpperCase(),
     }));
   }
 }

@@ -1806,4 +1806,80 @@ export class AiAdvisorService {
     questions.push('What should I do next week to improve savings?');
     return questions.slice(0, 6);
   }
+
+  async generatePeriodInsights(
+    userId: string,
+    snapshot: {
+      user: { currency: string };
+      period: { label: string; frequency: string; start: string; end: string };
+      totals: object;
+      previous: object;
+      twin: object;
+      spending_by_category: unknown[];
+      income_by_category: unknown[];
+      top_merchants: unknown[];
+      budgets: { items?: unknown[]; over_count?: number };
+      goals: unknown[];
+      loans: unknown[];
+      investments: Record<string, unknown> | object;
+      largest_expenses: unknown[];
+    },
+  ): Promise<string | null> {
+    try {
+      const { config, masterPrompt } =
+        await this.settingsService.loadActiveProviderConfig(userId);
+      const inv = snapshot.investments as {
+        total_value?: number;
+        total_gain?: number;
+        gain_percent?: number;
+      };
+      const compact = {
+        period: snapshot.period,
+        currency: snapshot.user.currency,
+        totals: snapshot.totals,
+        previous: snapshot.previous,
+        twin: snapshot.twin,
+        spending_by_category: snapshot.spending_by_category.slice(0, 8),
+        income_by_category: snapshot.income_by_category.slice(0, 6),
+        top_merchants: snapshot.top_merchants.slice(0, 6),
+        budgets: {
+          over_count: snapshot.budgets.over_count,
+          items: (snapshot.budgets.items || []).slice(0, 6),
+        },
+        goals: snapshot.goals.slice(0, 6),
+        loans: snapshot.loans.slice(0, 6),
+        investments: {
+          total_value: inv.total_value,
+          total_gain: inv.total_gain,
+          gain_percent: inv.gain_percent,
+        },
+        largest_expenses: snapshot.largest_expenses.slice(0, 8),
+      };
+      const result = await runProviderChat(
+        config,
+        [
+          {
+            role: 'system',
+            content: `${buildSystemPrompt(masterPrompt)}
+
+You are writing a scheduled Opal email for this user. Do not use tools, JSON action blocks, or greetings. Return 5 to 8 short paragraphs or bullets of specific, actionable financial coaching from the numbers only. Refer to categories, merchants, budgets, and goals by name. Never mention account IDs. This is decision support, not licensed advice.`,
+          },
+          {
+            role: 'user',
+            content: `Write the "what to change" section for this ${compact.period.frequency} report (${compact.period.label}). Data in ${compact.currency}:\n${JSON.stringify(compact)}`,
+          },
+        ],
+        900,
+      );
+      const text = String(result.content || '').trim();
+      return text || null;
+    } catch (error: any) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[Opal] period insights fallback for ${userId}:`,
+        error?.message || error,
+      );
+      return null;
+    }
+  }
 }

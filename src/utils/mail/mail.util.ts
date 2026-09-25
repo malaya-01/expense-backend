@@ -147,11 +147,18 @@ export function parseMailFrom(from = resolveMailFrom()): {
   return { name: 'Opal', email: from };
 }
 
+export type MailAttachment = {
+  filename: string;
+  content: Buffer;
+  contentType?: string;
+};
+
 async function sendViaMailtrap(options: {
   to: string;
   subject: string;
   text: string;
   html: string;
+  attachments?: MailAttachment[];
 }) {
   if (!isMailtrapConfigured()) {
     throw new Error('MAILTRAP_API_TOKEN is not set');
@@ -165,6 +172,12 @@ async function sendViaMailtrap(options: {
     text: options.text,
     html: options.html,
     category: mail.MAILTRAP_CATEGORY,
+    attachments: options.attachments?.map((file) => ({
+      filename: file.filename,
+      content: file.content,
+      type: file.contentType || 'application/octet-stream',
+      disposition: 'attachment',
+    })),
   });
 }
 
@@ -173,6 +186,7 @@ async function sendViaSmtp(options: {
   subject: string;
   text: string;
   html: string;
+  attachments?: MailAttachment[];
 }) {
   if (!isSmtpConfigured()) {
     throw new Error('SMTP is not configured');
@@ -180,7 +194,15 @@ async function sendViaSmtp(options: {
   const transporter = createTransporter();
   await transporter.sendMail({
     from: resolveMailFrom(),
-    ...options,
+    to: options.to,
+    subject: options.subject,
+    text: options.text,
+    html: options.html,
+    attachments: options.attachments?.map((file) => ({
+      filename: file.filename,
+      content: file.content,
+      contentType: file.contentType,
+    })),
   });
 }
 
@@ -196,6 +218,7 @@ export async function sendMail(options: {
   subject: string;
   text: string;
   html: string;
+  attachments?: MailAttachment[];
 }) {
   const prefer = appConfiguration().MAIL.PROVIDER || 'auto';
   const errors: string[] = [];

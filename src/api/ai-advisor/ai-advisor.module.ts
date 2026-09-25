@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { AiAdvisorController } from './ai-advisor.controller';
 import { AiAdvisorService } from './ai-advisor.service';
 import { AiSettingsService } from './ai-settings.service';
@@ -26,7 +26,7 @@ import { SpacesModule } from '../spaces/spaces.module';
     InvestmentsModule,
     LoansModule,
     RecurringModule,
-    ReportsModule,
+    forwardRef(() => ReportsModule),
     TransactionsModule,
     SpacesModule,
   ],
