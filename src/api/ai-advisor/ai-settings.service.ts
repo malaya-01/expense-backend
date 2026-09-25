@@ -61,8 +61,8 @@ export class AiSettingsService {
       [userId],
     );
 
-    const byProvider = new Map(
-      configs.rows.map((row) => [row.provider, this.publicConfig(row)]),
+    const byProvider = new Map<string, ReturnType<AiSettingsService['publicConfig']>>(
+      configs.rows.map((row) => [String(row.provider), this.publicConfig(row)]),
     );
 
     const omnirouteQuota = await this.omnirouteUsage.getUsage(userId);

@@ -740,15 +740,13 @@ export class SpacesService {
        GROUP BY 1`,
       [spaceId],
     );
-    const map = new Map(
-      spentByCategory.rows.map((r) => [r.category || '', Number(r.spent)]),
+    const map = new Map<string, number>(
+      spentByCategory.rows.map((r) => [String(r.category || ''), Number(r.spent)]),
     );
     return budgets.rows.map((b) => {
       const spent = b.category
-        ? map.get(b.category) || 0
-        : Number(
-            spentByCategory.rows.reduce((s, r) => s + Number(r.spent), 0),
-          );
+        ? (map.get(String(b.category)) ?? 0)
+        : spentByCategory.rows.reduce((s, r) => s + Number(r.spent), 0);
       return {
         ...b,
         amount: Number(b.amount),
