@@ -19,14 +19,10 @@ import {
 } from './dto/update-profile.dto';
 import {
   assertAvatarFile,
-  AVATAR_UPLOAD_DIR,
-  buildAvatarFilename,
   deleteAvatarFile,
-  ensureAvatarUploadDir,
-  publicAvatarPath,
 } from './avatar-storage';
-import { writeFileSync } from 'fs';
-import { join } from 'path';
+import { ObjectStorageService } from 'src/storage/object-storage.service';
+import { SaveFaceLoginDto } from './dto/face-login.dto';
 
 @Injectable()
 export class UserService {
@@ -34,6 +30,7 @@ export class UserService {
     @Inject('PG_POOL') private readonly pgPool: Pool,
     @Inject(CACHE_MANAGER)
     private cacheManager: Cache,
+    private readonly storage: ObjectStorageService,
   ) {}
 
   async syncUsersToCache() {
@@ -114,12 +111,15 @@ export class UserService {
     const existing = await this.findOne(userId);
     if (!existing) throw new NotFoundException('User not found');
 
-    ensureAvatarUploadDir();
-    const filename = buildAvatarFilename(userId, file.mimetype);
-    writeFileSync(join(AVATAR_UPLOAD_DIR, filename), file.buffer);
-
+    const saved = await this.storage.saveFile({
+      userId,
+      kind: 'avatar',
+      body: file.buffer,
+      mimeType: file.mimetype,
+      filename: file.originalname,
+    });
     const previous = existing.avatar_url as string | null;
-    const avatarUrl = publicAvatarPath(filename);
+    const avatarUrl = saved.publicPath;
 
     const result = await this.pgPool.query(
       `UPDATE users
@@ -132,6 +132,7 @@ export class UserService {
 
     if (previous && previous !== avatarUrl) {
       deleteAvatarFile(previous);
+      await this.storage.deletePublicPath(previous);
     }
 
     return result.rows[0];
@@ -151,6 +152,7 @@ export class UserService {
       [userId],
     );
     deleteAvatarFile(previous);
+    await this.storage.deletePublicPath(previous);
     return result.rows[0];
   }
 
@@ -270,5 +272,93 @@ export class UserService {
       custom_themes: Array.isArray(row?.custom_themes) ? row.custom_themes : [],
       has_preference: true,
     };
+  }
+
+  async getFaceLogin(userId: string) {
+    const result = await this.pgPool.query(
+      `SELECT email, preview_token FROM face_login_profiles WHERE user_id = $1`,
+      [userId],
+    );
+    if (!result.rowCount) {
+      return { enabled: false, email: null, preview_url: null };
+    }
+    const row = result.rows[0];
+    return {
+      enabled: true,
+      email: row.email as string,
+      preview_url: row.preview_token
+        ? `/api/media/${row.preview_token}`
+        : null,
+    };
+  }
+
+  async saveFaceLogin(userId: string, dto: SaveFaceLoginDto) {
+    const user = await this.findOne(userId);
+    if (!user) throw new NotFoundException('User not found');
+    const objectKey = `face-login/${userId}/profile.json`;
+    await this.storage.putJson(objectKey, {
+      userId,
+      email: user.email,
+      descriptor: dto.descriptor,
+      enrolledAt: new Date().toISOString(),
+    });
+
+    const existing = await this.pgPool.query(
+      `SELECT preview_token FROM face_login_profiles WHERE user_id = $1`,
+      [userId],
+    );
+    let previewToken = (existing.rows[0]?.preview_token as string | null) || null;
+    if (dto.preview_base64) {
+      const raw = dto.preview_base64.replace(/^data:image\/\w+;base64,/, '');
+      const body = Buffer.from(raw, 'base64');
+      if (body.length > 0 && body.length <= 1_500_000) {
+        if (previewToken) {
+          await this.storage.deletePublicPath(`/api/media/${previewToken}`);
+        }
+        const saved = await this.storage.saveFile({
+          userId,
+          kind: 'face_preview',
+          body,
+          mimeType: 'image/jpeg',
+          filename: 'face-preview.jpg',
+        });
+        previewToken = saved.token;
+      }
+    }
+
+    await this.pgPool.query(
+      `INSERT INTO face_login_profiles (user_id, email, object_key, preview_token, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET
+         email = EXCLUDED.email,
+         object_key = EXCLUDED.object_key,
+         preview_token = EXCLUDED.preview_token,
+         updated_at = NOW()`,
+      [userId, user.email, objectKey, previewToken],
+    );
+    return this.getFaceLogin(userId);
+  }
+
+  async deleteFaceLogin(userId: string) {
+    const existing = await this.pgPool.query(
+      `SELECT object_key, preview_token FROM face_login_profiles WHERE user_id = $1`,
+      [userId],
+    );
+    if (existing.rowCount) {
+      const row = existing.rows[0];
+      try {
+        await this.storage.deleteKey(row.object_key as string);
+      } catch {
+        /* already removed */
+      }
+      if (row.preview_token) {
+        await this.storage.deletePublicPath(`/api/media/${row.preview_token}`);
+      }
+      await this.pgPool.query(
+        `DELETE FROM face_login_profiles WHERE user_id = $1`,
+        [userId],
+      );
+    }
+    return { enabled: false };
   }
 }

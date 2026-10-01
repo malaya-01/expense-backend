@@ -610,7 +610,6 @@ export class AuthService {
           permissions: access.permissions,
         },
       };
-
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;

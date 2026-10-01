@@ -155,7 +155,13 @@ export class TransactionsService {
       posted,
       sourceModule,
     );
-    return this.normalize(result.rows[0]);
+    const withReceipt = await this.attachReceipt(
+      client,
+      userId,
+      result.rows[0].id,
+      dto.receipt_id,
+    );
+    return this.normalize(withReceipt || result.rows[0]);
   }
 
   async findAll(userId: string) {
@@ -826,6 +832,46 @@ export class TransactionsService {
        WHERE id = $2 AND user_id = $3`,
       [delta, containerId, userId],
     );
+  }
+
+  private async attachReceipt(
+    client: PoolClient,
+    userId: string,
+    transactionId: string,
+    receiptId?: string,
+  ) {
+    if (!receiptId) return null;
+    const linked = await client.query(
+      `UPDATE receipts
+       SET ledger_transaction_id = $1, updated_at = NOW()
+       WHERE id = $2 AND user_id = $3
+       RETURNING id, file_path, mime_type`,
+      [transactionId, receiptId, userId],
+    );
+    if (!linked.rowCount) return null;
+    const file = linked.rows[0];
+    const media = await client.query(
+      `SELECT public_token FROM stored_files
+       WHERE object_key = $1 AND user_id = $2`,
+      [file.file_path, userId],
+    );
+    const token = media.rows[0]?.public_token as string | undefined;
+    const updated = await client.query(
+      `UPDATE ledger_transactions
+       SET receipt_id = $2,
+           receipt_url = $3,
+           receipt_mime = $4
+       WHERE id = $1 AND user_id = $5
+       RETURNING *`,
+      [
+        transactionId,
+        file.id,
+        token ? `/api/media/${token}` : null,
+        file.mime_type || null,
+        userId,
+      ],
+    );
+    return updated.rows[0] || null;
   }
 
   private normalize(row: Record<string, any>): Record<string, any> {

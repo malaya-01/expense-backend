@@ -27,6 +27,7 @@ import {
   UpdateProfileDto,
 } from './dto/update-profile.dto';
 import { UpdateThemePreferencesDto } from './dto/theme-preferences.dto';
+import { SaveFaceLoginDto } from './dto/face-login.dto';
 import { errorResponse, successResponse } from 'src/utils/response/response';
 import { RequirePermissions } from 'src/helper/decorators/permissions.decorator';
 
@@ -243,6 +244,65 @@ export class UserController {
       return res
         .status(statusCode)
         .send(errorResponse(error.message || 'Failed to change password', statusCode));
+    }
+  }
+
+  @Get('face-login')
+  @ApiOperation({ summary: 'Whether face login is saved for this account' })
+  async getFaceLogin(@Req() req: Request, @Res() res: Response) {
+    try {
+      const data = await this.userService.getFaceLogin(
+        (req as any).user.id as string,
+      );
+      return res.status(HttpStatus.OK).send(successResponse(data, 'Face login'));
+    } catch (error) {
+      const statusCode = error.status || error.statusCode || HttpStatus.BAD_REQUEST;
+      return res
+        .status(statusCode)
+        .send(errorResponse(error.message || 'Could not read face login', statusCode));
+    }
+  }
+
+  @Put('face-login')
+  @ApiOperation({ summary: 'Save face login in cloud storage' })
+  @RequirePermissions('settings.update')
+  async saveFaceLogin(
+    @Req() req: Request,
+    @Body() dto: SaveFaceLoginDto,
+    @Res() res: Response,
+  ) {
+    try {
+      const data = await this.userService.saveFaceLogin(
+        (req as any).user.id as string,
+        dto,
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Face login saved'));
+    } catch (error) {
+      const statusCode = error.status || error.statusCode || HttpStatus.BAD_REQUEST;
+      return res
+        .status(statusCode)
+        .send(errorResponse(error.message || 'Could not save face login', statusCode));
+    }
+  }
+
+  @Delete('face-login')
+  @ApiOperation({ summary: 'Remove face login from cloud storage' })
+  @RequirePermissions('settings.update')
+  async deleteFaceLogin(@Req() req: Request, @Res() res: Response) {
+    try {
+      const data = await this.userService.deleteFaceLogin(
+        (req as any).user.id as string,
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Face login removed'));
+    } catch (error) {
+      const statusCode = error.status || error.statusCode || HttpStatus.BAD_REQUEST;
+      return res
+        .status(statusCode)
+        .send(errorResponse(error.message || 'Could not remove face login', statusCode));
     }
   }
 }

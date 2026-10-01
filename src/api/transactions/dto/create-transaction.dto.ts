@@ -130,4 +130,11 @@ export class CreateTransactionDto {
   @IsOptional()
   @IsDateString()
   paid_at?: string;
+
+  @ApiPropertyOptional({
+    description: 'Scanned receipt already stored for this transaction.',
+  })
+  @IsOptional()
+  @IsUUID()
+  receipt_id?: string;
 }

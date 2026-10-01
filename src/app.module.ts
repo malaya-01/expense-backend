@@ -6,6 +6,7 @@ import { CacheModule } from '@nestjs/cache-manager';
 import { createKeyv } from '@keyv/redis';
 import appConfiguration from './app.configuration';
 import { DatabaseModule } from './database/database.module';
+import { StorageModule } from './storage/storage.module';
 import { AuthModule } from './api/auth/auth.module';
 import { UserModule } from './api/user/user.module';
 import { ThrottleConfigModule } from './throttle/throttle.module';
@@ -50,6 +51,7 @@ import { PermissionsGuard } from './helper/guards/permissions.guard';
       },
     }),
     DatabaseModule,
+    StorageModule,
     AuthModule,
     UserModule,
     ThrottleConfigModule,

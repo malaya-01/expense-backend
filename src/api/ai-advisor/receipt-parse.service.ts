@@ -7,6 +7,7 @@ import { AiOmnirouteUsageService } from './ai-omniroute-usage.service';
 import { trySequentialVisionChat } from './providers/omniroute.adapter';
 import { ChatMessage } from './providers/types';
 import { matchExpenseSource, rankAccountMatches } from './match-container';
+import { ObjectStorageService } from 'src/storage/object-storage.service';
 import type { ReceiptAccountHint } from './match-container';
 
 export type ReceiptTransactionType = 'expense' | 'income' | 'transfer';
@@ -40,7 +41,9 @@ export type ReceiptExtractedFields = {
 
 export type ReceiptParseResult = {
   ok: boolean;
-  stored: false;
+  stored: boolean;
+  receipt_id?: string | null;
+  receipt_url?: string | null;
   warning?: string;
   blocked_reason?: 'failed_payment' | 'pending_payment';
   used_provider: string | null;
@@ -405,14 +408,27 @@ export class ReceiptParseService {
     private readonly categories: CategoriesService,
     private readonly accounts: AccountsService,
     private readonly omnirouteUsage: AiOmnirouteUsageService,
+    private readonly storage: ObjectStorageService,
   ) {}
 
   async parse(userId: string, dto: ParseReceiptDto): Promise<ReceiptParseResult> {
     const mime = dto.mime_type === 'image/jpg' ? 'image/jpeg' : dto.mime_type;
+    const saved = await this.persistReceipt(userId, dto, mime);
+    const finish = (result: ReceiptParseResult): ReceiptParseResult =>
+      saved
+        ? {
+            ...result,
+            stored: true,
+            receipt_id: saved.id,
+            receipt_url: saved.url,
+          }
+        : result;
     const quota = await this.omnirouteUsage.getUsage(userId);
     if (quota.remaining <= 0) {
-      return emptyResult(
-        'Daily free AI limit reached. Fill the transaction from the receipt yourself — nothing was stored.',
+      return finish(
+        emptyResult(
+          'Daily free AI limit reached. Fill the transaction from the receipt yourself. The scan image was saved.',
+        ),
       );
     }
 
@@ -493,11 +509,11 @@ export class ReceiptParseService {
         .map((item) => item.replace(/key[=:][^\s]+/gi, 'key=***'))
         .slice(0, 2)
         .join(' · ');
-      return emptyResult(
+      return finish(emptyResult(
         hint
-          ? `Could not read this receipt (${hint}). Fill the form manually — the file was not saved.`
-          : 'Could not read this receipt with free AI or Gemini. Fill the form manually — the file was not saved.',
-      );
+          ? `Could not read this receipt (${hint}). Fill the form manually. The scan image was saved.`
+          : 'Could not read this receipt with free AI or Gemini. Fill the form manually. The scan image was saved.',
+      ));
     }
 
     await this.omnirouteUsage.recordSuccessfulRequest(userId).catch(() => undefined);
@@ -506,27 +522,27 @@ export class ReceiptParseService {
     const status = extracted.payment_status;
     if (status === 'failed') {
       const source = describeVisionSource(vision.model);
-      return emptyResult(
-        'This looks like a failed payment. It was not added as a transaction — nothing was stored.',
+      return finish(emptyResult(
+        'This looks like a failed payment. It was not added as a transaction. The scan image was saved.',
         {
           blocked_reason: 'failed_payment',
           used_provider: source.provider,
           used_model: source.model,
           extracted,
         },
-      );
+      ));
     }
     if (status === 'pending') {
       const source = describeVisionSource(vision.model);
-      return emptyResult(
-        'This payment is still pending. Wait for success before adding it — nothing was stored.',
+      return finish(emptyResult(
+        'This payment is still pending. Wait for success before adding it. The scan image was saved.',
         {
           blocked_reason: 'pending_payment',
           used_provider: source.provider,
           used_model: source.model,
           extracted,
         },
-      );
+      ));
     }
 
     const resolved = this.resolveTransferAccounts(containers, extracted);
@@ -546,9 +562,9 @@ export class ReceiptParseService {
         extracted.merchant ||
         extracted.transaction_type === 'transfer',
     );
-    return {
+    return finish({
       ok: hasCore,
-      stored: false,
+      stored: Boolean(saved),
       warning: hasCore
         ? resolved.warning
         : 'AI ran but could not find a merchant or amount. Review the form before saving.',
@@ -559,7 +575,41 @@ export class ReceiptParseService {
       source_container_id: resolved.sourceId,
       destination_container_id: resolved.destinationId,
       extracted,
-    };
+    });
+  }
+
+  private async persistReceipt(
+    userId: string,
+    dto: ParseReceiptDto,
+    mime: string,
+  ): Promise<{ id: string; url: string } | null> {
+    try {
+      const body = Buffer.from(dto.data_base64 || '', 'base64');
+      if (!body.length || body.length > 8 * 1024 * 1024) return null;
+      const saved = await this.storage.saveFile({
+        userId,
+        kind: 'receipt',
+        body,
+        mimeType: mime || 'image/jpeg',
+        filename: dto.name,
+      });
+      const inserted = await this.pgPool.query(
+        `INSERT INTO receipts
+          (user_id, original_filename, file_path, file_size, mime_type, processing_status)
+         VALUES ($1, $2, $3, $4, $5, 'stored')
+         RETURNING id`,
+        [
+          userId,
+          (dto.name || 'receipt').slice(0, 255),
+          saved.objectKey,
+          body.length,
+          mime || 'image/jpeg',
+        ],
+      );
+      return { id: inserted.rows[0].id as string, url: saved.publicPath };
+    } catch {
+      return null;
+    }
   }
 
   /**
