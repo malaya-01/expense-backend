@@ -552,7 +552,8 @@ export class AuthService {
     const probe = assertDescriptor(dto.descriptor);
     const profiles = await this.pgPool.query(
       `SELECT u.id, u.email, u.full_name, u.country, u.currency, u.timezone, u.locale,
-              u.avatar_url, u.email_verified, u.locked_until, u.deleted_at, p.object_key
+              u.avatar_url, u.email_verified, u.locked_until, u.deleted_at,
+              p.object_key, p.template
        FROM face_login_profiles p
        JOIN users u ON u.id = p.user_id
        WHERE u.deleted_at IS NULL`,
@@ -561,8 +562,7 @@ export class AuthService {
     let best: { user: (typeof profiles.rows)[number]; distance: number } | null = null;
     let second = 1;
     for (const row of profiles.rows) {
-      const stored = await this.storage.getJson(row.object_key as string);
-      const descriptor = decryptFaceTemplate(stored);
+      const descriptor = await this.readFaceDescriptor(row);
       if (!descriptor) continue;
       const distance = faceDistance(probe, descriptor);
       if (!best || distance < best.distance) {
@@ -600,6 +600,22 @@ export class AuthService {
     } finally {
       client.release();
       await this.userService.syncUsersToCache();
+    }
+  }
+
+  private async readFaceDescriptor(row: {
+    object_key?: string;
+    template?: unknown;
+  }): Promise<number[] | null> {
+    const fromAccount = decryptFaceTemplate(row.template);
+    if (fromAccount) return fromAccount;
+    const objectKey = String(row.object_key || '');
+    if (!objectKey || objectKey.startsWith('inline:')) return null;
+    try {
+      const stored = await this.storage.getJson(objectKey);
+      return decryptFaceTemplate(stored);
+    } catch {
+      return null;
     }
   }
 

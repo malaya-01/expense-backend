@@ -296,8 +296,14 @@ export class UserService {
     const user = await this.findOne(userId);
     if (!user) throw new NotFoundException('User not found');
     const descriptor = assertDescriptor(dto.descriptor);
-    const objectKey = `face-login/${userId}/profile.json`;
-    await this.storage.putJson(objectKey, encryptFaceTemplate(descriptor));
+    const envelope = encryptFaceTemplate(descriptor);
+    let objectKey = `inline:${userId}`;
+    try {
+      objectKey = `face-login/${userId}/profile.json`;
+      await this.storage.putJson(objectKey, envelope);
+    } catch {
+      objectKey = `inline:${userId}`;
+    }
 
     const existing = await this.pgPool.query(
       `SELECT preview_token FROM face_login_profiles WHERE user_id = $1`,
@@ -309,14 +315,15 @@ export class UserService {
     }
 
     await this.pgPool.query(
-      `INSERT INTO face_login_profiles (user_id, email, object_key, preview_token, updated_at)
-       VALUES ($1, $2, $3, NULL, NOW())
+      `INSERT INTO face_login_profiles (user_id, email, object_key, preview_token, template, updated_at)
+       VALUES ($1, $2, $3, NULL, $4::jsonb, NOW())
        ON CONFLICT (user_id) DO UPDATE SET
          email = EXCLUDED.email,
          object_key = EXCLUDED.object_key,
          preview_token = NULL,
+         template = EXCLUDED.template,
          updated_at = NOW()`,
-      [userId, user.email, objectKey],
+      [userId, user.email, objectKey, JSON.stringify(envelope)],
     );
     return this.getFaceLogin(userId);
   }
@@ -328,10 +335,13 @@ export class UserService {
     );
     if (existing.rowCount) {
       const row = existing.rows[0];
-      try {
-        await this.storage.deleteKey(row.object_key as string);
-      } catch {
-        /* already removed */
+      const objectKey = String(row.object_key || '');
+      if (objectKey && !objectKey.startsWith('inline:')) {
+        try {
+          await this.storage.deleteKey(objectKey);
+        } catch {
+          /* already removed */
+        }
       }
       if (row.preview_token) {
         await this.storage.deletePublicPath(`/api/media/${row.preview_token}`);
