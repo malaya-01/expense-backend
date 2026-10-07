@@ -293,6 +293,68 @@ function cleanDescription(description: string | null, merchant: string | null) {
   return description;
 }
 
+function descriptionIsWeak(
+  description: string | null,
+  merchant: string | null,
+): boolean {
+  const text = (description || '').trim();
+  if (!text) return true;
+  const merchantName = (merchant || '').trim();
+  if (merchantName && normalizeName(text) === normalizeName(merchantName)) {
+    return true;
+  }
+  if (
+    /^(self|payment|upi|paid|sent|transfer|money sent|successful|payment successful)$/i.test(
+      text,
+    )
+  ) {
+    return true;
+  }
+  return /^(paid|sent|payment|transfer)\s+(to|from)\b/i.test(text);
+}
+
+function noteIsOnlyReference(note: string): boolean {
+  const text = note.trim();
+  return (
+    /^(upi|utr|txn|ref|rrn|transaction id)\b/i.test(text) ||
+    /^[A-Z0-9-]{12,}$/i.test(text)
+  );
+}
+
+function categoryFromNote(note: string, names: string[]): string | null {
+  const ranked = [...names]
+    .filter((name) => normalizeName(name).length >= 4)
+    .sort((a, b) => b.length - a.length);
+  for (const name of ranked) {
+    const escaped = name.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, 'i');
+    if (pattern.test(note)) return name;
+  }
+  return null;
+}
+
+/**
+ * GPay / PhonePe / Paytm "Note" is the user's own purpose. Use it for the
+ * description and category when the receipt itself only shows a payee.
+ */
+function applyNoteInsights(
+  fields: ReceiptExtractedFields,
+  categoryNames: string[],
+): ReceiptExtractedFields {
+  const note = fields.notes?.trim() || null;
+  if (!note || noteIsOnlyReference(note)) return fields;
+  const category = fields.category_name || categoryFromNote(note, categoryNames);
+  const description = descriptionIsWeak(fields.description, fields.merchant)
+    ? note
+    : fields.description;
+  return {
+    ...fields,
+    notes: note,
+    category_name: category,
+    description,
+  };
+}
+
 function joinHaystack(parts: Array<string | null | undefined>): string {
   return parts.filter(Boolean).join(' · ');
 }
@@ -479,7 +541,15 @@ export class ReceiptParseService {
           'upi_txn_id is the UPI transaction ID. platform_txn_id is the app id (Google transaction ID, PhonePe UTR, Paytm order id). They are different.',
           'platform is the app: Google Pay, PhonePe, Paytm, BHIM, bank PDF, etc.',
           'account_label / destination_account_label are the bank/account strings exactly as shown (e.g. "Karur Vysya Bank 2324").',
-          'notes is any remark/message on the screenshot, else null.',
+          'NOTES — Google Pay, PhonePe, and Paytm have a Note / Message / Remarks written by the sender. Read it. It is often the only explanation of the payment.',
+          '  The note can mean different things. Decide from the words, do not leave it as a raw dump when it clearly fills another field:',
+          '  - What was bought or why: "headphones", "dinner", "rent for March", "medicines" → description is that purpose. merchant stays the payee on the receipt.',
+          '  - Who it was really for: "paid back to Rahul for the shoes he bought me", "for mom", "splitting cab with Priya" → description states that. This is still an expense to the payee, not a self-transfer, unless the payee is the user\'s own account.',
+          '  - A category: if the note names or clearly means one of the user categories below (groceries, travel, rent, food, repayment, and so on) → set category_name to that category.',
+          '  - Mixed: one note can set description AND category. Example note "groceries for the week" → description "Groceries for the week", category_name the groceries category if one exists.',
+          '  - Always copy the note text itself into notes, even after you used it for description or category. notes is null only when no note is visible.',
+          '  - Do not put UPI ids, bank names, or the payee name into notes.',
+          '  - If there is no note, description can fall back to the payee or bill purpose shown on the receipt.',
           'container_name / destination_container_name must be one of these user accounts when it matches, else null:',
           containerNames.slice(0, 40).join(', ') || '(none)',
           'category_name must be one of these user categories when it reasonably matches, else null. Prefer "Transfers" for self-transfers:',
@@ -489,7 +559,7 @@ export class ReceiptParseService {
       {
         role: 'user',
         content:
-          'Extract JSON keys: merchant, description, amount, currency, date, time, payment_method, payment_status, transaction_type, upi_vpa, upi_txn_id, platform, platform_txn_id, notes, category_name, container_name, bank_name, account_last4, account_label, destination_container_name, destination_bank_name, destination_account_last4, destination_account_label. If this is a self/bank-to-bank transfer, set transaction_type to transfer and fill both source and destination account fields.',
+          'Extract JSON keys: merchant, description, amount, currency, date, time, payment_method, payment_status, transaction_type, upi_vpa, upi_txn_id, platform, platform_txn_id, notes, category_name, container_name, bank_name, account_last4, account_label, destination_container_name, destination_bank_name, destination_account_last4, destination_account_label. If this is a self/bank-to-bank transfer, set transaction_type to transfer and fill both source and destination account fields. If a Note, Message, or Remarks line is visible, use it for description and category_name when it explains the payment, and still copy that text into notes.',
         attachments: [
           {
             name: dto.name || 'receipt',
@@ -518,7 +588,10 @@ export class ReceiptParseService {
 
     await this.omnirouteUsage.recordSuccessfulRequest(userId).catch(() => undefined);
 
-    const extracted = this.parseModelJson(vision.content, userFullName);
+    const extracted = applyNoteInsights(
+      this.parseModelJson(vision.content, userFullName),
+      categoryNames,
+    );
     const status = extracted.payment_status;
     if (status === 'failed') {
       const source = describeVisionSource(vision.model);

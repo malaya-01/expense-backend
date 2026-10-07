@@ -11,7 +11,7 @@ import {
 } from '@nestjs/common';
 import { LoginAuthDto, PasswordResetDto, RegisterAuthDto } from './dto/create-auth.dto';
 // import { UpdateAuthDto } from './dto/update-auth.dto';
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 import * as bcrypt from 'bcrypt';
 import { OtpGenerateDto } from './dto/generat-otp.dto';
 import { Cache } from 'cache-manager';
@@ -36,6 +36,14 @@ import {
   shouldOfferInlineRecoveryCode,
 } from 'src/utils/mail/mail.util';
 import { buildAppPathUrl } from 'src/utils/url/public-app-url';
+import { ObjectStorageService } from 'src/storage/object-storage.service';
+import { MatchFaceLoginDto } from '../user/dto/face-login.dto';
+import {
+  assertDescriptor,
+  decryptFaceTemplate,
+  faceDistance,
+  faceMatchDistance,
+} from 'src/storage/face-template.crypto';
 
 const EMAIL_VERIFY_TTL_MS = 60 * 60 * 1000; // 1 hour
 const EMAIL_VERIFY_TTL_HOURS = 1;
@@ -86,6 +94,7 @@ export class AuthService {
     private readonly userService: UserService,
     private readonly categoriesService: CategoriesService,
     private readonly permissionsService: PermissionsService,
+    private readonly storage: ObjectStorageService,
   ) { }
 
 
@@ -518,98 +527,7 @@ export class AuthService {
         );
       }
 
-      // Reset failed attempts
-      await client.query(
-        `
-      UPDATE users
-      SET failed_login_attempts = 0,
-          locked_until = NULL,
-          last_login_at = NOW()
-      WHERE id = $1
-      `,
-        [user.id]
-      );
-
-      // Create tokens
-      const accessToken = await this.jwtService.signAsync(
-        {
-          sub: user.id,
-          email: user.email,
-        },
-        {
-          expiresIn: '15m',
-          secret:
-            process.env.JWT_ACCESS_SECRET ||
-            process.env.JWT_SECRET ||
-            appConfiguration().JWT.SECRET,
-        },
-      );
-
-      const refreshToken = await this.jwtService.signAsync(
-        {
-          sub: user.id,
-        },
-        {
-          expiresIn: '7d',
-          secret:
-            process.env.JWT_REFRESH_SECRET ||
-            process.env.JWT_SECRET ||
-            appConfiguration().JWT.REFRESH_SECRET,
-        },
-      );
-
-      const refreshTokenHash = await bcrypt.hash(refreshToken, 10);
-
-      const sessionToken = randomUUID();
-      const clientHeader =
-        req.headers['x-opal-client'] ?? req.headers['x-finos-client'];
-      const clientPlatform =
-        (typeof clientHeader === 'string'
-          ? clientHeader
-          : Array.isArray(clientHeader)
-            ? clientHeader[0]
-            : '') || '';
-      const rawUa = req.headers['user-agent'] || null;
-      const userAgent = clientPlatform
-        ? `[opal:${clientPlatform}] ${rawUa || ''}`.trim()
-        : rawUa;
-
-      // Store session
-      await client.query(
-        `
-      INSERT INTO user_sessions 
-      (user_id, session_token, refresh_token, user_agent, ip_address, expires_at)
-      VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '7 days')
-      `,
-        [
-          user.id,
-          sessionToken,
-          refreshTokenHash,
-          userAgent,
-          req.ip,
-        ],
-      );
-
-      await client.query('COMMIT');
-
-      const access = await this.permissionsService.mePayload(user.id);
-
-      return {
-        accessToken,
-        refreshToken,
-        user: {
-          id: user.id,
-          email: user.email,
-          full_name: user.full_name,
-          country: user.country,
-          currency: user.currency || 'USD',
-          timezone: user.timezone,
-          locale: user.locale,
-          avatar_url: user.avatar_url || null,
-          is_admin: access.is_admin,
-          permissions: access.permissions,
-        },
-      };
+      return await this.issueSession(client, user, req);
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
@@ -617,6 +535,143 @@ export class AuthService {
       client.release();
       await this.userService.syncUsersToCache()
     }
+  }
+
+  async faceLoginAvailable() {
+    const result = await this.pgPool.query(
+      `SELECT 1
+       FROM face_login_profiles p
+       JOIN users u ON u.id = p.user_id
+       WHERE u.deleted_at IS NULL
+       LIMIT 1`,
+    );
+    return { enabled: Boolean(result.rowCount) };
+  }
+
+  async loginWithFace(dto: MatchFaceLoginDto, req: Request) {
+    const probe = assertDescriptor(dto.descriptor);
+    const profiles = await this.pgPool.query(
+      `SELECT u.id, u.email, u.full_name, u.country, u.currency, u.timezone, u.locale,
+              u.avatar_url, u.email_verified, u.locked_until, u.deleted_at, p.object_key
+       FROM face_login_profiles p
+       JOIN users u ON u.id = p.user_id
+       WHERE u.deleted_at IS NULL`,
+    );
+
+    let best: { user: (typeof profiles.rows)[number]; distance: number } | null = null;
+    let second = 1;
+    for (const row of profiles.rows) {
+      const stored = await this.storage.getJson(row.object_key as string);
+      const descriptor = decryptFaceTemplate(stored);
+      if (!descriptor) continue;
+      const distance = faceDistance(probe, descriptor);
+      if (!best || distance < best.distance) {
+        if (best) second = Math.min(second, best.distance);
+        best = { user: row, distance };
+      } else if (distance < second) {
+        second = distance;
+      }
+    }
+
+    const matched =
+      best &&
+      best.distance <= faceMatchDistance() &&
+      second - best.distance >= 0.08;
+    if (!matched || !best) {
+      throw new UnauthorizedException('Face not recognized');
+    }
+
+    if (best.user.locked_until && new Date(best.user.locked_until) > new Date()) {
+      throw new AccountLockedException(new Date(best.user.locked_until));
+    }
+    if (REQUIRE_EMAIL_VERIFICATION && !best.user.email_verified) {
+      throw new ForbiddenException(
+        'EMAIL_NOT_VERIFIED: Please verify your email before signing in.',
+      );
+    }
+
+    const client = await this.pgPool.connect();
+    try {
+      await client.query('BEGIN');
+      return await this.issueSession(client, best.user, req);
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+      await this.userService.syncUsersToCache();
+    }
+  }
+
+  private async issueSession(client: PoolClient, user: any, req: Request) {
+    await client.query(
+      `UPDATE users
+       SET failed_login_attempts = 0,
+           locked_until = NULL,
+           last_login_at = NOW()
+       WHERE id = $1`,
+      [user.id],
+    );
+
+    const accessToken = await this.jwtService.signAsync(
+      { sub: user.id, email: user.email },
+      {
+        expiresIn: '15m',
+        secret:
+          process.env.JWT_ACCESS_SECRET ||
+          process.env.JWT_SECRET ||
+          appConfiguration().JWT.SECRET,
+      },
+    );
+    const refreshToken = await this.jwtService.signAsync(
+      { sub: user.id },
+      {
+        expiresIn: '7d',
+        secret:
+          process.env.JWT_REFRESH_SECRET ||
+          process.env.JWT_SECRET ||
+          appConfiguration().JWT.REFRESH_SECRET,
+      },
+    );
+    const refreshTokenHash = await bcrypt.hash(refreshToken, 10);
+    const clientHeader =
+      req.headers['x-opal-client'] ?? req.headers['x-finos-client'];
+    const clientPlatform =
+      (typeof clientHeader === 'string'
+        ? clientHeader
+        : Array.isArray(clientHeader)
+          ? clientHeader[0]
+          : '') || '';
+    const rawUa = req.headers['user-agent'] || null;
+    const userAgent = clientPlatform
+      ? `[opal:${clientPlatform}] ${rawUa || ''}`.trim()
+      : rawUa;
+
+    await client.query(
+      `INSERT INTO user_sessions
+        (user_id, session_token, refresh_token, user_agent, ip_address, expires_at)
+       VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '7 days')`,
+      [user.id, randomUUID(), refreshTokenHash, userAgent, req.ip],
+    );
+    await client.query('COMMIT');
+
+    const access = await this.permissionsService.mePayload(user.id);
+    return {
+      accessToken,
+      refreshToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        full_name: user.full_name,
+        country: user.country,
+        currency: user.currency || 'USD',
+        timezone: user.timezone,
+        locale: user.locale,
+        avatar_url: user.avatar_url || null,
+        is_admin: access.is_admin,
+        permissions: access.permissions,
+      },
+    };
   }
 
   async refreshToken(req: Request, res: Response) {

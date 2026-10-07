@@ -23,6 +23,10 @@ import {
 } from './avatar-storage';
 import { ObjectStorageService } from 'src/storage/object-storage.service';
 import { SaveFaceLoginDto } from './dto/face-login.dto';
+import {
+  assertDescriptor,
+  encryptFaceTemplate,
+} from 'src/storage/face-template.crypto';
 
 @Injectable()
 export class UserService {
@@ -276,65 +280,43 @@ export class UserService {
 
   async getFaceLogin(userId: string) {
     const result = await this.pgPool.query(
-      `SELECT email, preview_token FROM face_login_profiles WHERE user_id = $1`,
+      `SELECT email FROM face_login_profiles WHERE user_id = $1`,
       [userId],
     );
     if (!result.rowCount) {
-      return { enabled: false, email: null, preview_url: null };
+      return { enabled: false, email: null };
     }
-    const row = result.rows[0];
     return {
       enabled: true,
-      email: row.email as string,
-      preview_url: row.preview_token
-        ? `/api/media/${row.preview_token}`
-        : null,
+      email: result.rows[0].email as string,
     };
   }
 
   async saveFaceLogin(userId: string, dto: SaveFaceLoginDto) {
     const user = await this.findOne(userId);
     if (!user) throw new NotFoundException('User not found');
+    const descriptor = assertDescriptor(dto.descriptor);
     const objectKey = `face-login/${userId}/profile.json`;
-    await this.storage.putJson(objectKey, {
-      userId,
-      email: user.email,
-      descriptor: dto.descriptor,
-      enrolledAt: new Date().toISOString(),
-    });
+    await this.storage.putJson(objectKey, encryptFaceTemplate(descriptor));
 
     const existing = await this.pgPool.query(
       `SELECT preview_token FROM face_login_profiles WHERE user_id = $1`,
       [userId],
     );
-    let previewToken = (existing.rows[0]?.preview_token as string | null) || null;
-    if (dto.preview_base64) {
-      const raw = dto.preview_base64.replace(/^data:image\/\w+;base64,/, '');
-      const body = Buffer.from(raw, 'base64');
-      if (body.length > 0 && body.length <= 1_500_000) {
-        if (previewToken) {
-          await this.storage.deletePublicPath(`/api/media/${previewToken}`);
-        }
-        const saved = await this.storage.saveFile({
-          userId,
-          kind: 'face_preview',
-          body,
-          mimeType: 'image/jpeg',
-          filename: 'face-preview.jpg',
-        });
-        previewToken = saved.token;
-      }
+    const previewToken = existing.rows[0]?.preview_token as string | undefined;
+    if (previewToken) {
+      await this.storage.deletePublicPath(`/api/media/${previewToken}`);
     }
 
     await this.pgPool.query(
       `INSERT INTO face_login_profiles (user_id, email, object_key, preview_token, updated_at)
-       VALUES ($1, $2, $3, $4, NOW())
+       VALUES ($1, $2, $3, NULL, NOW())
        ON CONFLICT (user_id) DO UPDATE SET
          email = EXCLUDED.email,
          object_key = EXCLUDED.object_key,
-         preview_token = EXCLUDED.preview_token,
+         preview_token = NULL,
          updated_at = NOW()`,
-      [userId, user.email, objectKey, previewToken],
+      [userId, user.email, objectKey],
     );
     return this.getFaceLogin(userId);
   }
