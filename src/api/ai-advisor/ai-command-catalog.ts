@@ -178,7 +178,7 @@ export const AI_SLASH_COMMANDS: AiSlashCommandDef[] = [
     label: 'Log a receipt',
     description: 'OCR extract → confirm transaction',
     prompt:
-      'I will attach a receipt, bill, or statement image/PDF. Use OCR-style extraction: merchant, date, line items, total amount, currency, tax, and payment method if visible. Match or propose create_category when needed. Then propose create_transaction with every field you can fill from the document and my twin (accounts + categories). If the paying account/container (source_container_id for expenses) or destination is not in the document, list my accounts and ask which one to use before proposing — do not invent container IDs. Ask only for missing required fields.',
+      'I will attach a receipt, bill, or statement image/PDF. Read the merchant (brand name), date, the grand total / amount paid (not a subtotal or tax line — check that subtotal + taxes − discounts ≈ total), currency, tax breakdown, payment method and line items. Pick the closest of my existing categories. Then propose create_transaction with a clean description (e.g. "Groceries at DMart") and every field you can fill from the document and my twin (accounts + categories). If it is a bill payment between my own accounts (e.g. credit card bill), propose a transfer. If the paying account is not clear from the document, list my matching accounts and ask which one to use before proposing — never invent IDs. Ask only for missing required fields.',
     tools: ['list_accounts', 'list_categories'],
   },
   {

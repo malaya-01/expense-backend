@@ -9,6 +9,7 @@ import {
 } from './types';
 import { providerHttpException } from './provider-errors';
 import { normalizeOpenAiCompatibleUrl } from './url-guard';
+import { isTruncationReason } from './continuation';
 
 type CompatibleProviderId = 'openai' | 'local' | 'openrouter';
 
@@ -44,6 +45,18 @@ function throwProviderFailure(
 ): never {
   const combined = [payload.code, payload.message].filter(Boolean).join(' — ');
   throw providerHttpException(provider, res.status, combined);
+}
+
+/** Non-streaming calls get a hard ceiling so a stalled upstream cannot hang a request. */
+const REQUEST_TIMEOUT_MS = 120_000;
+
+/**
+ * OpenAI reasoning models (o1/o3/o4…, gpt-5*) reject `max_tokens` and any
+ * non-default `temperature`; they take `max_completion_tokens` instead.
+ */
+function isReasoningModel(model: string): boolean {
+  const id = String(model || '').toLowerCase().replace(/^.*\//, '');
+  return /^(o\d|gpt-5)/.test(id);
 }
 
 export class OpenAiCompatibleAdapter implements AiProviderAdapter {
@@ -115,19 +128,31 @@ export class OpenAiCompatibleAdapter implements AiProviderAdapter {
     });
   }
 
+  private samplingParams(model: string, request: ProviderChatRequest) {
+    const maxTokens = request.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+    if (isReasoningModel(model)) {
+      return { max_completion_tokens: maxTokens };
+    }
+    return {
+      temperature: request.temperature ?? 0.3,
+      max_tokens: maxTokens,
+    };
+  }
+
   async chat(
     config: ProviderConfig,
     request: ProviderChatRequest,
   ): Promise<ProviderChatResult> {
     const base = this.resolveUrl(config);
+    const model = request.model || config.model;
     const res = await fetch(`${base}/chat/completions`, {
       method: 'POST',
       headers: this.authHeaders(config),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       body: JSON.stringify({
-        model: request.model || config.model,
+        model,
         messages: this.messages(request),
-        temperature: request.temperature ?? 0.3,
-        max_tokens: request.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+        ...this.samplingParams(model, request),
       }),
     });
 
@@ -136,13 +161,20 @@ export class OpenAiCompatibleAdapter implements AiProviderAdapter {
     }
     const data = await res.json();
     const content = data?.choices?.[0]?.message?.content;
+    const finishReason = data?.choices?.[0]?.finish_reason;
     if (!content) {
-      throw new BadRequestException('Provider returned an empty response.');
+      throw new BadRequestException(
+        isTruncationReason(finishReason)
+          ? 'Provider hit the output token limit before replying.'
+          : 'Provider returned an empty response.',
+      );
     }
     return {
       content: String(content),
       model: data?.model || request.model || config.model,
       provider: this.id,
+      finish_reason: finishReason ? String(finishReason) : undefined,
+      truncated: isTruncationReason(finishReason),
       usage: {
         input_tokens: data?.usage?.prompt_tokens,
         output_tokens: data?.usage?.completion_tokens,
@@ -156,15 +188,15 @@ export class OpenAiCompatibleAdapter implements AiProviderAdapter {
     signal?: AbortSignal,
   ): AsyncGenerator<string, ProviderChatResult, void> {
     const base = this.resolveUrl(config);
+    const requestModel = request.model || config.model;
     const res = await fetch(`${base}/chat/completions`, {
       method: 'POST',
       headers: this.authHeaders(config),
       signal,
       body: JSON.stringify({
-        model: request.model || config.model,
+        model: requestModel,
         messages: this.messages(request),
-        temperature: request.temperature ?? 0.3,
-        max_tokens: request.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+        ...this.samplingParams(requestModel, request),
         stream: true,
       }),
     });
@@ -180,7 +212,8 @@ export class OpenAiCompatibleAdapter implements AiProviderAdapter {
     const decoder = new TextDecoder();
     let buffer = '';
     let content = '';
-    let model = request.model || config.model;
+    let model = requestModel;
+    let finishReason = '';
 
     while (true) {
       const { done, value } = await reader.read();
@@ -193,27 +226,43 @@ export class OpenAiCompatibleAdapter implements AiProviderAdapter {
         if (!line.startsWith('data:')) continue;
         const payload = line.slice(5).trim();
         if (!payload || payload === '[DONE]') continue;
+        let json: any;
         try {
-          const json = JSON.parse(payload);
-          if (json?.model) model = String(json.model);
-          const delta = json?.choices?.[0]?.delta?.content;
-          if (delta) {
-            content += delta;
-            yield String(delta);
-          }
+          json = JSON.parse(payload);
         } catch {
-          /* ignore partial JSON */
+          continue; /* ignore partial JSON */
+        }
+        if (json?.error) {
+          // OpenRouter / OpenAI report mid-stream failures as an error frame.
+          const message =
+            (typeof json.error === 'string' ? json.error : json.error?.message) ||
+            'stream error';
+          throw new BadRequestException(`Provider error (${this.id}): ${message}`);
+        }
+        if (json?.model) model = String(json.model);
+        const reason = json?.choices?.[0]?.finish_reason;
+        if (reason) finishReason = String(reason);
+        const delta = json?.choices?.[0]?.delta?.content;
+        if (delta) {
+          content += delta;
+          yield String(delta);
         }
       }
     }
 
     if (!content) {
-      throw new BadRequestException('Provider returned an empty response.');
+      throw new BadRequestException(
+        isTruncationReason(finishReason)
+          ? 'Provider hit the output token limit before replying.'
+          : 'Provider returned an empty response.',
+      );
     }
     return {
       content,
       model,
       provider: this.id,
+      finish_reason: finishReason || undefined,
+      truncated: isTruncationReason(finishReason),
     };
   }
 
@@ -227,7 +276,8 @@ export class OpenAiCompatibleAdapter implements AiProviderAdapter {
             content: 'Reply with exactly: ok',
           },
         ],
-        maxTokens: 16,
+        // Reasoning models spend completion tokens on hidden reasoning first.
+        maxTokens: isReasoningModel(config.model) ? 1024 : 16,
         temperature: 0,
       });
       return {
@@ -248,6 +298,7 @@ export class OpenAiCompatibleAdapter implements AiProviderAdapter {
       const base = this.resolveUrl(config);
       const res = await fetch(`${base}/models`, {
         headers: this.authHeaders(config),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
       if (!res.ok) return [];
       const data = await res.json();

@@ -27,6 +27,41 @@ import {
   buildSeedCategoryProposals,
   wantsCategorySeed,
 } from './default-category-taxonomy';
+import { MAX_CONTINUATIONS } from './providers/continuation';
+import { sanitizeAssistantMarkdown } from './markdown-sanitizer';
+import {
+  ProposalContext,
+  repairReferenceIds,
+  validateTransactionProposal,
+} from './transaction-proposal';
+import { fitJsonToBudget, fitStringList } from './context-budget';
+
+/** Normalised stop reason surfaced to the client on `done`. */
+export type AdvisorFinishReason = 'stop' | 'length' | 'refusal' | 'error';
+
+type ReplyMeta = {
+  truncated: boolean;
+  finish_reason: AdvisorFinishReason;
+  continuations: number;
+};
+
+const TRANSACTION_PROPOSALS = new Set([
+  'create_transaction',
+  'update_transaction',
+  'create_recurring',
+  'update_recurring',
+]);
+
+const REFERENCE_PROPOSALS = new Set([
+  'create_budget',
+  'update_budget',
+  'create_goal',
+  'create_holding',
+  'create_loan',
+  'update_loan',
+  'create_space_expense',
+  'propose_settlement',
+]);
 
 function extractAdvisorErrorMessage(error: unknown): string {
   if (!error) return 'Advisor stream failed';
@@ -82,6 +117,13 @@ export type AiChatStreamEvent =
       tool_activity: Array<{ name: string; status: string; summary: string }>;
       citations: Citation[];
       suggested_questions: string[];
+      /** True only if the reply is still cut after auto-continuation. */
+      truncated: boolean;
+      finish_reason: AdvisorFinishReason;
+      /** Continuation requests stitched into the reply (0 = none needed). */
+      continuations: number;
+      /** Saved text differs from the streamed deltas (mermaid / fence fixes). */
+      content_sanitized: boolean;
     }
   | { type: 'error'; message: string };
 
@@ -523,83 +565,93 @@ export class AiAdvisorService {
     dataBase64: string,
     fallback: ReturnType<AiAdvisorService['analyzeDocumentLocally']>,
   ) {
+    // Errors propagate so finalizeDocumentAnalysis's caller marks the document
+    // 'failed' (with analysis_error) instead of reporting a silent 'ready'.
+    const [{ config }, twin] = await Promise.all([
+      this.settingsService.loadActiveProviderConfig(userId),
+      this.toolsService.gatherContext(userId).catch(() => ({
+        context: {},
+      })),
+    ]);
+    const prompt = [
+      'Analyze this financial document for a contextual sidebar.',
+      'Return ONLY valid JSON with this exact shape:',
+      JSON.stringify({
+        detected_type: 'string',
+        summary: 'concise string, max 500 characters',
+        analysis_confidence: 0,
+        extracted_sections: [{ title: 'string', content: 'string' }],
+        suggested_actions: ['string'],
+        related_accounts: ['string'],
+        related_transactions: [
+          {
+            date: 'YYYY-MM-DD',
+            description: 'string',
+            amount: 0,
+          },
+        ],
+      }),
+      'Use only evidence in the document and supplied financial context.',
+      'Do not invent accounts or transactions. Use empty arrays when uncertain.',
+      `File name: ${name}`,
+      `Financial context: ${
+        fitJsonToBudget(twin.context as Record<string, unknown>, 16000, {
+          protect: ['user', 'accounts'],
+        }).json
+      }`,
+    ].join('\n');
+    const messages: ChatMessage[] = [
+      {
+        role: 'user',
+        content: prompt,
+        attachments: [
+          {
+            name,
+            mimeType,
+            dataBase64,
+          },
+        ],
+      },
+    ];
+    const response = await runProviderChat(config, messages);
+    const match = response.content.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    let parsed: any;
     try {
-      const [{ config }, twin] = await Promise.all([
-        this.settingsService.loadActiveProviderConfig(userId),
-        this.toolsService.gatherContext(userId).catch(() => ({
-          context: {},
-        })),
-      ]);
-      const prompt = [
-        'Analyze this financial document for a contextual sidebar.',
-        'Return ONLY valid JSON with this exact shape:',
-        JSON.stringify({
-          detected_type: 'string',
-          summary: 'concise string, max 500 characters',
-          analysis_confidence: 0,
-          extracted_sections: [{ title: 'string', content: 'string' }],
-          suggested_actions: ['string'],
-          related_accounts: ['string'],
-          related_transactions: [
-            {
-              date: 'YYYY-MM-DD',
-              description: 'string',
-              amount: 0,
-            },
-          ],
-        }),
-        'Use only evidence in the document and supplied financial context.',
-        'Do not invent accounts or transactions. Use empty arrays when uncertain.',
-        `File name: ${name}`,
-        `Financial context: ${JSON.stringify(twin.context).slice(0, 16000)}`,
-      ].join('\n');
-      const messages: ChatMessage[] = [
-        {
-          role: 'user',
-          content: prompt,
-          attachments: [
-            {
-              name,
-              mimeType,
-              dataBase64,
-            },
-          ],
-        },
-      ];
-      const response = await runProviderChat(config, messages);
-      const match = response.content.match(/```(?:json)?\s*([\s\S]*?)```/i);
-      const parsed = JSON.parse((match?.[1] || response.content).trim());
-      return {
-        detected_type:
-          String(parsed.detected_type || fallback.detected_type).slice(0, 80),
-        summary: String(parsed.summary || fallback.summary).slice(0, 2000),
-        analysis_confidence: Math.max(
-          0,
-          Math.min(100, Number(parsed.analysis_confidence) || 0),
-        ),
-        extracted_sections: Array.isArray(parsed.extracted_sections)
-          ? parsed.extracted_sections.slice(0, 12).map((section: any) => ({
-              title: String(section?.title || 'Section').slice(0, 120),
-              content: String(section?.content || '').slice(0, 4000),
-            }))
-          : fallback.extracted_sections,
-        suggested_actions: Array.isArray(parsed.suggested_actions)
-          ? parsed.suggested_actions
-              .slice(0, 8)
-              .map((action: unknown) => String(action).slice(0, 240))
-          : fallback.suggested_actions,
-        related_accounts: Array.isArray(parsed.related_accounts)
-          ? parsed.related_accounts
-              .slice(0, 12)
-              .map((account: unknown) => String(account).slice(0, 160))
-          : [],
-        related_transactions: Array.isArray(parsed.related_transactions)
-          ? parsed.related_transactions.slice(0, 20)
-          : [],
-      };
+      parsed = JSON.parse((match?.[1] || response.content).trim());
     } catch {
-      return fallback;
+      throw new Error('Document analysis returned invalid JSON.');
     }
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error('Document analysis returned an unexpected shape.');
+    }
+    return {
+      detected_type:
+        String(parsed.detected_type || fallback.detected_type).slice(0, 80),
+      summary: String(parsed.summary || fallback.summary).slice(0, 2000),
+      analysis_confidence: Math.max(
+        0,
+        Math.min(100, Number(parsed.analysis_confidence) || 0),
+      ),
+      extracted_sections: Array.isArray(parsed.extracted_sections)
+        ? parsed.extracted_sections.slice(0, 12).map((section: any) => ({
+            title: String(section?.title || 'Section').slice(0, 120),
+            content: String(section?.content || '').slice(0, 4000),
+          }))
+        : fallback.extracted_sections,
+      suggested_actions: Array.isArray(parsed.suggested_actions)
+        ? parsed.suggested_actions
+            .slice(0, 8)
+            .map((action: unknown) => String(action).slice(0, 240))
+        : fallback.suggested_actions,
+      related_accounts: Array.isArray(parsed.related_accounts)
+        ? parsed.related_accounts
+            .slice(0, 12)
+            .map((account: unknown) => String(account).slice(0, 160))
+        : [],
+      related_transactions: Array.isArray(parsed.related_transactions)
+        ? parsed.related_transactions.slice(0, 20)
+        : [],
+    };
   }
 
   async listMemories(userId: string) {
@@ -718,16 +770,27 @@ export class AiAdvisorService {
           {
             model: prepared.config.model,
             messages: prepared.messages,
+            maxContinuations: MAX_CONTINUATIONS,
           },
           () => undefined,
         )
-      : await runProviderChat(prepared.config, prepared.messages);
+      : await runProviderChat(prepared.config, prepared.messages, undefined, {
+          maxContinuations: MAX_CONTINUATIONS,
+        });
     const persisted = await this.persistAssistantTurn(
       prepared,
       result.content,
       result.model,
+      {
+        truncated: Boolean(result.truncated),
+        finish_reason: result.truncated ? 'length' : 'stop',
+        continuations: result.continuations || 0,
+      },
     );
-    if (isOmnirouteProvider(prepared.config.provider)) {
+    if (
+      isOmnirouteProvider(prepared.config.provider) &&
+      !this.isLocalOpalFallback(result.model)
+    ) {
       await this.omnirouteUsage.recordSuccessfulRequest(userId);
     }
     return persisted;
@@ -755,21 +818,31 @@ export class AiAdvisorService {
 
       let rawContent = '';
       let model = prepared.config.model;
+      let truncated = false;
+      let continuations = 0;
 
       if (isOmnirouteProvider(prepared.config.provider)) {
         yield { type: 'status', message: 'Asking a fast free model…' };
         const progressQueue: string[] = [];
+        // Segments (first reply, then each continuation) stream as they land.
+        const segmentQueue: string[] = [];
+        let streamed = '';
         const resultPromise = omnirouteAdapter.chatWithProgress(
           prepared.config,
           {
             model: prepared.config.model,
             messages: prepared.messages,
+            maxContinuations: MAX_CONTINUATIONS,
           },
           (message) => {
             progressQueue.push(message);
           },
           signal,
+          (segment) => {
+            segmentQueue.push(segment);
+          },
         );
+        const chunkSize = 18;
 
         while (true) {
           const raced = await Promise.race([
@@ -781,19 +854,34 @@ export class AiAdvisorService {
           while (progressQueue.length) {
             yield { type: 'status', message: progressQueue.shift()! };
           }
+          while (segmentQueue.length) {
+            const segment = segmentQueue.shift()!;
+            for (let i = 0; i < segment.length; i += chunkSize) {
+              if (signal?.aborted) throw new Error('Request cancelled');
+              yield { type: 'delta', text: segment.slice(i, i + chunkSize) };
+            }
+            streamed += segment;
+          }
           if (raced.done) {
             rawContent = raced.value.content;
             model = raced.value.model || model;
+            truncated = Boolean(raced.value.truncated);
+            continuations = raced.value.continuations || 0;
             break;
           }
           if (signal?.aborted) throw new Error('Request cancelled');
         }
 
-        yield { type: 'status', message: 'Writing your Opal Advisor reply…' };
-        const chunkSize = 18;
-        for (let i = 0; i < rawContent.length; i += chunkSize) {
-          if (signal?.aborted) throw new Error('Request cancelled');
-          yield { type: 'delta', text: rawContent.slice(i, i + chunkSize) };
+        // Local Opal replies (and any unstreamed tail) are chunked here.
+        const remainder = rawContent.startsWith(streamed)
+          ? rawContent.slice(streamed.length)
+          : '';
+        if (remainder) {
+          yield { type: 'status', message: 'Writing your Opal Advisor reply…' };
+          for (let i = 0; i < remainder.length; i += chunkSize) {
+            if (signal?.aborted) throw new Error('Request cancelled');
+            yield { type: 'delta', text: remainder.slice(i, i + chunkSize) };
+          }
         }
       } else {
         yield { type: 'status', message: 'Opal Advisor is thinking…' };
@@ -801,12 +889,16 @@ export class AiAdvisorService {
           prepared.config,
           prepared.messages,
           signal,
+          undefined,
+          { maxContinuations: MAX_CONTINUATIONS },
         );
         while (true) {
           const next = await stream.next();
           if (next.done) {
             if (next.value?.model) model = next.value.model;
             if (next.value?.content) rawContent = next.value.content;
+            truncated = Boolean(next.value?.truncated);
+            continuations = next.value?.continuations || 0;
             break;
           }
           rawContent += next.value;
@@ -819,8 +911,16 @@ export class AiAdvisorService {
         prepared,
         rawContent,
         model,
+        {
+          truncated,
+          finish_reason: truncated ? 'length' : 'stop',
+          continuations,
+        },
       );
-      if (isOmnirouteProvider(prepared.config.provider)) {
+      if (
+        isOmnirouteProvider(prepared.config.provider) &&
+        !this.isLocalOpalFallback(model)
+      ) {
         await this.omnirouteUsage.recordSuccessfulRequest(userId);
       }
       yield {
@@ -834,6 +934,10 @@ export class AiAdvisorService {
         tool_activity: persisted.tool_activity,
         citations: persisted.citations,
         suggested_questions: persisted.suggested_questions,
+        truncated: persisted.truncated,
+        finish_reason: persisted.finish_reason,
+        continuations: persisted.continuations,
+        content_sanitized: persisted.content_sanitized,
       };
     } catch (error: any) {
       if (signal?.aborted || error?.name === 'AbortError') {
@@ -847,6 +951,14 @@ export class AiAdvisorService {
     }
   }
 
+  /**
+   * The built-in canned reply (omniroute.adapter chatOnce → local_opal) reports
+   * model 'omniroute/opal-local'; it costs nothing and must not burn free quota.
+   */
+  private isLocalOpalFallback(model: string | null | undefined): boolean {
+    return String(model || '').startsWith('omniroute/opal-local');
+  }
+
   private async prepareChat(userId: string, dto: ChatMessageDto) {
     const { config, masterPrompt } =
       await this.settingsService.loadActiveProviderConfig(userId);
@@ -854,6 +966,10 @@ export class AiAdvisorService {
     if (isOmnirouteProvider(config.provider)) {
       await this.omnirouteUsage.assertWithinQuota(userId);
     }
+    // Opal Free backends have small per-minute token quotas (Groq rejects
+    // ~20k-token prompts as "request too large", dropping the turn to a
+    // slower/capped fallback). Send them a leaner prompt.
+    const compactPrompt = isOmnirouteProvider(config.provider);
 
     let conversationId = dto.conversation_id;
     if (conversationId) {
@@ -908,12 +1024,17 @@ export class AiAdvisorService {
       );
     }
 
+    // Newest 24 turns (the current user message included), replayed oldest-first.
     const history = await this.pgPool.query(
-      `SELECT role, content FROM ai_messages
-       WHERE conversation_id = $1 AND user_id = $2 AND role IN ('user', 'assistant')
-       ORDER BY created_at ASC
-       LIMIT 24`,
-      [conversationId, userId],
+      `SELECT role, content FROM (
+         SELECT role, content, created_at FROM ai_messages
+         WHERE conversation_id = $1 AND user_id = $2 AND role IN ('user', 'assistant')
+           AND (role = 'user' OR COALESCE(BTRIM(content), '') <> '')
+         ORDER BY created_at DESC
+         LIMIT $3
+       ) recent
+       ORDER BY created_at ASC`,
+      [conversationId, userId, compactPrompt ? 12 : 24],
     );
 
     const preferences = await this.pgPool.query(
@@ -992,24 +1113,68 @@ export class AiAdvisorService {
     }
 
     const invoked = this.resolveInvokedTools(dto);
+    // Most important first: the model needs user/accounts/categories for
+    // every proposal, and the budgeter trims bulky lists before those.
+    const orderedContext: Record<string, unknown> = {};
+    for (const key of [
+      'user',
+      'accounts',
+      'categories',
+      'overview',
+      'cash_flow',
+      'budgets',
+      'goals',
+      'loans',
+      'recurring',
+      'uncategorized_transactions',
+      'recent_transactions',
+      'investments',
+      'spaces',
+      'scenario',
+      'fx_sample',
+      'invoked_tools',
+    ]) {
+      if (context[key] !== undefined) orderedContext[key] = context[key];
+    }
+    for (const [key, value] of Object.entries(context)) {
+      if (key !== 'web_sources' && !(key in orderedContext)) {
+        orderedContext[key] = value;
+      }
+    }
+    const twinBudget = compactPrompt ? 18000 : invoked.length ? 64000 : 48000;
+    const twinJson = fitJsonToBudget(orderedContext, twinBudget, {
+      protect: ['user', 'accounts', 'categories', 'invoked_tools'],
+    }).json;
     const system = [
       buildSystemPrompt(masterPrompt),
       memoryEnabled
         ? [
             'Durable user memory (user-controlled; use when relevant):',
-            JSON.stringify(memories.rows.map((row) => row.content)).slice(0, 12000),
+            fitStringList(
+              memories.rows.map((row) => String(row.content)),
+              compactPrompt ? 3000 : 12000,
+              600,
+            ),
             'Recent context from other conversations (oldest to newest):',
-            JSON.stringify([...recentAcrossChats.rows].reverse()).slice(0, 16000),
+            JSON.stringify(
+              [...recentAcrossChats.rows]
+                .reverse()
+                .slice(compactPrompt ? -6 : -12)
+                .map((row) => ({
+                  role: row.role,
+                  chat: row.title,
+                  content: String(row.content || '')
+                    .replace(/\s+/g, ' ')
+                    .slice(0, compactPrompt ? 300 : 900),
+                })),
+            ),
           ].join('\n')
         : 'Cross-conversation memory is disabled by the user.',
       invoked.length
         ? `User-invoked tools for this turn (@ / slash): ${invoked.join(', ')}. Prioritize these datasets.`
         : 'No explicit @ or / tool invocation for this turn.',
       'Live Opal twin context (JSON):',
-      JSON.stringify({ ...context, web_sources: undefined }).slice(
-        0,
-        invoked.length ? 64000 : 48000,
-      ),
+      twinJson,
       context.web_sources
         ? [
             'Current public web sources are included above.',
@@ -1022,11 +1187,27 @@ export class AiAdvisorService {
 
     const messages: ChatMessage[] = [
       { role: 'system' as const, content: system },
-      ...history.rows.map((m) => ({
-        role: m.role as 'user' | 'assistant',
-        content: String(m.content),
-      })),
+      ...history.rows
+        // Empty assistant turns (proposal-only replies from older rows) make
+        // some providers reject the request; the user turn is always kept.
+        .filter(
+          (m) => m.role === 'user' || String(m.content ?? '').trim().length > 0,
+        )
+        .map((m, index, rows) => {
+          const content = String(m.content);
+          // Lean prompt: older turns are trimmed, the newest turns kept whole.
+          const keepWhole = !compactPrompt || index >= rows.length - 2;
+          return {
+            role: m.role as 'user' | 'assistant',
+            content:
+              keepWhole || content.length <= 2500
+                ? content
+                : `${content.slice(0, 2500)}…`,
+          };
+        }),
     ];
+    // The user turn inserted above is the newest row, so it is the last user
+    // message here; swap in the slash-expanded prompt for the provider.
     const lastUser = [...messages].reverse().find((m) => m.role === 'user');
     if (lastUser) {
       lastUser.content = effectiveContent;
@@ -1111,14 +1292,33 @@ export class AiAdvisorService {
     },
     rawContent: string,
     model: string,
+    meta: ReplyMeta = { truncated: false, finish_reason: 'stop', continuations: 0 },
   ) {
     const parsed = this.extractProposals(rawContent);
-    let cleanContent = this.stripSensitiveIdentifiers(
+    const stripped = this.stripSensitiveIdentifiers(
       this.stripBrokenProposalFences(parsed.cleanedContent),
     );
+    // Mermaid validation / auto-fix and closing of fences left open by a cut
+    // reply, so the saved message always renders.
+    const sanitized = sanitizeAssistantMarkdown(stripped);
+    let cleanContent = sanitized.content;
     const userId = prepared.userId;
 
-    const proposals = [...parsed.proposals];
+    const validated = await this.validateProposals(
+      userId,
+      parsed.proposals,
+      prepared,
+    );
+    const proposals = [...validated.proposals];
+    if (validated.clarifications.length) {
+      cleanContent = [
+        cleanContent.trim(),
+        `**Before I can set ${validated.clarifications.length === 1 ? 'this' : 'these'} up, I need a quick answer:**`,
+        validated.clarifications.map((q) => `- ${q}`).join('\n'),
+      ]
+        .filter(Boolean)
+        .join('\n\n');
+    }
     const createCategoryCount = proposals.filter(
       (p) => p.action_type === 'create_category',
     ).length;
@@ -1140,6 +1340,14 @@ export class AiAdvisorService {
         cleanContent =
           `${cleanContent.trim()}\n\nI've attached **${seeded.length} create_category** proposals for your review — use Review / Review all to approve them.`.trim();
       }
+    }
+
+    // Never persist an empty assistant turn: it renders as a blank bubble and
+    // poisons the history replayed to providers on the next turn.
+    if (!cleanContent.trim()) {
+      cleanContent = proposals.length
+        ? `Proposed ${proposals.length} action${proposals.length === 1 ? '' : 's'} for review.`
+        : 'I could not produce a reply this time. Please try asking again.';
     }
 
     const proposalIds: string[] = [];
@@ -1203,18 +1411,90 @@ export class AiAdvisorService {
     );
 
     const suggestedQuestions: string[] = [];
+    const replyMeta = {
+      truncated: meta.truncated,
+      finish_reason: meta.finish_reason,
+      continuations: meta.continuations,
+    };
 
     return {
       conversation_id: prepared.conversationId,
       conversation_title: conversationTitle,
-      message: assistant.rows[0],
+      // ai_messages has no metadata column; the flags ride on the returned
+      // message (top level + `metadata`) for the client's Continue button.
+      message: { ...assistant.rows[0], ...replyMeta, metadata: replyMeta },
       proposals: proposalRows,
       provider: prepared.config.provider,
       model,
       tool_activity: prepared.activity,
       citations: prepared.citations,
       suggested_questions: suggestedQuestions,
+      ...replyMeta,
+      content_sanitized: sanitized.changed || validated.clarifications.length > 0,
     };
+  }
+
+  /**
+   * Check every write proposal against the user's real accounts/categories:
+   * repair what can be repaired (names → ids, transfer classification,
+   * category, description, timezone-correct date, currency) and turn the
+   * rest into clarification questions instead of cards that would fail.
+   */
+  private async validateProposals(
+    userId: string,
+    proposals: ParsedProposal[],
+    prepared: { context: Record<string, unknown>; originalUserPrompt?: string; userPrompt: string },
+  ): Promise<{ proposals: ParsedProposal[]; clarifications: string[] }> {
+    const needsCheck = proposals.some(
+      (p) => TRANSACTION_PROPOSALS.has(p.action_type) || REFERENCE_PROPOSALS.has(p.action_type),
+    );
+    if (!needsCheck) return { proposals, clarifications: [] };
+
+    let ctx: ProposalContext;
+    try {
+      ctx = await this.toolsService.proposalContext(
+        userId,
+        prepared.originalUserPrompt || prepared.userPrompt,
+      );
+    } catch {
+      return { proposals, clarifications: [] };
+    }
+
+    const kept: ParsedProposal[] = [];
+    const clarifications: string[] = [];
+    for (const proposal of proposals) {
+      if (TRANSACTION_PROPOSALS.has(proposal.action_type)) {
+        const outcome = validateTransactionProposal(
+          proposal.action_type,
+          proposal.payload || {},
+          ctx,
+        );
+        if (!outcome.ok) {
+          if (outcome.clarification) clarifications.push(outcome.clarification);
+          continue;
+        }
+        kept.push({
+          ...proposal,
+          title: (outcome.title || proposal.title).slice(0, 200),
+          summary: outcome.summary || proposal.summary,
+          payload: outcome.payload,
+        });
+      } else if (REFERENCE_PROPOSALS.has(proposal.action_type)) {
+        const outcome = repairReferenceIds(
+          proposal.action_type,
+          proposal.payload || {},
+          ctx,
+        );
+        if (!outcome.ok) {
+          if (outcome.clarification) clarifications.push(outcome.clarification);
+          continue;
+        }
+        kept.push({ ...proposal, payload: outcome.payload });
+      } else {
+        kept.push(proposal);
+      }
+    }
+    return { proposals: kept, clarifications: [...new Set(clarifications)] };
   }
 
   /**
@@ -1344,41 +1624,63 @@ export class AiAdvisorService {
     return raw;
   }
 
-  /** Never persist UUIDs / machine IDs into chat content shown to users. */
+  /**
+   * Never persist UUIDs / machine IDs into chat content shown to users.
+   * Only text around a removed id is tidied: indentation (code, nested
+   * lists), task-list "[ ]" boxes and code blocks are left untouched — the
+   * old global whitespace collapse mangled saved replies.
+   */
   private stripSensitiveIdentifiers(content: string): string {
     const uuid =
       '[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
-    return content
+    const MARK = '\u0001';
+    const marked = content
       .replace(
         new RegExp(
-          `\\s*[\\(\\[]\\s*(?:id|uuid|container[_ ]?id|category[_ ]?id|account[_ ]?id)\\s*[:#]?\\s*\`?${uuid}\`?\\s*[\\)\\]]`,
+          `[ \\t]*[\\(\\[][ \\t]*(?:id|uuid|container[_ ]?id|category[_ ]?id|account[_ ]?id)[ \\t]*[:#]?[ \\t]*\`?${uuid}\`?[ \\t]*[\\)\\]]`,
           'gi',
         ),
-        '',
+        MARK,
       )
       .replace(
         new RegExp(
-          `\\b(?:id|uuid|container_id|category_id|account_id|source_container_id|destination_container_id)\\s*[:=]\\s*\`?${uuid}\`?`,
+          `\\b(?:id|uuid|container_id|category_id|account_id|source_container_id|destination_container_id)[ \\t]*[:=][ \\t]*\`?${uuid}\`?`,
           'gi',
         ),
-        '',
+        MARK,
       )
-      .replace(new RegExp(`\`${uuid}\``, 'gi'), '')
-      .replace(new RegExp(`\\b${uuid}\\b`, 'gi'), '')
-      .replace(/\(\s*\)/g, '')
-      .replace(/\[\s*\]/g, '')
-      .replace(/[ \t]{2,}/g, ' ')
-      .replace(/ +\n/g, '\n')
-      .replace(/\n{3,}/g, '\n\n')
+      .replace(new RegExp(`\`${uuid}\``, 'gi'), MARK)
+      .replace(new RegExp(`\\b${uuid}\\b`, 'gi'), MARK);
+    if (!marked.includes(MARK)) return content.trim();
+    return marked
+      .replace(new RegExp(`[\\(\\[][ \\t]*${MARK}[ \\t]*[\\)\\]]`, 'g'), MARK)
+      .replace(new RegExp(`(\\S)[ \\t]+${MARK}[ \\t]*(?=\\S)`, 'g'), '$1 ')
+      .replace(new RegExp(`[ \\t]*${MARK}[ \\t]*`, 'g'), '')
       .trim();
   }
 
-  /** Drop truncated ```action_proposal / ```json fences the model left unfinished. */
+  /**
+   * Drop proposal fences that extractProposals could not ingest:
+   * - complete ```action_proposal blocks (internal protocol, never user-facing);
+   * - a trailing unterminated ```action_proposal fence (cut-off internal JSON).
+   * A trailing unterminated ```json (or any other) fence is user-visible
+   * content from a cut reply: it is kept and closed by the markdown sanitizer.
+   */
   private stripBrokenProposalFences(content: string): string {
-    return content
-      .replace(/```(?:action_proposal|json)\s*[\s\S]*?(?:```|$)/gi, '')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
+    let text = content.replace(/```action_proposal\b[\s\S]*?```/gi, '');
+    const fences = [...text.matchAll(/```/g)];
+    if (fences.length % 2 === 1) {
+      const lastOpen = fences[fences.length - 1].index ?? -1;
+      const tail = lastOpen >= 0 ? text.slice(lastOpen) : '';
+      // A cut ```json block is only dropped when it is clearly a proposal.
+      if (
+        /^```action_proposal\b/i.test(tail) ||
+        (/^```json\b/i.test(tail) && /"action_type"\s*:/.test(tail))
+      ) {
+        text = text.slice(0, lastOpen);
+      }
+    }
+    return text.trim();
   }
 
   private async generateSuggestedQuestions(
@@ -1448,70 +1750,76 @@ export class AiAdvisorService {
   }
 
   async confirmProposal(userId: string, proposalId: string) {
-    const client = await this.pgPool.connect();
-    try {
-      await client.query('BEGIN');
-      const result = await client.query(
-        `SELECT * FROM ai_action_proposals
-         WHERE id = $1 AND user_id = $2
-         FOR UPDATE`,
+    // Atomically claim the proposal without holding a pooled client across the
+    // (multi-connection) execution. The status CHECK constraint only allows
+    // pending/confirmed/rejected/expired/failed, so the claim moves it straight
+    // to 'confirmed'; a failed execution is then recorded as 'failed'. A second
+    // concurrent confirm finds no pending row and cannot execute it twice.
+    const claimed = await this.pgPool.query(
+      `UPDATE ai_action_proposals
+       SET status = 'confirmed', updated_at = NOW()
+       WHERE id = $1 AND user_id = $2 AND status = 'pending' AND expires_at > NOW()
+       RETURNING *`,
+      [proposalId, userId],
+    );
+
+    if (!claimed.rowCount) {
+      const existing = await this.pgPool.query(
+        `SELECT status, expires_at FROM ai_action_proposals
+         WHERE id = $1 AND user_id = $2`,
         [proposalId, userId],
       );
-      if (!result.rowCount) {
+      if (!existing.rowCount) {
         throw new NotFoundException('Proposal not found');
       }
-      const row = result.rows[0];
-      if (row.status !== 'pending') {
-        throw new BadRequestException(`Proposal is already ${row.status}`);
-      }
-      if (new Date(row.expires_at) < new Date()) {
-        await client.query(
-          `UPDATE ai_action_proposals SET status = 'expired', updated_at = NOW() WHERE id = $1`,
-          [proposalId],
+      const current = existing.rows[0];
+      if (current.status === 'pending') {
+        await this.pgPool.query(
+          `UPDATE ai_action_proposals
+           SET status = 'expired', updated_at = NOW()
+           WHERE id = $1 AND user_id = $2 AND status = 'pending'`,
+          [proposalId, userId],
         );
-        await client.query('COMMIT');
         throw new BadRequestException('Proposal expired. Ask Opal again.');
       }
+      throw new BadRequestException(`Proposal is already ${current.status}`);
+    }
 
-      const executed = await this.toolsService.executeProposal(
+    const row = claimed.rows[0];
+    let executed: unknown;
+    try {
+      executed = await this.toolsService.executeProposal(
         userId,
         row.action_type,
         row.payload || {},
       );
-
-      await client.query(
-        `UPDATE ai_action_proposals
-         SET status = 'confirmed', executed_at = NOW(), result = $2, updated_at = NOW()
-         WHERE id = $1`,
-        [proposalId, JSON.stringify(executed)],
-      );
-      await client.query('COMMIT');
-      return {
-        id: proposalId,
-        status: 'confirmed',
-        result: executed,
-      };
     } catch (error) {
-      await client.query('ROLLBACK');
-      if (error instanceof BadRequestException || error instanceof NotFoundException) {
-        throw error;
-      }
+      const extracted = extractAdvisorErrorMessage(error);
+      const message =
+        extracted === 'Advisor stream failed'
+          ? 'Failed to execute proposal'
+          : extracted;
       await this.pgPool.query(
         `UPDATE ai_action_proposals
-         SET status = 'failed', result = $2, updated_at = NOW()
-         WHERE id = $1 AND user_id = $3`,
-        [
-          proposalId,
-          JSON.stringify({ error: (error as Error).message }),
-          userId,
-        ],
+         SET status = 'failed', result = $3, updated_at = NOW()
+         WHERE id = $1 AND user_id = $2`,
+        [proposalId, userId, JSON.stringify({ error: message })],
       );
-      throw new BadRequestException(
-        (error as Error).message || 'Failed to execute proposal',
-      );
-    } finally {
-      client.release();
+      if (error instanceof HttpException) throw error;
+      throw new BadRequestException(message);
     }
+
+    await this.pgPool.query(
+      `UPDATE ai_action_proposals
+       SET executed_at = NOW(), result = $3, updated_at = NOW()
+       WHERE id = $1 AND user_id = $2`,
+      [proposalId, userId, JSON.stringify(executed ?? null)],
+    );
+    return {
+      id: proposalId,
+      status: 'confirmed',
+      result: executed,
+    };
   }
 
   async rejectProposal(userId: string, proposalId: string) {
@@ -1696,7 +2004,9 @@ export class AiAdvisorService {
 
     return {
       action_type: actionType,
-      title,
+      // ai_action_proposals.title is VARCHAR(200); a longer model title
+      // would fail the INSERT and lose the whole reply.
+      title: title.slice(0, 200),
       summary: raw.summary ? String(raw.summary) : undefined,
       payload,
     };
@@ -1870,6 +2180,7 @@ You are writing a scheduled Opal email for this user. Do not use tools, JSON act
           },
         ],
         900,
+        { maxContinuations: 1 },
       );
       const text = String(result.content || '').trim();
       return text || null;

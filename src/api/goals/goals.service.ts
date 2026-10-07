@@ -220,13 +220,15 @@ export class GoalsService {
         );
       }
 
-      const next = Number(raw.rows[0].current_amount) + Number(dto.amount);
+      // Increment in SQL: the SELECT above runs outside a transaction, so its
+      // row lock is already released and a JS read-modify-write could lose
+      // a concurrent contribution.
       const updated = await client.query(
         `UPDATE goals
-         SET current_amount = $1, updated_at = NOW()
-         WHERE id = $2 AND user_id = $3
+         SET current_amount = current_amount + $1, updated_at = NOW()
+         WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL
          RETURNING *`,
-        [next, id, userId],
+        [Number(dto.amount), id, userId],
       );
       const row = {
         ...updated.rows[0],

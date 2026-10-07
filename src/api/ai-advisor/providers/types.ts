@@ -29,6 +29,11 @@ export type ProviderChatRequest = {
   maxTokens?: number;
   /** Ask OpenAI-compatible backends for a JSON object (vision extraction). */
   json?: boolean;
+  /**
+   * Continuation requests an adapter may issue itself after a max_tokens stop
+   * (only Opal Free does this internally; others go through providers/index).
+   */
+  maxContinuations?: number;
 };
 
 /** Default completion budget for advisor replies (was 2048 and cut long answers short). */
@@ -41,6 +46,12 @@ export type ProviderChatResult = {
   model: string;
   provider: AiProviderId;
   usage?: { input_tokens?: number; output_tokens?: number };
+  /** Raw provider stop reason (stop_reason / finish_reason / finishReason). */
+  finish_reason?: string;
+  /** True when the reply stopped on the output-token limit. */
+  truncated?: boolean;
+  /** Continuation requests stitched into `content`. */
+  continuations?: number;
 };
 
 export type ProviderCredentials = {
@@ -82,7 +93,6 @@ export const DEFAULT_MODELS: Record<AiProviderId, string[]> = {
     'openai/gpt-4o-mini',
     'openai/gpt-4o',
     'anthropic/claude-sonnet-4',
-    'anthropic/claude-3.5-haiku',
     'google/gemini-2.5-flash',
     'google/gemini-2.5-pro',
     'deepseek/deepseek-chat',
@@ -91,16 +101,11 @@ export const DEFAULT_MODELS: Record<AiProviderId, string[]> = {
     'mistralai/mistral-small-3.1-24b-instruct',
   ],
   openai: ['gpt-4.1-mini', 'gpt-4.1', 'gpt-4o-mini', 'gpt-4o', 'o4-mini'],
-  anthropic: [
-    'claude-3-5-haiku-latest',
-    'claude-sonnet-4-20250514',
-  ],
+  anthropic: ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5'],
   local: ['llama3.2', 'llama3.1', 'mistral', 'qwen2.5', 'phi4'],
   vertex: [
     'gemini-2.5-flash',
     'gemini-2.5-pro',
     'gemini-2.5-flash-lite',
-    'gemini-2.0-flash',
-    'gemini-2.0-flash-lite',
   ],
 };

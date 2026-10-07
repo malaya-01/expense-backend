@@ -1,16 +1,20 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
+import { Type } from 'class-transformer';
 import {
   IsIn,
+  IsObject,
   IsOptional,
   IsString,
   Length,
   MaxLength,
   MinLength,
+  ValidateNested,
 } from 'class-validator';
 import {
   COUNTRIES,
   SUPPORTED_CURRENCIES,
 } from 'src/common/currency/currency.data';
+import { UserPreferencesDto } from './user-preferences.dto';
 
 const COUNTRY_CODES = COUNTRIES.map((c) => c.code);
 
@@ -47,6 +51,13 @@ export class UpdateProfileDto {
   @IsString()
   @MaxLength(10)
   locale?: string;
+
+  @ApiPropertyOptional({ type: UserPreferencesDto })
+  @IsOptional()
+  @IsObject()
+  @ValidateNested()
+  @Type(() => UserPreferencesDto)
+  preferences?: UserPreferencesDto;
 }
 
 export class ChangePasswordDto {

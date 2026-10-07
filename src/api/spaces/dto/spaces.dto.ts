@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional, PartialType } from '@nestjs/swagger';
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import {
   ArrayMinSize,
   IsArray,
@@ -7,6 +7,7 @@ import {
   IsDateString,
   IsIn,
   IsNumber,
+  IsObject,
   IsOptional,
   IsString,
   IsUUID,
@@ -14,6 +15,7 @@ import {
   Min,
   ValidateNested,
 } from 'class-validator';
+import { SUPPORTED_CURRENCIES } from 'src/common/currency/currency.data';
 
 export class CreateSpaceDto {
   @ApiProperty({ example: 'Goa Trip' })
@@ -27,10 +29,14 @@ export class CreateSpaceDto {
   @MaxLength(2000)
   description?: string;
 
-  @ApiPropertyOptional({ example: 'INR' })
+  @ApiPropertyOptional({ example: 'INR', enum: SUPPORTED_CURRENCIES })
   @IsOptional()
+  @Transform(({ value }) =>
+    typeof value === 'string' ? value.trim().toUpperCase() : value,
+  )
   @IsString()
   @MaxLength(3)
+  @IsIn(SUPPORTED_CURRENCIES)
   currency?: string;
 
   @ApiPropertyOptional()
@@ -258,7 +264,9 @@ export class SyncOutboxDto {
   @IsUUID()
   space_id?: string;
 
-  payload: Record<string, unknown>;
+  @IsOptional()
+  @IsObject()
+  payload?: Record<string, unknown>;
 }
 
 export class FavoriteSpaceDto {

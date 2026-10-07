@@ -4,6 +4,11 @@ import appConfiguration from 'src/app.configuration';
 
 // DATE OID 1082 — keep calendar dates as YYYY-MM-DD strings.
 types.setTypeParser(1082, (value: string) => value);
+// DATE[] OID 1182 — pg-types would otherwise build JS Date objects; parse it
+// like TEXT[] so array elements stay YYYY-MM-DD strings too.
+// OIDs outside the TypeId enum need a cast.
+const parseTextArray = types.getTypeParser(1009 as any) as (v: string) => string[];
+types.setTypeParser(1182 as any, (value: string) => parseTextArray(value));
 
 function resolvePoolMax(db: {
   SSL?: boolean;

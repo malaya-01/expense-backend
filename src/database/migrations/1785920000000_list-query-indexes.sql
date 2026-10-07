@@ -1,3 +1,4 @@
+-- Up Migration
 -- Speed up the dashboard / ledger list query:
 -- WHERE user_id = $1 AND deleted_at IS NULL ORDER BY date DESC, created_at DESC
 CREATE INDEX IF NOT EXISTS idx_ledger_transactions_user_active_date

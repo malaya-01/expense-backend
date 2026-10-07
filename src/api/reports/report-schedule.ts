@@ -218,6 +218,18 @@ export function periodBounds(
         end: isoDate(prevYear, prevMonth, last),
       };
     }
+    if (schedule.monthly_mode === 'day_of_month') {
+      // Cover everything since the previous send day so the tail of the
+      // previous month (days after N) is not skipped.
+      const prevMonth = local.month === 1 ? 12 : local.month - 1;
+      const prevYear = local.month === 1 ? local.year - 1 : local.year;
+      const prevSend = isoDate(
+        prevYear,
+        prevMonth,
+        Math.min(schedule.day_of_month, lastDayOfMonth(prevYear, prevMonth)),
+      );
+      return { start: addDaysIso(prevSend, 1), end };
+    }
     return { start: isoDate(local.year, local.month, 1), end };
   }
   if (schedule.custom_mode === 'interval') {

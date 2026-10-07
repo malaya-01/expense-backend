@@ -143,49 +143,59 @@ export class ReportDispatchService {
     if (!isMailConfigured()) return;
     this.processing = true;
     try {
-      const users = await this.pgPool.query(
-        `SELECT u.id, u.email, u.full_name, u.timezone, u.created_at,
-                s.enabled, s.frequency, s.weekday, s.monthly_mode, s.day_of_month,
-                s.custom_mode, s.interval_days, s.custom_dates, s.send_time,
-                s.include_excel, s.include_ai, s.last_sent_at, s.last_period_key
-         FROM users u
-         LEFT JOIN user_report_schedules s ON s.user_id = u.id
-         WHERE u.deleted_at IS NULL
-           AND COALESCE(u.is_delete, false) = false
-           AND COALESCE(u.is_active, true) = true
-           AND u.email IS NOT NULL
-           AND u.email <> ''
-           AND COALESCE(u.email_verified, true) = true
-           AND COALESCE(s.enabled, true) = true
-         ORDER BY s.last_sent_at NULLS FIRST, u.created_at ASC
-         LIMIT 80`,
-      );
-      for (const row of users.rows) {
-        const schedule = this.rowToSchedule(row);
-        const due = isReportDue({
-          schedule,
-          timeZone: row.timezone,
-          lastPeriodKey: row.last_period_key,
-          lastSentAt: row.last_sent_at,
-          createdAt: row.created_at,
-        });
-        if (!due.due) continue;
-        try {
-          await this.deliver({
-            userId: row.id,
-            email: row.email,
-            fullName: row.full_name,
-            timezone: row.timezone,
+      // Walk every eligible user in id order; a fixed LIMIT would keep
+      // re-checking the same first rows and starve everyone after them.
+      let lastId: string | null = null;
+      for (;;) {
+        const users = await this.pgPool.query(
+          `SELECT u.id, u.email, u.full_name, u.timezone, u.created_at,
+                  s.enabled, s.frequency, s.weekday, s.monthly_mode, s.day_of_month,
+                  s.custom_mode, s.interval_days, s.custom_dates, s.send_time,
+                  s.include_excel, s.include_ai, s.last_sent_at, s.last_period_key
+           FROM users u
+           LEFT JOIN user_report_schedules s ON s.user_id = u.id
+           WHERE u.deleted_at IS NULL
+             AND COALESCE(u.is_delete, false) = false
+             AND COALESCE(u.is_active, true) = true
+             AND u.email IS NOT NULL
+             AND u.email <> ''
+             AND COALESCE(u.email_verified, true) = true
+             AND COALESCE(s.enabled, true) = true
+             AND ($1::uuid IS NULL OR u.id > $1::uuid)
+           ORDER BY u.id
+           LIMIT 200`,
+          [lastId],
+        );
+        if (!users.rowCount) break;
+        lastId = users.rows[users.rows.length - 1].id;
+        for (const row of users.rows) {
+          const schedule = this.rowToSchedule(row);
+          const due = isReportDue({
             schedule,
-            start: due.start,
-            end: due.end,
-            periodKey: due.periodKey,
+            timeZone: row.timezone,
+            lastPeriodKey: row.last_period_key,
+            lastSentAt: row.last_sent_at,
+            createdAt: row.created_at,
           });
-        } catch (error: any) {
-          const message = error?.message || 'Failed to send report';
-          this.logger.warn(`Report email failed for ${row.id}: ${message}`);
-          await this.recordError(row.id, message);
+          if (!due.due) continue;
+          try {
+            await this.deliver({
+              userId: row.id,
+              email: row.email,
+              fullName: row.full_name,
+              timezone: row.timezone,
+              schedule,
+              start: due.start,
+              end: due.end,
+              periodKey: due.periodKey,
+            });
+          } catch (error: any) {
+            const message = error?.message || 'Failed to send report';
+            this.logger.warn(`Report email failed for ${row.id}: ${message}`);
+            await this.recordError(row.id, message);
+          }
         }
+        if (users.rowCount < 200) break;
       }
     } finally {
       this.processing = false;
@@ -310,7 +320,9 @@ export class ReportDispatchService {
     const sendTime = String(row.send_time || '10:00:00').slice(0, 5);
     const dates = Array.isArray(row.custom_dates)
       ? row.custom_dates.map((value: Date | string) =>
-          String(value).slice(0, 10),
+          value instanceof Date
+            ? value.toISOString().slice(0, 10)
+            : String(value).slice(0, 10),
         )
       : [];
     return {

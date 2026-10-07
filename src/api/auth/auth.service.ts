@@ -17,7 +17,7 @@ import { OtpGenerateDto } from './dto/generat-otp.dto';
 import { Cache } from 'cache-manager';
 import { JwtService } from '@nestjs/jwt';
 import { Request, Response } from 'express';
-import { randomBytes, randomInt, randomUUID } from 'crypto';
+import { createHash, randomBytes, randomInt, randomUUID } from 'crypto';
 import { UserService } from '../user/user.service';
 import { CategoriesService } from '../categories/categories.service';
 import { PermissionsService } from '../permissions/permissions.service';
@@ -36,23 +36,38 @@ import {
   shouldOfferInlineRecoveryCode,
 } from 'src/utils/mail/mail.util';
 import { buildAppPathUrl } from 'src/utils/url/public-app-url';
-import { ObjectStorageService } from 'src/storage/object-storage.service';
-import { MatchFaceLoginDto } from '../user/dto/face-login.dto';
-import {
-  assertDescriptor,
-  decryptFaceTemplate,
-  faceDistance,
-  faceMatchDistance,
-} from 'src/storage/face-template.crypto';
 
 const EMAIL_VERIFY_TTL_MS = 60 * 60 * 1000; // 1 hour
 const EMAIL_VERIFY_TTL_HOURS = 1;
 const LOGIN_LOCK_MS = 15 * 60 * 1000;
-/** Require a verified email before sign-in / API access. */
-const REQUIRE_EMAIL_VERIFICATION = true;
+const LOGIN_MAX_ATTEMPTS = 5;
+const OTP_TTL_MS = 10 * 60 * 1000;
+/** Wrong recovery-code guesses allowed per issued code. */
+const OTP_MAX_ATTEMPTS = 5;
+const ACCESS_TOKEN_TTL = '15m';
+const REFRESH_TOKEN_TTL = '7d';
+/**
+ * After a refresh token is rotated, the same (old) token may be presented
+ * again for this long — concurrent refreshes from parallel 401s, or a retry
+ * after a lost response — and receives the same new token pair instead of
+ * tripping reuse detection.
+ */
+const REFRESH_REUSE_GRACE_MS = 60 * 1000;
 
+/** Refresh tokens are stored as SHA-256 hex (bcrypt only reads 72 bytes). */
+export function hashRefreshToken(token: string): string {
+  return createHash('sha256').update(token).digest('hex');
+}
+/**
+ * Require a verified email before sign-in / API access.
+ * On by default; EMAIL_VERIFICATION_REQUIRED=false turns it off (e.g. while
+ * outbound mail is not deliverable).
+ */
 export function isEmailVerificationRequired() {
-  return REQUIRE_EMAIL_VERIFICATION;
+  const flag = (process.env.EMAIL_VERIFICATION_REQUIRED || '')
+    .trim()
+    .toLowerCase();
+  return !(flag === 'false' || flag === '0' || flag === 'no');
 }
 
 export function formatLockRemaining(until: Date): string {
@@ -94,7 +109,6 @@ export class AuthService {
     private readonly userService: UserService,
     private readonly categoriesService: CategoriesService,
     private readonly permissionsService: PermissionsService,
-    private readonly storage: ObjectStorageService,
   ) { }
 
 
@@ -102,12 +116,13 @@ export class AuthService {
     const { full_name, password, confirmPassword, country, currency } =
       registerAuthDto;
     const email = registerAuthDto.email.trim().toLowerCase();
+    const requireVerification = isEmailVerificationRequired();
 
     if (password !== confirmPassword) {
       throw new BadRequestException('Password and confirm password do not match');
     }
 
-    if (REQUIRE_EMAIL_VERIFICATION && !isMailConfigured()) {
+    if (requireVerification && !isMailConfigured()) {
       throw new ServiceUnavailableException(
         'Email delivery is not configured. Contact the application administrator.',
       );
@@ -125,6 +140,7 @@ export class AuthService {
 
     const passwordHash = await bcrypt.hash(password, 10);
     const client = await this.pgPool.connect();
+    let user: any;
     try {
       await client.query('BEGIN');
       const result = await client.query(
@@ -137,27 +153,12 @@ export class AuthService {
           passwordHash,
           countryCode,
           baseCurrency,
-          !REQUIRE_EMAIL_VERIFICATION,
+          !requireVerification,
         ],
       );
-      const user = result.rows[0];
+      user = result.rows[0];
       await this.categoriesService.seedDefaultsForUser(user.id, client);
       await client.query('COMMIT');
-      await this.permissionsService.markAdminIfBootstrapEmail(user.id, user.email);
-      await this.permissionsService.ensureFirstUserIsAdmin();
-      const access = await this.permissionsService.mePayload(user.id);
-      if (REQUIRE_EMAIL_VERIFICATION) {
-        await this.sendVerificationEmail(user.id, user.email, user.full_name);
-      }
-      return {
-        ...user,
-        is_admin: access.is_admin,
-        permissions: access.permissions,
-        requires_email_verification: REQUIRE_EMAIL_VERIFICATION,
-        message: REQUIRE_EMAIL_VERIFICATION
-          ? 'Account created. Please verify your email before signing in.'
-          : 'Account created. You can sign in now.',
-      };
     } catch (error: any) {
       try {
         await client.query('ROLLBACK');
@@ -176,8 +177,63 @@ export class AuthService {
       throw new InternalServerErrorException('Failed to register user');
     } finally {
       client.release();
-      await this.userService.syncUsersToCache()
     }
+
+    // The account exists from here on. Follow-up steps are best-effort: a
+    // failure must not turn a successful sign-up into an error response.
+    try {
+      await this.permissionsService.markAdminIfBootstrapEmail(user.id, user.email);
+      await this.permissionsService.ensureFirstUserIsAdmin();
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error(
+        '[Opal] Admin bootstrap after register failed:',
+        error instanceof Error ? error.message : error,
+      );
+    }
+
+    let access: { is_admin: boolean; permissions: string[] } = {
+      is_admin: false,
+      permissions: [],
+    };
+    try {
+      access = await this.permissionsService.mePayload(user.id);
+    } catch {
+      /* permissions are re-read on sign-in */
+    }
+
+    let verificationEmailSent = false;
+    if (requireVerification) {
+      try {
+        await this.sendVerificationEmail(user.id, user.email, user.full_name);
+        verificationEmailSent = true;
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.error(
+          '[Opal] Verification email after register failed:',
+          error instanceof Error ? error.message : error,
+        );
+      }
+    }
+
+    try {
+      await this.userService.syncUsersToCache();
+    } catch {
+      /* cache refresh is best-effort */
+    }
+
+    return {
+      ...user,
+      is_admin: access.is_admin,
+      permissions: access.permissions,
+      requires_email_verification: requireVerification,
+      verification_email_sent: verificationEmailSent,
+      message: !requireVerification
+        ? 'Account created. You can sign in now.'
+        : verificationEmailSent
+          ? 'Account created. Please verify your email before signing in.'
+          : 'Account created, but we could not send the verification email. Use "Resend verification" to get a new link.',
+    };
   }
 
   async verifyEmail(token: string) {
@@ -308,58 +364,49 @@ export class AuthService {
     }
 
     const user = await this.pgPool.query(
-      'SELECT id FROM users WHERE email = $1',
+      'SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL',
       [email],
     );
+    const genericResponse = {
+      message:
+        'If an account exists for this email, a recovery code has been sent.',
+      delivery: 'email' as const,
+    };
     // Same generic message when the account is missing (avoid email enumeration).
     if (user.rowCount === 0) {
-      return {
-        message:
-          'If an account exists for this email, a recovery code has been sent.',
-        delivery: 'email' as const,
-      };
+      return genericResponse;
     }
 
     const otp = randomInt(100000, 1_000_000).toString();
     const key = `${email}-otp`;
-    await this.cacheManager.set(key, otp, 10 * 60 * 1000);
+    await this.cacheManager.set(key, otp, OTP_TTL_MS);
+    await this.cacheManager.del(`${email}-otp-attempts`);
 
-    // Always attempt mail when configured.
-    // Inline OTP is only a fallback after send fails (e.g. host blocks SMTP).
-    if (canEmail) {
-      try {
-        await this.sendRecoveryCode(email, otp);
-        return {
-          message:
-            'If an account exists for this email, a recovery code has been sent.',
-          delivery: 'email' as const,
-        };
-      } catch (err) {
+    if (canEmail && !allowInline) {
+      // Send in the background and answer exactly as for an unknown email, so
+      // neither the response nor its timing reveals whether the account exists.
+      void this.sendRecoveryCode(email, otp).catch(async (err) => {
         // eslint-disable-next-line no-console
         console.error(
           '[Opal] Recovery email failed:',
           err instanceof Error ? err.message : err,
         );
-        if (!allowInline) {
-          await this.cacheManager.del(key);
-          throw new ServiceUnavailableException(
-            'Recovery email could not be sent. Please try again later.',
-          );
+        try {
+          if ((await this.cacheManager.get<string>(key)) === otp) {
+            await this.cacheManager.del(key);
+          }
+        } catch {
+          /* ignore cache errors */
         }
-      }
+      });
+      return genericResponse;
     }
 
-    if (!allowInline) {
-      await this.cacheManager.del(key);
-      throw new ServiceUnavailableException(
-        'Password recovery email is not configured. Contact the application administrator.',
-      );
-    }
-
+    // Inline OTP (opt-in via PASSWORD_RESET_INLINE_CODE). Email is skipped
+    // entirely: the mail API can accept a message that later bounces, which
+    // would leave the user with no code at all.
     // eslint-disable-next-line no-console
-    console.warn(
-      `[Opal] Inline recovery code issued for ${email} (mail send failed or not configured).`,
-    );
+    console.warn(`[Opal] Inline recovery code issued for ${email}.`);
     return {
       message:
         'Email delivery is unavailable on this server. Use the on-screen recovery code to reset your password.',
@@ -375,9 +422,23 @@ export class AuthService {
     const email = dto.email.trim().toLowerCase();
     const otp = String(dto.otp || '').trim();
     const key = `${email}-otp`;
+    const attemptsKey = `${email}-otp-attempts`;
     const cachedOtp = await this.cacheManager.get<string>(key);
 
     if (!cachedOtp || cachedOtp !== otp) {
+      if (cachedOtp) {
+        // Limit guesses per issued code; burn it after too many misses.
+        const attempts =
+          (Number(await this.cacheManager.get<number>(attemptsKey)) || 0) + 1;
+        if (attempts >= OTP_MAX_ATTEMPTS) {
+          await this.cacheManager.del(key);
+          await this.cacheManager.del(attemptsKey);
+          throw new BadRequestException(
+            'Too many incorrect codes. Request a new recovery code.',
+          );
+        }
+        await this.cacheManager.set(attemptsKey, attempts, OTP_TTL_MS);
+      }
       throw new BadRequestException('Invalid OTP');
     }
 
@@ -389,6 +450,7 @@ export class AuthService {
     );
     // OTP is single-use once verified.
     await this.cacheManager.del(key);
+    await this.cacheManager.del(attemptsKey);
 
     return {
       message: 'Code verified. You can set a new password.',
@@ -416,19 +478,44 @@ export class AuthService {
 
     const passwordHash = await bcrypt.hash(newPassword, 10);
     const client = await this.pgPool.connect();
+    let updated = false;
     try {
-      await client.query(
-        'UPDATE users SET password_hash = $1 WHERE email = $2',
+      await client.query('BEGIN');
+      const result = await client.query(
+        `UPDATE users
+         SET password_hash = $1,
+             failed_login_attempts = 0,
+             locked_until = NULL,
+             updated_at = NOW()
+         WHERE email = $2 AND deleted_at IS NULL
+         RETURNING id`,
         [passwordHash, email],
       );
-      await this.cacheManager.del(tokenKey);
-      await this.cacheManager.del(`${email}-otp`);
-      return { message: 'Password reset successfully' };
+      if (result.rowCount) {
+        // A password reset signs out every existing session.
+        await this.revokeAllSessions(result.rows[0].id, client);
+        updated = true;
+      }
+      await client.query('COMMIT');
     } catch (error) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        /* ignore rollback errors */
+      }
       throw new InternalServerErrorException('Failed to reset password');
     } finally {
       client.release();
     }
+
+    await this.cacheManager.del(tokenKey);
+    await this.cacheManager.del(`${email}-otp`);
+    if (!updated) {
+      throw new BadRequestException(
+        'Reset session expired or invalid. Request a new recovery code.',
+      );
+    }
+    return { message: 'Password reset successfully' };
   }
 
   private async sendRecoveryCode(email: string, otp: string) {
@@ -487,23 +574,35 @@ export class AuthService {
       );
 
       if (!isPasswordValid) {
-        const attempts = user.failed_login_attempts + 1;
+        // Atomic increment; an expired lock starts a fresh count so the next
+        // wrong password after a lockout does not immediately re-lock.
+        const counted = await client.query(
+          `
+        UPDATE users
+        SET failed_login_attempts = CASE
+              WHEN locked_until IS NOT NULL AND locked_until < NOW() THEN 1
+              ELSE COALESCE(failed_login_attempts, 0) + 1
+            END,
+            locked_until = CASE
+              WHEN locked_until IS NOT NULL AND locked_until < NOW() THEN NULL
+              ELSE locked_until
+            END
+        WHERE id = $1
+        RETURNING failed_login_attempts
+        `,
+          [user.id]
+        );
+        const attempts = Number(counted.rows[0]?.failed_login_attempts) || 0;
 
         let lockedUntil: Date | null = null;
 
-        if (attempts >= 5) {
+        if (attempts >= LOGIN_MAX_ATTEMPTS) {
           lockedUntil = new Date(Date.now() + LOGIN_LOCK_MS);
+          await client.query(
+            `UPDATE users SET locked_until = $1 WHERE id = $2`,
+            [lockedUntil, user.id],
+          );
         }
-
-        await client.query(
-          `
-        UPDATE users
-        SET failed_login_attempts = $1,
-            locked_until = $2
-        WHERE id = $3
-        `,
-          [attempts, lockedUntil, user.id]
-        );
 
         await client.query('COMMIT');
 
@@ -515,7 +614,7 @@ export class AuthService {
       }
 
       // Only after a valid password: block unverified accounts and resend link.
-      if (REQUIRE_EMAIL_VERIFICATION && !user.email_verified) {
+      if (isEmailVerificationRequired() && !user.email_verified) {
         await client.query('ROLLBACK');
         try {
           await this.sendVerificationEmail(user.id, user.email, user.full_name);
@@ -537,88 +636,6 @@ export class AuthService {
     }
   }
 
-  async faceLoginAvailable() {
-    const result = await this.pgPool.query(
-      `SELECT 1
-       FROM face_login_profiles p
-       JOIN users u ON u.id = p.user_id
-       WHERE u.deleted_at IS NULL
-       LIMIT 1`,
-    );
-    return { enabled: Boolean(result.rowCount) };
-  }
-
-  async loginWithFace(dto: MatchFaceLoginDto, req: Request) {
-    const probe = assertDescriptor(dto.descriptor);
-    const profiles = await this.pgPool.query(
-      `SELECT u.id, u.email, u.full_name, u.country, u.currency, u.timezone, u.locale,
-              u.avatar_url, u.email_verified, u.locked_until, u.deleted_at,
-              p.object_key, p.template
-       FROM face_login_profiles p
-       JOIN users u ON u.id = p.user_id
-       WHERE u.deleted_at IS NULL`,
-    );
-
-    let best: { user: (typeof profiles.rows)[number]; distance: number } | null = null;
-    let second = 1;
-    for (const row of profiles.rows) {
-      const descriptor = await this.readFaceDescriptor(row);
-      if (!descriptor) continue;
-      const distance = faceDistance(probe, descriptor);
-      if (!best || distance < best.distance) {
-        if (best) second = Math.min(second, best.distance);
-        best = { user: row, distance };
-      } else if (distance < second) {
-        second = distance;
-      }
-    }
-
-    const matched =
-      best &&
-      best.distance <= faceMatchDistance() &&
-      second - best.distance >= 0.08;
-    if (!matched || !best) {
-      throw new UnauthorizedException('Face not recognized');
-    }
-
-    if (best.user.locked_until && new Date(best.user.locked_until) > new Date()) {
-      throw new AccountLockedException(new Date(best.user.locked_until));
-    }
-    if (REQUIRE_EMAIL_VERIFICATION && !best.user.email_verified) {
-      throw new ForbiddenException(
-        'EMAIL_NOT_VERIFIED: Please verify your email before signing in.',
-      );
-    }
-
-    const client = await this.pgPool.connect();
-    try {
-      await client.query('BEGIN');
-      return await this.issueSession(client, best.user, req);
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-      await this.userService.syncUsersToCache();
-    }
-  }
-
-  private async readFaceDescriptor(row: {
-    object_key?: string;
-    template?: unknown;
-  }): Promise<number[] | null> {
-    const fromAccount = decryptFaceTemplate(row.template);
-    if (fromAccount) return fromAccount;
-    const objectKey = String(row.object_key || '');
-    if (!objectKey || objectKey.startsWith('inline:')) return null;
-    try {
-      const stored = await this.storage.getJson(objectKey);
-      return decryptFaceTemplate(stored);
-    } catch {
-      return null;
-    }
-  }
-
   private async issueSession(client: PoolClient, user: any, req: Request) {
     await client.query(
       `UPDATE users
@@ -629,27 +646,9 @@ export class AuthService {
       [user.id],
     );
 
-    const accessToken = await this.jwtService.signAsync(
-      { sub: user.id, email: user.email },
-      {
-        expiresIn: '15m',
-        secret:
-          process.env.JWT_ACCESS_SECRET ||
-          process.env.JWT_SECRET ||
-          appConfiguration().JWT.SECRET,
-      },
-    );
-    const refreshToken = await this.jwtService.signAsync(
-      { sub: user.id },
-      {
-        expiresIn: '7d',
-        secret:
-          process.env.JWT_REFRESH_SECRET ||
-          process.env.JWT_SECRET ||
-          appConfiguration().JWT.REFRESH_SECRET,
-      },
-    );
-    const refreshTokenHash = await bcrypt.hash(refreshToken, 10);
+    const accessToken = await this.signAccessToken(user.id, user.email);
+    const refreshToken = await this.signRefreshToken(user.id);
+    const refreshTokenHash = hashRefreshToken(refreshToken);
     const clientHeader =
       req.headers['x-opal-client'] ?? req.headers['x-finos-client'];
     const clientPlatform =
@@ -690,94 +689,250 @@ export class AuthService {
     };
   }
 
-  async refreshToken(req: Request, res: Response) {
-    const refreshToken =
-      req.cookies?.['refreshToken'] || req.body?.refreshToken;
+  private signAccessToken(userId: string, email?: string | null) {
+    return this.jwtService.signAsync(
+      { sub: userId, ...(email ? { email } : {}), typ: 'access' },
+      {
+        expiresIn: ACCESS_TOKEN_TTL,
+        secret: appConfiguration().JWT.SECRET,
+      },
+    );
+  }
+
+  /** Unique per issue (jti) so every session row gets a distinct hash. */
+  private signRefreshToken(userId: string) {
+    return this.jwtService.signAsync(
+      { sub: userId, typ: 'refresh', jti: randomUUID() },
+      {
+        expiresIn: REFRESH_TOKEN_TTL,
+        secret: appConfiguration().JWT.REFRESH_SECRET,
+      },
+    );
+  }
+
+  private async revokeAllSessions(
+    userId: string,
+    client: Pick<Pool, 'query'> | PoolClient = this.pgPool,
+  ) {
+    await client.query(
+      `UPDATE user_sessions
+       SET revoked_at = NOW(), updated_at = NOW()
+       WHERE user_id = $1 AND revoked_at IS NULL`,
+      [userId],
+    );
+  }
+
+  /**
+   * Sessions created before the SHA-256 switch store bcrypt hashes. Kept for
+   * one release so already signed-in users are not logged out; a match is
+   * rotated onto the new scheme by the caller.
+   */
+  private async findLegacyBcryptSession(
+    userId: string,
+    refreshToken: string,
+  ): Promise<{ id: string; refresh_token: string } | null> {
+    const result = await this.pgPool.query(
+      `SELECT id, refresh_token FROM user_sessions
+       WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > NOW()
+         AND refresh_token LIKE $2
+       ORDER BY created_at DESC`,
+      [userId, '$2%'],
+    );
+    for (const candidate of result.rows) {
+      if (await bcrypt.compare(refreshToken, candidate.refresh_token)) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  private async readRefreshGrace(
+    tokenHash: string,
+  ): Promise<{ accessToken: string; refreshToken: string } | null> {
+    try {
+      const cached = await this.cacheManager.get<{
+        accessToken: string;
+        refreshToken: string;
+      }>(`refresh-grace:${tokenHash}`);
+      return cached?.accessToken && cached?.refreshToken ? cached : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async refreshToken(presentedToken: string, res: Response) {
+    const refreshToken = String(presentedToken || '').trim();
     if (!refreshToken) {
       throw new UnauthorizedException('Refresh token missing');
     }
     let payload: any;
     try {
       payload = await this.jwtService.verifyAsync(refreshToken, {
-        secret:
-          process.env.JWT_REFRESH_SECRET ||
-          process.env.JWT_SECRET ||
-          appConfiguration().JWT.REFRESH_SECRET,
+        secret: appConfiguration().JWT.REFRESH_SECRET,
       });
     } catch {
       throw new UnauthorizedException('Invalid refresh token');
     }
+    // Only refresh tokens may be exchanged. Tokens without `typ` predate this
+    // release and are accepted only via a legacy bcrypt session row below.
+    if (!payload?.sub || (payload.typ !== undefined && payload.typ !== 'refresh')) {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+    const userId = String(payload.sub);
+    const presentedHash = hashRefreshToken(refreshToken);
 
-    const sessionResult = await this.pgPool.query(
-      `SELECT id, refresh_token FROM user_sessions
-      WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > NOW()
-      ORDER BY created_at DESC`,
-      [payload.sub]
-    )
+    const graced = await this.readRefreshGrace(presentedHash);
+    if (graced) {
+      res.cookie(REFRESH_COOKIE_NAME, graced.refreshToken, refreshCookieOptions());
+      return graced;
+    }
 
-    if (!sessionResult.rowCount) {
+    const userResult = await this.pgPool.query(
+      `SELECT id, email FROM users WHERE id = $1 AND deleted_at IS NULL`,
+      [userId],
+    );
+    if (!userResult.rowCount) {
+      await this.revokeAllSessions(userId);
       throw new UnauthorizedException('Session not found');
     }
 
-    // A user can have multiple active sessions (different devices/logins).
-    // Find the one whose stored hash matches this refresh token.
-    let session: { id: string; refresh_token: string } | undefined;
-    for (const candidate of sessionResult.rows) {
-      if (await bcrypt.compare(refreshToken, candidate.refresh_token)) {
-        session = candidate;
-        break;
+    const newAccessToken = await this.signAccessToken(
+      userId,
+      userResult.rows[0].email,
+    );
+    const newRefreshToken = await this.signRefreshToken(userId);
+    const newRefreshTokenHash = hashRefreshToken(newRefreshToken);
+
+    // Rotate atomically: only the request whose token still matches the
+    // stored hash wins, so a token can be exchanged once.
+    let rotated = false;
+    if (payload.typ === 'refresh') {
+      const result = await this.pgPool.query(
+        `UPDATE user_sessions
+         SET refresh_token = $3,
+             session_token = $4,
+             expires_at = NOW() + INTERVAL '7 days',
+             updated_at = NOW()
+         WHERE user_id = $1 AND refresh_token = $2
+           AND revoked_at IS NULL AND expires_at > NOW()
+         RETURNING id`,
+        [userId, presentedHash, newRefreshTokenHash, randomUUID()],
+      );
+      rotated = Boolean(result.rowCount);
+    } else {
+      const legacy = await this.findLegacyBcryptSession(userId, refreshToken);
+      if (legacy) {
+        const result = await this.pgPool.query(
+          `UPDATE user_sessions
+           SET refresh_token = $3,
+               session_token = $4,
+               expires_at = NOW() + INTERVAL '7 days',
+               updated_at = NOW()
+           WHERE id = $1 AND refresh_token = $2 AND revoked_at IS NULL
+           RETURNING id`,
+          [legacy.id, legacy.refresh_token, newRefreshTokenHash, randomUUID()],
+        );
+        rotated = Boolean(result.rowCount);
       }
     }
 
-    if (!session) {
-      throw new UnauthorizedException('Invalid refresh token');
+    if (!rotated) {
+      // Possibly a concurrent refresh that rotated this token a moment ago.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const racedGrace = await this.readRefreshGrace(presentedHash);
+      if (racedGrace) {
+        res.cookie(
+          REFRESH_COOKIE_NAME,
+          racedGrace.refreshToken,
+          refreshCookieOptions(),
+        );
+        return racedGrace;
+      }
+      // The token is still the latest one of a session that was deliberately
+      // ended (logout, "sign out other devices", per-session revoke) or that
+      // expired: reject it without touching the user's other sessions.
+      const ended = await this.pgPool.query(
+        `SELECT 1 FROM user_sessions
+         WHERE user_id = $1 AND refresh_token = $2
+           AND (revoked_at IS NOT NULL OR expires_at <= NOW())
+         LIMIT 1`,
+        [userId, presentedHash],
+      );
+      if (ended.rowCount) {
+        throw new UnauthorizedException(
+          'Session expired or was signed out. Please sign in again.',
+        );
+      }
+      // A validly signed refresh token that matches no session row was
+      // already rotated away: treat it as stolen and end every session.
+      await this.revokeAllSessions(userId);
+      throw new UnauthorizedException(
+        'Session expired or was signed out. Please sign in again.',
+      );
     }
 
-    const newAccessToken = await this.jwtService.signAsync(
-      {
-        sub: payload.sub,
-      },
-      {
-        expiresIn: '15m',
-        secret:
-          process.env.JWT_ACCESS_SECRET ||
-          process.env.JWT_SECRET ||
-          appConfiguration().JWT.SECRET,
-      },
-    );
-
-    // new refresh token rotating.
-    const newRefreshToken = await this.jwtService.signAsync(
-      {
-        sub: payload.sub,
-      },
-      {
-        expiresIn: '7d',
-        secret:
-          process.env.JWT_REFRESH_SECRET ||
-          process.env.JWT_SECRET ||
-          appConfiguration().JWT.REFRESH_SECRET,
-      },
-    );
-
-    const newRefreshTokenHashed = await bcrypt.hash(newRefreshToken, 10);
-
-    await this.pgPool.query(
-      `UPDATE user_sessions
-      SET session_token = $1,
-          refresh_token = $2,
-          updated_at = NOW()
-      WHERE id = $3`,
-      [newAccessToken, newRefreshTokenHashed, session.id]
-    )
-
-
-    res.cookie(REFRESH_COOKIE_NAME, newRefreshToken, refreshCookieOptions());
-    return {
+    const tokens = {
       accessToken: newAccessToken,
       refreshToken: newRefreshToken,
+    };
+    try {
+      await this.cacheManager.set(
+        `refresh-grace:${presentedHash}`,
+        tokens,
+        REFRESH_REUSE_GRACE_MS,
+      );
+    } catch {
+      /* grace window is best-effort */
     }
 
+    res.cookie(REFRESH_COOKIE_NAME, newRefreshToken, refreshCookieOptions());
+    return tokens;
+  }
+
+  /** Revoke the session behind a refresh token (logout). Always succeeds. */
+  async logout(presentedToken: string) {
+    const refreshToken = String(presentedToken || '').trim();
+    if (!refreshToken) return { message: 'Signed out' };
+
+    const tokenHash = hashRefreshToken(refreshToken);
+    try {
+      await this.cacheManager.del(`refresh-grace:${tokenHash}`);
+    } catch {
+      /* ignore cache errors */
+    }
+
+    const revoked = await this.pgPool.query(
+      `UPDATE user_sessions
+       SET revoked_at = NOW(), updated_at = NOW()
+       WHERE refresh_token = $1 AND revoked_at IS NULL
+       RETURNING id`,
+      [tokenHash],
+    );
+    if (!revoked.rowCount) {
+      // Legacy (pre-SHA-256) session: needs the user id to find the row.
+      try {
+        const payload: any = await this.jwtService.verifyAsync(refreshToken, {
+          secret: appConfiguration().JWT.REFRESH_SECRET,
+        });
+        if (payload?.sub && payload.typ === undefined) {
+          const legacy = await this.findLegacyBcryptSession(
+            String(payload.sub),
+            refreshToken,
+          );
+          if (legacy) {
+            await this.pgPool.query(
+              `UPDATE user_sessions
+               SET revoked_at = NOW(), updated_at = NOW()
+               WHERE id = $1`,
+              [legacy.id],
+            );
+          }
+        }
+      } catch {
+        /* invalid or expired token: nothing to revoke */
+      }
+    }
+    return { message: 'Signed out' };
   }
 
 

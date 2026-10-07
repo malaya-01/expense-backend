@@ -76,6 +76,24 @@ export class ThemeTokensDto {
   selectionAlpha?: string;
 }
 
+/** Font pairing ids for a theme (ids are resolved by the frontend registry). */
+export class ThemeFontsDto {
+  @IsString()
+  @MinLength(1)
+  @MaxLength(40)
+  sans!: string;
+
+  @IsString()
+  @MinLength(1)
+  @MaxLength(40)
+  mono!: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  heading?: string;
+}
+
 export class CustomThemeDto {
   @IsString()
   @MinLength(1)
@@ -96,6 +114,12 @@ export class CustomThemeDto {
   @ValidateNested()
   @Type(() => ThemeTokensDto)
   tokens!: ThemeTokensDto;
+
+  @IsOptional()
+  @IsObject()
+  @ValidateNested()
+  @Type(() => ThemeFontsDto)
+  fonts?: ThemeFontsDto;
 
   @IsOptional()
   builtin?: boolean;

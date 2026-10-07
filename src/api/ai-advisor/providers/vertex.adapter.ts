@@ -38,10 +38,36 @@ function resolveMaxOutputTokens(request: ProviderChatRequest): number {
   return VERTEX_MAX_OUTPUT_TOKENS;
 }
 
+/** Models whose thinking cannot be turned off (thinkingBudget 0 is rejected). */
+function requiresThinking(model: string): boolean {
+  const id = String(model || '').toLowerCase();
+  return id.includes('2.5-pro') || id.includes('gemini-3');
+}
+
 function thinkingBudgetFor(maxOutputTokens: number, model: string): number | null {
   if (!usesThinkingModel(model)) return null;
-  // Leave most of the budget for visible reply text.
-  return Math.min(2048, Math.max(512, Math.floor(maxOutputTokens * 0.12)));
+  // Leave most of the budget for visible reply text; never exceed the output
+  // budget (thinking shares maxOutputTokens).
+  const budget = Math.max(
+    0,
+    Math.min(2048, Math.floor(maxOutputTokens * 0.12)),
+  );
+  return requiresThinking(model) ? Math.max(128, budget) : budget;
+}
+
+/** Non-streaming calls get a hard ceiling so a stalled upstream cannot hang a request. */
+const REQUEST_TIMEOUT_MS = 120_000;
+
+function withTimeout(signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+/** The 'global' location uses the un-prefixed host. */
+function vertexHost(location: string): string {
+  return location === 'global'
+    ? 'aiplatform.googleapis.com'
+    : `${location}-aiplatform.googleapis.com`;
 }
 
 function extractVisibleText(data: unknown): string {
@@ -163,7 +189,7 @@ export class VertexAdapter implements AiProviderAdapter {
     stream: boolean,
   ) {
     const base =
-      `https://${location}-aiplatform.googleapis.com/v1/projects/${projectId}` +
+      `https://${vertexHost(location)}/v1/projects/${projectId}` +
       `/locations/${location}/publishers/google/models/${model}`;
     return stream
       ? `${base}:streamGenerateContent?alt=sse`
@@ -182,7 +208,7 @@ export class VertexAdapter implements AiProviderAdapter {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
       },
-      signal,
+      signal: withTimeout(signal),
       body: JSON.stringify(body),
     });
     if (!res.ok) {
@@ -198,39 +224,8 @@ export class VertexAdapter implements AiProviderAdapter {
     return res.json();
   }
 
-  /**
-   * If Vertex stopped early on MAX_TOKENS, ask once to continue so long
-   * advisor answers are not left mid-sentence.
-   */
-  private async continueIfTruncated(
-    url: string,
-    accessToken: string,
-    request: ProviderChatRequest,
-    partial: string,
-    signal?: AbortSignal,
-  ): Promise<string> {
-    const continuationRequest: ProviderChatRequest = {
-      ...request,
-      messages: [
-        ...request.messages,
-        { role: 'assistant', content: partial },
-        {
-          role: 'user',
-          content:
-            'Continue the previous reply from exactly where it stopped. Do not restart or repeat earlier text — only finish the remaining answer.',
-        },
-      ],
-      // Fresh budget for the continuation segment.
-      maxTokens: Math.max(4096, Math.floor(resolveMaxOutputTokens(request) / 2)),
-    };
-    const data = await this.generateOnce(
-      url,
-      accessToken,
-      this.requestBody(continuationRequest),
-      signal,
-    );
-    return extractVisibleText(data).trim();
-  }
+  // MAX_TOKENS stops are reported via `truncated`; providers/index.ts issues
+  // up to MAX_CONTINUATIONS follow-up requests and stitches/streams them.
 
   async chat(
     config: ProviderConfig,
@@ -250,25 +245,22 @@ export class VertexAdapter implements AiProviderAdapter {
       accessToken,
       this.requestBody({ ...request, model }),
     );
-    let content = extractVisibleText(data).trim();
+    const content = extractVisibleText(data).trim();
+    const finishReason = finishReasonOf(data);
     if (!content) {
-      throw new BadRequestException('Vertex returned an empty response.');
-    }
-
-    if (isMaxTokensStop(finishReasonOf(data))) {
-      const more = await this.continueIfTruncated(
-        url,
-        accessToken,
-        { ...request, model },
-        content,
-      ).catch(() => '');
-      if (more) content = `${content}${more.startsWith('\n') ? '' : '\n'}${more}`.trim();
+      throw new BadRequestException(
+        isMaxTokensStop(finishReason)
+          ? 'Vertex hit the output token limit before replying.'
+          : 'Vertex returned an empty response.',
+      );
     }
 
     return {
       content,
       model,
       provider: 'vertex',
+      finish_reason: finishReason || undefined,
+      truncated: isMaxTokensStop(finishReason),
       usage: {
         input_tokens: (data as any)?.usageMetadata?.promptTokenCount,
         output_tokens: (data as any)?.usageMetadata?.candidatesTokenCount,
@@ -344,23 +336,13 @@ export class VertexAdapter implements AiProviderAdapter {
       throw new BadRequestException('Vertex returned an empty response.');
     }
 
-    if (isMaxTokensStop(lastFinishReason) && !signal?.aborted) {
-      const continueUrl = this.endpoint(projectId, location, model, false);
-      const more = await this.continueIfTruncated(
-        continueUrl,
-        accessToken,
-        { ...request, model },
-        content,
-        signal,
-      ).catch(() => '');
-      if (more) {
-        const glue = more.startsWith('\n') ? '' : '\n';
-        content += `${glue}${more}`;
-        yield `${glue}${more}`;
-      }
-    }
-
-    return { content, model, provider: 'vertex' };
+    return {
+      content,
+      model,
+      provider: 'vertex',
+      finish_reason: lastFinishReason || undefined,
+      truncated: isMaxTokensStop(lastFinishReason),
+    };
   }
 
   async testConnection(config: ProviderConfig) {
@@ -396,11 +378,12 @@ export class VertexAdapter implements AiProviderAdapter {
     try {
       const token = await this.getAccessToken(sa);
       const url =
-        `https://${location}-aiplatform.googleapis.com/v1/projects/` +
+        `https://${vertexHost(location)}/v1/projects/` +
         `${encodeURIComponent(projectId)}/locations/${encodeURIComponent(location)}` +
         '/publishers/google/models?pageSize=100';
       const res = await fetch(url, {
         headers: { Authorization: `Bearer ${token}` },
+        signal: withTimeout(),
       });
       if (!res.ok) return [];
       const data = await res.json();

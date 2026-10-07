@@ -89,17 +89,16 @@ export function isMailConfigured() {
 
 /**
  * Inline recovery codes when mail cannot be delivered.
- * Set PASSWORD_RESET_INLINE_CODE=false to disable.
+ *
+ * WARNING: returning the OTP in the HTTP response lets anyone who knows an
+ * email reset that account. Opt-in only via PASSWORD_RESET_INLINE_CODE=true;
+ * turn it off again as soon as outbound mail is deliverable.
  */
 export function shouldOfferInlineRecoveryCode() {
   const flag = (process.env.PASSWORD_RESET_INLINE_CODE || '')
     .trim()
     .toLowerCase();
-  if (flag === 'true' || flag === '1' || flag === 'yes') return true;
-  if (flag === 'false' || flag === '0' || flag === 'no') return false;
-  return (
-    process.env.RENDER === 'true' || Boolean(process.env.RENDER_SERVICE_ID)
-  );
+  return flag === 'true' || flag === '1' || flag === 'yes';
 }
 
 export function hasReliableMailTransport() {

@@ -314,7 +314,7 @@ export class InvestmentsService {
     containerId: string,
   ) {
     const container = await client.query(
-      `SELECT id, currency FROM financial_containers
+      `SELECT id, name, currency, balance FROM financial_containers
        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
        FOR UPDATE`,
       [containerId, userId],
@@ -342,11 +342,58 @@ export class InvestmentsService {
       );
     }
 
+    // Post the revaluation through the ledger so container balances keep
+    // matching their journal lines (instead of overwriting the balance).
+    const target = Math.round((total + Number.EPSILON) * 100) / 100;
+    const delta =
+      Math.round((target - Number(container.rows[0].balance)) * 100) / 100;
+    if (Math.abs(delta) < 0.01) return;
+
+    const baseCurrency = await this.getUserCurrency(client, userId);
+    const nativeAmount = Math.abs(delta);
+    const amountBase = Math.max(
+      0.0001,
+      convertAmount(nativeAmount, containerCurrency, baseCurrency),
+    );
+    const increase = delta > 0;
+    const metadata = JSON.stringify({
+      reason: 'Investment revaluation',
+      displayed_delta: delta,
+    });
+    const journal = await client.query(
+      `INSERT INTO ledger_journals
+        (user_id, description, source_module, reference_container_id, metadata)
+       VALUES ($1, $2, 'investments', $3, $4::jsonb)
+       RETURNING id`,
+      [
+        userId,
+        `Investment revaluation: ${container.rows[0].name}`,
+        containerId,
+        metadata,
+      ],
+    );
+    await client.query(
+      `INSERT INTO ledger_journal_lines
+        (journal_id, container_id, account_code, debit_base, credit_base,
+         native_amount, currency, sequence_number, metadata)
+       VALUES
+        ($1, $2, NULL, $3, $4, $5, $6, 1, $7::jsonb),
+        ($1, NULL, 'equity:unrealized_gain', $4, $3, $5, $6, 2, $7::jsonb)`,
+      [
+        journal.rows[0].id,
+        containerId,
+        increase ? amountBase : 0,
+        increase ? 0 : amountBase,
+        nativeAmount,
+        containerCurrency,
+        metadata,
+      ],
+    );
     await client.query(
       `UPDATE financial_containers
-       SET balance = $1, updated_at = NOW()
+       SET balance = balance + $1, updated_at = NOW()
        WHERE id = $2 AND user_id = $3`,
-      [Math.round((total + Number.EPSILON) * 100) / 100, containerId, userId],
+      [delta, containerId, userId],
     );
   }
 

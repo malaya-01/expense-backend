@@ -31,7 +31,7 @@ export class CategoriesService {
         const result = await db.query(
           `INSERT INTO categories (user_id, name, description, color, icon, is_system)
            VALUES ($1, $2, $3, $4, $5, TRUE)
-           ON CONFLICT (user_id, name) DO NOTHING
+           ON CONFLICT (user_id, name) WHERE deleted_at IS NULL DO NOTHING
            RETURNING id`,
           [
             userId,
@@ -50,7 +50,7 @@ export class CategoriesService {
   }
 
   async create(user_id: string, createCategoryDto: CreateCategoryDto) {
-    const { name, description, color, icon, parent_id, is_system, budget_amount, budget_period } = createCategoryDto
+    const { name, description, color, icon, parent_id, budget_amount, budget_period } = createCategoryDto
     const client = await this.pgPool.connect()
     const normalizedIcon = normalizeCategoryIcon(icon)
     
@@ -64,6 +64,16 @@ export class CategoriesService {
         throw new BadRequestException('A category with this name already exists.')
       }
 
+      if (parent_id) {
+        const parent = await client.query(
+          `SELECT 1 FROM categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+          [parent_id, user_id]
+        )
+        if (!parent.rowCount) {
+          throw new BadRequestException('Parent category not found.')
+        }
+      }
+
       const clientId = (createCategoryDto as { id?: string }).id
       const result = await client.query(
         clientId
@@ -74,14 +84,17 @@ export class CategoriesService {
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
              RETURNING id, user_id, name, description, color, icon, parent_id, is_system, budget_amount, budget_period, created_at, updated_at`,
         clientId
-          ? [clientId, user_id, name, description || null, color || null, normalizedIcon, parent_id || null, is_system || false, budget_amount || null, budget_period || null]
-          : [user_id, name, description || null, color || null, normalizedIcon, parent_id || null, is_system || false, budget_amount || null, budget_period || null]
+          ? [clientId, user_id, name, description || null, color || null, normalizedIcon, parent_id || null, false, budget_amount || null, budget_period || null]
+          : [user_id, name, description || null, color || null, normalizedIcon, parent_id || null, false, budget_amount || null, budget_period || null]
       )
 
       return result.rows[0]
     } catch(error: any) {
-      if (error.message?.includes('A category with this name already exists')) {
+      if (error?.status === 400) {
         throw error
+      }
+      if (error?.code === '23505') {
+        throw new BadRequestException('A category with this name already exists.')
       }
       throw new BadRequestException(error.message || 'Failed to create category')
     } finally {
@@ -169,7 +182,25 @@ export class CategoriesService {
     const client = await this.pgPool.connect()
 
     try{
-      const payload = { ...updateCategoryDto } as Record<string, unknown>
+      // Only user-editable columns; user_id / is_system must never be reassigned.
+      const editable = ['name', 'description', 'color', 'icon', 'parent_id', 'budget_amount', 'budget_period'] as const
+      const payload: Record<string, unknown> = {}
+      for (const key of editable) {
+        const value = (updateCategoryDto as Record<string, unknown>)[key]
+        if (value !== undefined) payload[key] = value
+      }
+      if (payload.parent_id) {
+        if (payload.parent_id === category_id) {
+          throw new BadRequestException('A category cannot be its own parent.')
+        }
+        const parent = await client.query(
+          `SELECT 1 FROM categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+          [payload.parent_id, user_id]
+        )
+        if (!parent.rowCount) {
+          throw new BadRequestException('Parent category not found.')
+        }
+      }
       if (payload.icon !== undefined) {
         payload.icon = normalizeCategoryIcon(
           typeof payload.icon === 'string' ? payload.icon : null,
@@ -184,7 +215,7 @@ export class CategoriesService {
       const values = Object.values(payload)
       values.push(user_id, category_id)
 
-      const query =  `UPDATE categories SET ${setClause}, updated_at = NOW() WHERE user_id = $${values.length -1} AND id = $${values.length} RETURNING *
+      const query =  `UPDATE categories SET ${setClause}, updated_at = NOW() WHERE user_id = $${values.length -1} AND id = $${values.length} AND deleted_at IS NULL RETURNING *
       `
       const result = await client.query(query, values)
       if(result.rowCount === 0){
@@ -192,7 +223,11 @@ export class CategoriesService {
       }
 
       return result.rows[0]
-    }catch(error){
+    }catch(error: any){
+      if (error?.status === 400) throw error
+      if (error?.code === '23505') {
+        throw new BadRequestException('A category with this name already exists.')
+      }
       console.log(error)
       throw new BadRequestException("Failed to update category.")
     }finally{

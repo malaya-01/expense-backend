@@ -24,7 +24,8 @@ export class AccountsService {
       await client.query('BEGIN');
       const existing = await client.query(
         `SELECT id FROM financial_containers
-         WHERE user_id = $1 AND name = $2 AND deleted_at IS NULL`,
+         WHERE user_id = $1 AND name = $2 AND deleted_at IS NULL
+           AND space_id IS NULL`,
         [userId, dto.name],
       );
       if (existing.rowCount !== 0) {
@@ -137,7 +138,8 @@ export class AccountsService {
         `SELECT id, user_id, name, type, balance, currency, institution, color, notes,
                 include_in_net_worth, space_id, created_at, updated_at, deleted_at
          FROM financial_containers
-         WHERE user_id = $1 AND id = $2 AND deleted_at IS NULL`,
+         WHERE user_id = $1 AND id = $2 AND deleted_at IS NULL
+           AND space_id IS NULL`,
         [userId, id],
       );
       if (!result.rowCount) {
@@ -162,6 +164,7 @@ export class AccountsService {
         `SELECT id, name, type, balance, currency
          FROM financial_containers
          WHERE user_id = $1 AND id = $2 AND deleted_at IS NULL
+           AND space_id IS NULL
          FOR UPDATE`,
         [userId, id],
       );
@@ -179,6 +182,8 @@ export class AccountsService {
           `SELECT EXISTS (
              SELECT 1 FROM ledger_transactions
              WHERE (source_container_id = $1 OR destination_container_id = $1)
+           ) OR EXISTS (
+             SELECT 1 FROM ledger_journal_lines WHERE container_id = $1
            ) AS has_activity`,
           [id],
         );
@@ -280,10 +285,34 @@ export class AccountsService {
   async remove(userId: string, id: string) {
     const client = await this.pgPool.connect();
     try {
+      // Archiving a container that still drives a loan or a live recurring
+      // schedule would make those fail on every run.
+      const busy = await client.query(
+        `SELECT
+           EXISTS (SELECT 1 FROM loans
+                   WHERE container_id = $1 AND deleted_at IS NULL
+                     AND status IN ('active', 'paused')) AS has_loan,
+           EXISTS (SELECT 1 FROM recurring_schedules
+                   WHERE (source_container_id = $1 OR destination_container_id = $1)
+                     AND deleted_at IS NULL
+                     AND status IN ('draft', 'active', 'paused')) AS has_schedule`,
+        [id],
+      );
+      if (busy.rows[0]?.has_loan) {
+        throw new BadRequestException(
+          'This container backs an active loan. Close or archive the loan first.',
+        );
+      }
+      if (busy.rows[0]?.has_schedule) {
+        throw new BadRequestException(
+          'Recurring schedules still use this container. Archive or edit them first.',
+        );
+      }
       const result = await client.query(
         `UPDATE financial_containers
          SET deleted_at = NOW(), updated_at = NOW()
          WHERE user_id = $1 AND id = $2 AND deleted_at IS NULL
+           AND space_id IS NULL
          RETURNING id`,
         [userId, id],
       );

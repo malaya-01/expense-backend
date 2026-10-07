@@ -333,6 +333,27 @@ export class SpacesController {
     }
   }
 
+  @Delete(':spaceId/expenses/:expenseId')
+  @ApiOperation({ summary: 'Delete a space expense and its stored receipt' })
+  @RequirePermissions('spaces.delete')
+  async deleteExpense(
+    @Req() req: Request,
+    @Param('spaceId') spaceId: string,
+    @Param('expenseId') expenseId: string,
+    @Res() res: Response,
+  ) {
+    try {
+      const data = await this.spacesService.deleteExpense(
+        this.userId(req),
+        spaceId,
+        expenseId,
+      );
+      return res.status(HttpStatus.OK).send(successResponse(data, 'Expense deleted'));
+    } catch (error) {
+      return this.fail(res, error);
+    }
+  }
+
   @Get(':spaceId/balances')
   @RequirePermissions('spaces.read')
   async balances(

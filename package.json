@@ -28,7 +28,8 @@
     "migration:check": "node scripts/fix-migration-tracking.js check",
     "migration:list": "node scripts/list-pending-migrations.js",
     "migration:fix": "node scripts/fix-migration-tracking.js fix",
-    "migration:delete": "node scripts/fix-migration-tracking.js delete"
+    "migration:delete": "node scripts/fix-migration-tracking.js delete",
+    "storage:migrate-layout": "node scripts/migrate-r2-layout.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1144.0",

@@ -5,7 +5,7 @@ export type ReceiptAccountHint = {
   account_label?: string | null;
 };
 
-const BANK_ALIASES: Array<{ aliases: string[] }> = [
+export const BANK_ALIASES: Array<{ aliases: string[] }> = [
   { aliases: ['kvb', 'karur vysya', 'karur'] },
   { aliases: ['icici'] },
   { aliases: ['hdfc'] },

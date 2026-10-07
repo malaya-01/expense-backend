@@ -18,8 +18,47 @@ import {
   resolveVisionFreeBackends,
 } from './omniroute.free-backends';
 import { buildLocalOpalReply } from './opal-local-reply';
+import {
+  TRUNCATION_NOTICE,
+  buildContinuationMessages,
+  isTruncationReason,
+  stitchPiece,
+} from './continuation';
 
 export type OmnirouteProgress = (message: string) => void;
+/** Receives reply text as soon as each segment (first reply, continuations) lands. */
+export type OmnirouteSegment = (text: string) => void;
+
+/**
+ * Non-Groq free backends (Gemini Flash via OpenAI-compat, OpenRouter free).
+ * Kept modest so one segment fits the free-route time budget; longer answers
+ * are completed by continuation requests instead.
+ */
+const FREE_MAX_OUTPUT_TOKENS = Math.max(
+  512,
+  Number(process.env.OMNIROUTE_MAX_OUTPUT_TOKENS || 2048) || 2048,
+);
+
+/** Continuations get their own, longer budget (the user already sees text). */
+const CONTINUATION_TIMEOUT_MS = Math.max(
+  FREE_ROUTE_BUDGET_MS,
+  Number(process.env.OMNIROUTE_CONTINUATION_TIMEOUT_MS || 20_000) || 20_000,
+);
+
+/**
+ * Hidden reasoning shares the completion budget on gpt-oss (Groq) and Gemini
+ * 2.5+/3 thinking models; with Groq's 768-token cap "medium" reasoning left
+ * only a few hundred visible tokens. Ask for low effort where documented.
+ */
+function reasoningEffortFor(backend: FreeBackend): string | undefined {
+  if (isGroqBackend(backend) && /gpt-oss/i.test(backend.upstreamModel)) {
+    return 'low';
+  }
+  if (backend.chatUrl?.includes('generativelanguage.googleapis.com')) {
+    return 'low';
+  }
+  return undefined;
+}
 
 function stripThink(text: string): string {
   return String(text || '')
@@ -138,9 +177,10 @@ async function chatOpenAiPost(
   const groq = isGroqBackend(backend);
   const tokenBudget = Math.min(
     request.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
-    groq ? GROQ_FREE_MAX_OUTPUT_TOKENS : 2048,
+    groq ? GROQ_FREE_MAX_OUTPUT_TOKENS : FREE_MAX_OUTPUT_TOKENS,
   );
   const wantJson = Boolean(request.json) && !backend.upstreamModel.startsWith('qwen/');
+  const reasoningEffort = request.json ? undefined : reasoningEffortFor(backend);
   const res = await fetchWithTimeout(
     backend.chatUrl,
     {
@@ -154,6 +194,7 @@ async function chatOpenAiPost(
         ...(groq ? { max_completion_tokens: tokenBudget } : {}),
         stream: false,
         ...(wantJson ? { response_format: { type: 'json_object' } } : {}),
+        ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
       }),
     },
     backend.timeoutMs || FREE_ROUTE_BUDGET_MS,
@@ -166,14 +207,19 @@ async function chatOpenAiPost(
 
   const data = await res.json();
   const content = stripThink(String(data?.choices?.[0]?.message?.content || ''));
+  const finishReason = data?.choices?.[0]?.finish_reason;
   if (!content) {
-    throw new Error(`${backend.label}: empty response`);
+    throw new Error(
+      `${backend.label}: ${isTruncationReason(finishReason) ? 'output limit reached before any visible text' : 'empty response'}`,
+    );
   }
 
   return {
     content,
     model: `${backend.id}/${data?.model || backend.upstreamModel}`,
     provider: 'omniroute',
+    finish_reason: finishReason ? String(finishReason) : undefined,
+    truncated: isTruncationReason(finishReason),
     usage: {
       input_tokens: data?.usage?.prompt_tokens,
       output_tokens: data?.usage?.completion_tokens,
@@ -219,7 +265,9 @@ async function chatGeminiNative(
         contents: [{ role: 'user', parts }],
         generationConfig: {
           temperature: request.temperature ?? 0.1,
-          maxOutputTokens: Math.min(request.maxTokens ?? 1024, 2048),
+          // Thinking tokens share this budget on Gemini 2.5+/3 Flash; 2048
+          // clipped long receipts (line items) mid-JSON.
+          maxOutputTokens: Math.min(request.maxTokens ?? 1024, 4096),
           responseMimeType: 'application/json',
         },
       }),
@@ -237,6 +285,7 @@ async function chatGeminiNative(
       .join('\n')
       .trim(),
   );
+  const finishReason = String(data?.candidates?.[0]?.finishReason || '');
   if (!content) {
     throw new Error(`${backend.label}: empty response`);
   }
@@ -244,6 +293,8 @@ async function chatGeminiNative(
     content,
     model: `${backend.id}/${backend.upstreamModel}`,
     provider: 'omniroute',
+    finish_reason: finishReason || undefined,
+    truncated: isTruncationReason(finishReason),
     usage: {
       input_tokens: data?.usageMetadata?.promptTokenCount,
       output_tokens: data?.usageMetadata?.candidatesTokenCount,
@@ -279,7 +330,7 @@ async function raceRemotes(
   messages: ChatMessage[],
   onProgress?: OmnirouteProgress,
   signal?: AbortSignal,
-): Promise<ProviderChatResult | null> {
+): Promise<{ result: ProviderChatResult; backend: FreeBackend } | null> {
   if (!backends.length) return null;
 
   onProgress?.(
@@ -288,7 +339,10 @@ async function raceRemotes(
       : `Racing ${backends.map((b) => b.label).join(' · ')}…`,
   );
 
-  return await new Promise<ProviderChatResult | null>((resolve) => {
+  return await new Promise<{
+    result: ProviderChatResult;
+    backend: FreeBackend;
+  } | null>((resolve) => {
     let settled = false;
     let pending = backends.length;
     const errors: string[] = [];
@@ -310,7 +364,7 @@ async function raceRemotes(
           if (settled) return;
           settled = true;
           onProgress?.(`Connected via ${backend.label}`);
-          resolve(result);
+          resolve({ result, backend });
         })
         .catch((err: any) => {
           errors.push(err?.message || String(err));
@@ -345,7 +399,7 @@ function isGroqQuotaError(detail: string): boolean {
  */
 export async function trySequentialVisionChat(
   messages: ChatMessage[],
-  options?: { skipGroq?: boolean },
+  options?: { skipGroq?: boolean; maxTokens?: number },
 ): Promise<{ result: ProviderChatResult | null; errors: string[] }> {
   const backends = resolveVisionFreeBackends({ skipGroq: options?.skipGroq });
   const base: ProviderChatRequest = {
@@ -373,7 +427,7 @@ export async function trySequentialVisionChat(
       const run = async (json: boolean) => {
         const maxTokens = isGroqBackend(backend)
           ? GROQ_FREE_MAX_OUTPUT_TOKENS
-          : 1024;
+          : Math.min(options?.maxTokens ?? 3072, 4096);
         const result = await chatOnce(
           backend,
           { ...base, maxTokens, json },
@@ -381,8 +435,13 @@ export async function trySequentialVisionChat(
         );
         const start = result.content.indexOf('{');
         const end = result.content.lastIndexOf('}');
-        if (start < 0 || end <= start) {
+        if (start < 0) {
           throw new Error(`${backend.label}: no JSON object in reply`);
+        }
+        // A reply cut by the token cap is kept from '{' to the end: the
+        // receipt parser repairs it (totals come first in the schema).
+        if (result.truncated || end <= start) {
+          return { ...result, content: result.content.slice(start) };
         }
         return { ...result, content: result.content.slice(start, end + 1) };
       };
@@ -418,7 +477,11 @@ export class OmnirouteAdapter implements AiProviderAdapter {
   async chat(
     config: ProviderConfig,
     request: ProviderChatRequest,
-    options?: { signal?: AbortSignal; onProgress?: OmnirouteProgress },
+    options?: {
+      signal?: AbortSignal;
+      onProgress?: OmnirouteProgress;
+      onSegment?: OmnirouteSegment;
+    },
   ): Promise<ProviderChatResult> {
     const messages = withOpalIdentity(request.messages);
     const remotes = resolveRemoteFreeBackends(request.model || config.model);
@@ -436,10 +499,73 @@ export class OmnirouteAdapter implements AiProviderAdapter {
       onProgress,
       options?.signal,
     );
-    if (raced) return raced;
+    if (raced) {
+      return this.continueOnBackend(
+        raced.backend,
+        raced.result,
+        request,
+        messages,
+        options,
+      );
+    }
 
     onProgress?.('Free models busy — answering as Opal Advisor…');
     return chatOnce(localOpalBackend(), request, messages, options?.signal);
+  }
+
+  /**
+   * Free backends cap output hard (Groq 768 tokens). When the winner stopped
+   * on its limit, ask the SAME backend to continue (user turn, not prefill)
+   * and stitch; segments are surfaced as they land so the UI can stream them.
+   */
+  private async continueOnBackend(
+    backend: FreeBackend,
+    first: ProviderChatResult,
+    request: ProviderChatRequest,
+    messages: ChatMessage[],
+    options?: {
+      signal?: AbortSignal;
+      onProgress?: OmnirouteProgress;
+      onSegment?: OmnirouteSegment;
+    },
+  ): Promise<ProviderChatResult> {
+    const maxContinuations = Math.max(0, request.maxContinuations ?? 0);
+    options?.onSegment?.(first.content);
+    if (!first.truncated || !maxContinuations) return first;
+
+    let content = first.content;
+    let truncated = true;
+    let attempts = 0;
+    const slowBackend = { ...backend, timeoutMs: CONTINUATION_TIMEOUT_MS };
+    while (truncated && attempts < maxContinuations) {
+      if (options?.signal?.aborted) break;
+      attempts += 1;
+      options?.onProgress?.('Continuing the reply…');
+      let next: ProviderChatResult;
+      try {
+        next = await chatOnce(
+          slowBackend,
+          request,
+          buildContinuationMessages(messages, content),
+          options?.signal,
+        );
+      } catch (err: any) {
+        console.warn(
+          `[Opal Free] continuation ${attempts} failed: ${err?.message || err}`,
+        );
+        break;
+      }
+      const piece = stitchPiece(content, next.content);
+      truncated = Boolean(next.truncated);
+      if (!piece.trim()) break;
+      content += piece;
+      options?.onSegment?.(piece);
+    }
+    if (truncated) {
+      content += TRUNCATION_NOTICE;
+      options?.onSegment?.(TRUNCATION_NOTICE);
+    }
+    return { ...first, content, truncated, continuations: attempts };
   }
 
   async *streamChat(
@@ -461,8 +587,9 @@ export class OmnirouteAdapter implements AiProviderAdapter {
     request: ProviderChatRequest,
     onProgress: OmnirouteProgress,
     signal?: AbortSignal,
+    onSegment?: OmnirouteSegment,
   ): Promise<ProviderChatResult> {
-    return this.chat(config, request, { signal, onProgress });
+    return this.chat(config, request, { signal, onProgress, onSegment });
   }
 
   async testConnection(

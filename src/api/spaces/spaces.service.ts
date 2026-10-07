@@ -1,13 +1,20 @@
 import {
   BadRequestException,
   ForbiddenException,
+  HttpException,
   Inject,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { Pool } from 'pg';
 import { randomBytes } from 'crypto';
 import { TransactionsService } from '../transactions/transactions.service';
+import {
+  MEDIA_PATH_PREFIX,
+  ObjectStorageService,
+} from 'src/storage/object-storage.service';
+import { isUuid } from 'src/storage/storage-keys';
 import { can, slugify, type SpacePermission, type SpaceRole } from './spaces.permissions';
 import { computeSplits, round2, simplifyDebts } from './spaces.settlement';
 import {
@@ -23,11 +30,31 @@ import {
   WalletMovementDto,
 } from './dto/spaces.dto';
 
+type SpaceReceiptUpload = {
+  fileId: string | null;
+  mimeType: string | null;
+  /** Only when R2 was unavailable: kept inline until storage:migrate-layout. */
+  legacyBase64: string | null;
+};
+
+/** Accepts raw base64 or a data: URL; returns bytes plus any embedded mime. */
+function decodeReceiptPayload(value: string): { body: Buffer; mime: string | null } {
+  const match = /^data:([^;,]+)?(?:;[^,]*)?;base64,/i.exec(value);
+  const raw = match ? value.slice(match[0].length) : value;
+  return {
+    body: Buffer.from(raw.replace(/\s+/g, ''), 'base64'),
+    mime: match?.[1] || null,
+  };
+}
+
 @Injectable()
 export class SpacesService {
+  private readonly logger = new Logger(SpacesService.name);
+
   constructor(
     @Inject('PG_POOL') private readonly pgPool: Pool,
     private readonly transactionsService: TransactionsService,
+    private readonly storage: ObjectStorageService,
   ) {}
 
   async listMine(userId: string) {
@@ -394,6 +421,20 @@ export class SpacesService {
     if (target.rows[0].role === 'owner' && actor.role !== 'owner') {
       throw new ForbiddenException('Only the owner can change the owner role');
     }
+    if (target.rows[0].role === 'owner' && role !== 'owner') {
+      // Demoting the owner directly would leave the space ownerless; ownership
+      // must be transferred by promoting another member to owner instead.
+      const owners = await this.pgPool.query(
+        `SELECT COUNT(*)::int AS count FROM space_members
+         WHERE space_id = $1 AND role = 'owner' AND status = 'active'`,
+        [spaceId],
+      );
+      if (Number(owners.rows[0]?.count || 0) <= 1) {
+        throw new BadRequestException(
+          'Transfer ownership to another member before changing the owner role',
+        );
+      }
+    }
     if (role === 'owner') {
       if (actor.role !== 'owner') throw new ForbiddenException('Only owner can transfer ownership');
       await this.pgPool.query(
@@ -428,6 +469,7 @@ export class SpacesService {
           'Transfer ownership before leaving this space',
         );
       }
+      await this.assertMemberSettled(spaceId, memberId);
       await this.pgPool.query(
         `UPDATE space_members SET status = 'left', updated_at = NOW() WHERE id = $1`,
         [memberId],
@@ -442,6 +484,7 @@ export class SpacesService {
     if (target.rows[0].role === 'owner') {
       throw new BadRequestException('Transfer ownership before removing the owner');
     }
+    await this.assertMemberSettled(spaceId, memberId);
     await this.pgPool.query(
       `UPDATE space_members SET status = 'removed', updated_at = NOW() WHERE id = $1`,
       [memberId],
@@ -456,15 +499,22 @@ export class SpacesService {
     const membership = await this.requireMembership(userId, spaceId, 'add_expense');
     const space = await this.findSpace(spaceId);
     const splits = computeSplits(dto.split_method, dto.amount, dto.participants);
+    const expenseDate = dto.expense_date || new Date().toISOString().slice(0, 10);
+    // Upload before opening the DB transaction (no locks held during I/O).
+    const receipt = await this.storeSpaceReceipt(userId, spaceId, dto, expenseDate);
     const client = await this.pgPool.connect();
     try {
       await client.query('BEGIN');
+      await this.assertActiveMembers(client, spaceId, [
+        dto.payer_member_id,
+        ...dto.participants.map((p) => p.member_id),
+      ]);
       const expense = await client.query(
         `INSERT INTO space_expenses
           (space_id, title, amount, currency, payer_member_id, split_method, category,
            expense_date, notes, tags, receipt_name, receipt_mime_type, receipt_base64,
-           created_by, link_to_personal, personal_container_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+           created_by, link_to_personal, personal_container_id, receipt_file_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
          RETURNING *`,
         [
           spaceId,
@@ -474,15 +524,16 @@ export class SpacesService {
           dto.payer_member_id,
           dto.split_method,
           dto.category || null,
-          dto.expense_date || new Date().toISOString().slice(0, 10),
+          expenseDate,
           dto.notes || null,
           JSON.stringify(dto.tags || []),
-          dto.receipt_name || null,
-          dto.receipt_mime_type || null,
-          dto.receipt_base64 || null,
+          receipt.fileId || receipt.legacyBase64 ? dto.receipt_name || null : null,
+          receipt.mimeType,
+          receipt.legacyBase64,
           userId,
           dto.link_to_personal === true,
           dto.personal_container_id || null,
+          receipt.fileId,
         ],
       );
       const expenseId = expense.rows[0].id;
@@ -532,15 +583,106 @@ export class SpacesService {
       return this.getExpense(spaceId, expenseId);
     } catch (error: any) {
       await client.query('ROLLBACK');
+      if (receipt.fileId) {
+        await this.storage.deleteSpaceFile(receipt.fileId, spaceId);
+      }
       throw new BadRequestException(error.message || 'Could not create expense');
     } finally {
       client.release();
     }
   }
 
+  /**
+   * Store an inline (base64) receipt in R2 under
+   * spaces/{spaceId}/receipts/{YYYY}/{MM}/{yyyymmdd}-{title}-{id}.{ext}.
+   * Invalid files are rejected; if R2 itself is unavailable the bytes are
+   * kept inline (legacy column) so the expense is not lost.
+   */
+  private async storeSpaceReceipt(
+    userId: string,
+    spaceId: string,
+    dto: CreateSpaceExpenseDto,
+    expenseDate: string,
+  ): Promise<SpaceReceiptUpload> {
+    if (!dto.receipt_base64) {
+      return { fileId: null, mimeType: null, legacyBase64: null };
+    }
+    const decoded = decodeReceiptPayload(dto.receipt_base64);
+    if (!decoded.body.length) {
+      throw new BadRequestException('Receipt file is empty or not valid base64');
+    }
+    try {
+      const saved = await this.storage.saveFile({
+        userId,
+        spaceId,
+        kind: 'receipt',
+        body: decoded.body,
+        mimeType: dto.receipt_mime_type || decoded.mime || 'image/jpeg',
+        filename: dto.receipt_name,
+        date: expenseDate,
+        label: dto.title,
+      });
+      return { fileId: saved.id, mimeType: saved.mimeType, legacyBase64: null };
+    } catch (error) {
+      if (error instanceof BadRequestException) throw error;
+      this.logger.warn(
+        `Space receipt kept inline (R2 unavailable): ${(error as Error)?.message || error}`,
+      );
+      return {
+        fileId: null,
+        mimeType: dto.receipt_mime_type || decoded.mime || null,
+        legacyBase64: decoded.body.toString('base64'),
+      };
+    }
+  }
+
+  /**
+   * Soft-delete a space expense (creator with edit_own_expense, or
+   * owner/admin) and release its receipt file. Balances, budgets and reports
+   * already ignore deleted expenses. A linked personal transaction is left
+   * untouched (it is the member's own ledger record).
+   */
+  async deleteExpense(userId: string, spaceId: string, expenseId: string) {
+    if (!isUuid(spaceId) || !isUuid(expenseId)) {
+      throw new NotFoundException('Expense not found');
+    }
+    const membership = await this.requireMembership(userId, spaceId, 'read');
+    const found = await this.pgPool.query(
+      `SELECT id, title, created_by, receipt_file_id
+       FROM space_expenses
+       WHERE id = $1 AND space_id = $2 AND deleted_at IS NULL`,
+      [expenseId, spaceId],
+    );
+    if (!found.rowCount) throw new NotFoundException('Expense not found');
+    const expense = found.rows[0];
+    const role = membership.role as SpaceRole;
+    const allowed =
+      can(role, 'manage_space') ||
+      (expense.created_by === userId && can(role, 'edit_own_expense'));
+    if (!allowed) {
+      throw new ForbiddenException('Insufficient space permissions');
+    }
+    await this.pgPool.query(
+      `UPDATE space_expenses
+       SET deleted_at = NOW(), updated_at = NOW()
+       WHERE id = $1 AND space_id = $2 AND deleted_at IS NULL`,
+      [expenseId, spaceId],
+    );
+    await this.logActivity(this.pgPool, spaceId, userId, 'expense_deleted', expense.title, {
+      expense_id: expenseId,
+    });
+    if (expense.receipt_file_id) {
+      // Best-effort; never fails the delete.
+      void this.storage.deleteSpaceFile(expense.receipt_file_id as string, spaceId);
+    }
+    return { id: expenseId, deleted: true };
+  }
+
   async listExpenses(spaceId: string) {
     const result = await this.pgPool.query(
       `SELECT e.*,
+              f.public_token AS receipt_token,
+              f.mime_type AS receipt_file_mime,
               json_agg(json_build_object(
                 'id', s.id,
                 'member_id', s.member_id,
@@ -549,14 +691,21 @@ export class SpacesService {
               ) ORDER BY s.owed_amount DESC) AS splits
        FROM space_expenses e
        LEFT JOIN space_expense_splits s ON s.expense_id = e.id
+       LEFT JOIN stored_files f
+         ON f.id = e.receipt_file_id AND f.deleted_at IS NULL
        WHERE e.space_id = $1 AND e.deleted_at IS NULL
-       GROUP BY e.id
+       GROUP BY e.id, f.id
        ORDER BY e.expense_date DESC, e.created_at DESC`,
       [spaceId],
     );
-    return result.rows.map((row) => ({
+    return result.rows.map(({ receipt_token, receipt_file_mime, ...row }) => ({
       ...row,
       amount: Number(row.amount),
+      // Media URL for R2-stored receipts (members only via canAccess /
+      // capability token). receipt_base64 is only set on legacy rows that
+      // storage:migrate-layout has not moved yet.
+      receipt_url: receipt_token ? `${MEDIA_PATH_PREFIX}${receipt_token}` : null,
+      receipt_mime_type: receipt_file_mime || row.receipt_mime_type || null,
       splits: Array.isArray(row.splits)
         ? row.splits.filter((s: any) => s && s.member_id)
         : [],
@@ -621,15 +770,41 @@ export class SpacesService {
   }
 
   async createSettlement(userId: string, spaceId: string, dto: CreateSettlementDto) {
-    await this.requireMembership(userId, spaceId, 'settle');
+    const membership = await this.requireMembership(userId, spaceId, 'settle');
     const space = await this.findSpace(spaceId);
     if (dto.from_member_id === dto.to_member_id) {
       throw new BadRequestException('Cannot settle with yourself');
+    }
+    const actorIsPayer = membership.id === dto.from_member_id;
+    const actorIsReceiver = membership.id === dto.to_member_id;
+    if (
+      !actorIsPayer &&
+      !actorIsReceiver &&
+      membership.role !== 'owner' &&
+      membership.role !== 'admin'
+    ) {
+      throw new ForbiddenException(
+        'Only the payer, the receiver, or a space admin can record this settlement',
+      );
+    }
+    if (
+      dto.link_to_personal &&
+      dto.personal_container_id &&
+      !actorIsPayer &&
+      !actorIsReceiver
+    ) {
+      throw new BadRequestException(
+        'Only the payer or receiver can link a settlement to a personal account',
+      );
     }
     const status = dto.scheduled_at ? 'scheduled' : 'completed';
     const client = await this.pgPool.connect();
     try {
       await client.query('BEGIN');
+      await this.assertActiveMembers(client, spaceId, [
+        dto.from_member_id,
+        dto.to_member_id,
+      ]);
       const result = await client.query(
         `INSERT INTO space_settlements
           (space_id, from_member_id, to_member_id, amount, currency, status, notes,
@@ -657,15 +832,18 @@ export class SpacesService {
       );
       let personalTxId: string | null = null;
       if (dto.link_to_personal && dto.personal_container_id && status === 'completed') {
+        // Payer's money leaves their account; receiver's money arrives in theirs.
         const tx = await this.transactionsService.createWithClient(
           client,
           userId,
           {
-            type: 'expense',
+            type: actorIsPayer ? 'expense' : 'income',
             amount: dto.amount,
             description: `[${space.name}] Settlement`,
             date: new Date().toISOString().slice(0, 10),
-            source_container_id: dto.personal_container_id,
+            ...(actorIsPayer
+              ? { source_container_id: dto.personal_container_id }
+              : { destination_container_id: dto.personal_container_id }),
             currency: space.currency,
             notes: dto.notes || `Space settlement ${result.rows[0].id}`,
           } as any,
@@ -728,25 +906,35 @@ export class SpacesService {
 
   async listBudgets(spaceId: string) {
     const space = await this.findSpace(spaceId);
+    // Spend is scoped to each budget's own current period (weekly = Mon–Sun,
+    // monthly = calendar month, yearly = calendar year) and category filter.
     const budgets = await this.pgPool.query(
-      `SELECT * FROM space_budgets WHERE space_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC`,
+      `SELECT b.*, COALESCE(sp.spent, 0)::float AS spent
+       FROM space_budgets b
+       CROSS JOIN LATERAL (
+         SELECT CASE b.period_type
+                  WHEN 'weekly' THEN 'week'
+                  WHEN 'yearly' THEN 'year'
+                  ELSE 'month'
+                END AS unit
+       ) p
+       CROSS JOIN LATERAL (
+         SELECT date_trunc(p.unit, CURRENT_DATE::timestamp) AS period_start
+       ) w
+       LEFT JOIN LATERAL (
+         SELECT SUM(e.amount) AS spent
+         FROM space_expenses e
+         WHERE e.space_id = b.space_id AND e.deleted_at IS NULL
+           AND e.expense_date >= w.period_start::date
+           AND e.expense_date < (w.period_start + ('1 ' || p.unit)::interval)::date
+           AND (NULLIF(b.category, '') IS NULL OR e.category = b.category)
+       ) sp ON TRUE
+       WHERE b.space_id = $1 AND b.deleted_at IS NULL
+       ORDER BY b.created_at DESC`,
       [spaceId],
-    );
-    const spentByCategory = await this.pgPool.query(
-      `SELECT COALESCE(category, '') AS category, COALESCE(SUM(amount),0)::float AS spent
-       FROM space_expenses
-       WHERE space_id = $1 AND deleted_at IS NULL
-         AND expense_date >= date_trunc('month', CURRENT_DATE)::date
-       GROUP BY 1`,
-      [spaceId],
-    );
-    const map = new Map<string, number>(
-      spentByCategory.rows.map((r) => [String(r.category || ''), Number(r.spent)]),
     );
     return budgets.rows.map((b) => {
-      const spent = b.category
-        ? (map.get(String(b.category)) ?? 0)
-        : spentByCategory.rows.reduce((s, r) => s + Number(r.spent), 0);
+      const spent = Number(b.spent || 0);
       return {
         ...b,
         amount: Number(b.amount),
@@ -849,22 +1037,42 @@ export class SpacesService {
       throw new BadRequestException('Space wallet is not configured');
     }
     const delta = dto.kind === 'deposit' ? dto.amount : -dto.amount;
-    const result = await this.pgPool.query(
-      `UPDATE financial_containers
-       SET balance = balance + $2, updated_at = NOW()
-       WHERE id = $1
-       RETURNING id, name, balance, currency`,
-      [space.wallet_container_id, delta],
-    );
-    await this.logActivity(
-      this.pgPool,
-      spaceId,
-      userId,
-      dto.kind === 'deposit' ? 'wallet_deposit' : 'wallet_withdrawal',
-      `Wallet ${dto.kind}`,
-      { amount: dto.amount, note: dto.note },
-    );
-    return result.rows[0];
+    const client = await this.pgPool.connect();
+    try {
+      await client.query('BEGIN');
+      const locked = await client.query(
+        `SELECT balance FROM financial_containers WHERE id = $1 FOR UPDATE`,
+        [space.wallet_container_id],
+      );
+      if (!locked.rowCount) throw new NotFoundException('Space wallet not found');
+      const current = Number(locked.rows[0].balance || 0);
+      if (current + delta < -0.005) {
+        throw new BadRequestException('Insufficient shared wallet balance');
+      }
+      const result = await client.query(
+        `UPDATE financial_containers
+         SET balance = balance + $2, updated_at = NOW()
+         WHERE id = $1
+         RETURNING id, name, balance, currency`,
+        [space.wallet_container_id, delta],
+      );
+      await this.logActivity(
+        client,
+        spaceId,
+        userId,
+        dto.kind === 'deposit' ? 'wallet_deposit' : 'wallet_withdrawal',
+        `Wallet ${dto.kind}`,
+        { amount: dto.amount, note: dto.note },
+      );
+      await client.query('COMMIT');
+      return result.rows[0];
+    } catch (error: any) {
+      await client.query('ROLLBACK');
+      if (error instanceof HttpException) throw error;
+      throw new BadRequestException(error.message || 'Could not move wallet funds');
+    } finally {
+      client.release();
+    }
   }
 
   async reports(userId: string, spaceId: string) {
@@ -1076,6 +1284,32 @@ export class SpacesService {
       throw new ForbiddenException('Insufficient space permissions');
     }
     return membership;
+  }
+
+  /** Every id must be an active member of this space (not removed/left/foreign). */
+  private async assertActiveMembers(
+    db: Pool | { query: Pool['query'] },
+    spaceId: string,
+    ids: string[],
+  ) {
+    const unique = Array.from(new Set(ids.filter(Boolean)));
+    if (!unique.length) return;
+    const result = await db.query(
+      `SELECT id FROM space_members
+       WHERE space_id = $1 AND status = 'active' AND id = ANY($2::uuid[])`,
+      [spaceId, unique],
+    );
+    if ((result.rowCount || 0) !== unique.length) {
+      throw new BadRequestException('All members must be active members of this space');
+    }
+  }
+
+  private async assertMemberSettled(spaceId: string, memberId: string) {
+    const balances = await this.computeBalances(spaceId);
+    const entry = balances.find((b) => b.member_id === memberId);
+    if (entry && Math.abs(entry.net) > 0.005) {
+      throw new BadRequestException('Settle up before leaving/removing this member');
+    }
   }
 
   private async logActivity(

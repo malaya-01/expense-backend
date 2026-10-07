@@ -1,7 +1,6 @@
 import { Controller, Get, Post, Body, Patch, Param, Delete, Req, Res, HttpStatus } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { LoginAuthDto, PasswordResetDto, RegisterAuthDto } from './dto/create-auth.dto';
-import { MatchFaceLoginDto } from '../user/dto/face-login.dto';
 // import { UpdateAuthDto } from './dto/update-auth.dto';
 import { ApiOperation } from '@nestjs/swagger';
 import { OtpGenerateDto } from './dto/generat-otp.dto';
@@ -10,7 +9,12 @@ import { Request, Response } from 'express';
 import { Throttle } from '@nestjs/throttler';
 import { errorResponse, successResponse } from 'src/utils/response/response';
 import { Public } from 'src/helper/decorators/public.decorator';
-import { REFRESH_COOKIE_NAME, refreshCookieOptions } from './refresh-cookie';
+import {
+  REFRESH_COOKIE_NAME,
+  clearRefreshCookieOptions,
+  readPresentedRefreshToken,
+  refreshCookieOptions,
+} from './refresh-cookie';
 import { AccountLockedException } from './auth.service';
 
 @Controller('auth')
@@ -67,61 +71,6 @@ export class AuthController {
             lockedUntil ? { lockedUntil } : undefined,
           ),
         )
-    }
-  }
-
-  @Public()
-  @Get('face-login/available')
-  @ApiOperation({ summary: 'Whether any account can sign in with face' })
-  async faceLoginAvailable(@Res() res: Response) {
-    try {
-      const result = await this.authService.faceLoginAvailable();
-      return res.status(HttpStatus.OK).send(successResponse(result, 'Face login'));
-    } catch (error) {
-      const statusCode = error.status || error.statusCode || HttpStatus.BAD_REQUEST;
-      return res
-        .status(statusCode)
-        .send(errorResponse(error.message || 'Could not check face login', statusCode));
-    }
-  }
-
-  @Public()
-  @Post('face-login')
-  @Throttle({ default: { limit: 5, ttl: 60_000 } })
-  @ApiOperation({ summary: 'Sign in by matching a face template' })
-  async loginWithFace(
-    @Body() dto: MatchFaceLoginDto,
-    @Req() req: Request,
-    @Res() res: Response,
-  ) {
-    try {
-      const result = await this.authService.loginWithFace(dto, req);
-      res.cookie(REFRESH_COOKIE_NAME, result.refreshToken, refreshCookieOptions());
-      return res.status(HttpStatus.OK).send(successResponse(result, 'User loged in successfully.'));
-    } catch (error) {
-      const response =
-        typeof error.getResponse === 'function' ? error.getResponse() : null;
-      const message =
-        (typeof response === 'string' && response) ||
-        (response && typeof response.message === 'string' && response.message) ||
-        error.message ||
-        'An unexpected error occured';
-      const statusCode = error.statuscode || error.status || HttpStatus.BAD_REQUEST;
-      const lockedUntil =
-        error instanceof AccountLockedException
-          ? error.lockedUntil
-          : typeof error?.lockedUntil === 'string'
-            ? error.lockedUntil
-            : undefined;
-      return res
-        .status(statusCode)
-        .send(
-          errorResponse(
-            message,
-            statusCode,
-            lockedUntil ? { lockedUntil } : undefined,
-          ),
-        );
     }
   }
 
@@ -219,9 +168,30 @@ export class AuthController {
   async refreshToken(@Req() req: Request, @Res() res: Response) {
     // return this.authService.refreshToken(req, res);
     try{
-      const result = await this.authService.refreshToken(req, res)
+      // The explicit body token wins over the cookie (see readPresentedRefreshToken).
+      const result = await this.authService.refreshToken(
+        readPresentedRefreshToken(req),
+        res,
+      )
       return res.status(HttpStatus.OK).send(successResponse(result, 'User loged in successfully.'))
     }catch(error){
+      const message = error.message || 'An unexpected error occured'
+      const statusCode = error.statuscode || error.status || HttpStatus.BAD_REQUEST
+      return res.status(statusCode).send(errorResponse(message, statusCode))
+    }
+  }
+
+  @Public()
+  @Post('logout')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({ summary: 'Revoke the current refresh-token session and clear its cookie.' })
+  async logout(@Req() req: Request, @Res() res: Response) {
+    try {
+      const result = await this.authService.logout(readPresentedRefreshToken(req));
+      res.clearCookie(REFRESH_COOKIE_NAME, clearRefreshCookieOptions());
+      return res.status(HttpStatus.OK).send(successResponse(result, 'Signed out'));
+    } catch (error) {
+      res.clearCookie(REFRESH_COOKIE_NAME, clearRefreshCookieOptions());
       const message = error.message || 'An unexpected error occured'
       const statusCode = error.statuscode || error.status || HttpStatus.BAD_REQUEST
       return res.status(statusCode).send(errorResponse(message, statusCode))

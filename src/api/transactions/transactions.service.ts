@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Inject,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { Pool, PoolClient } from 'pg';
@@ -13,6 +14,7 @@ import {
   roundMoney,
 } from 'src/common/currency/currency.data';
 import { requireDateOnly } from 'src/common/date/to-date-only';
+import { ObjectStorageService } from 'src/storage/object-storage.service';
 
 const LIABILITY_TYPES = new Set(['credit_card', 'loan', 'payable']);
 
@@ -22,6 +24,12 @@ type ContainerRow = {
   balance: string | number;
   currency: string;
 };
+
+type ReceiptContext = Pick<PostedTx, 'date' | 'merchant' | 'description'> | null;
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 type PostedTx = {
   type: 'expense' | 'income' | 'transfer';
@@ -43,9 +51,12 @@ type PostedTx = {
 
 @Injectable()
 export class TransactionsService {
+  private readonly logger = new Logger(TransactionsService.name);
+
   constructor(
     @Inject('PG_POOL')
     private readonly pgPool: Pool,
+    private readonly storage: ObjectStorageService,
   ) {}
 
   async create(userId: string, dto: CreateTransactionDto) {
@@ -160,6 +171,7 @@ export class TransactionsService {
       userId,
       result.rows[0].id,
       dto.receipt_id,
+      posted,
     );
     return this.normalize(withReceipt || result.rows[0]);
   }
@@ -311,6 +323,16 @@ export class TransactionsService {
         notes: currentRow.notes,
       };
 
+      // When the posting's containers/type change, the stored currency and
+      // exchange rate no longer apply; let buildPostedTx derive them again.
+      const containersChanged =
+        (dto.type !== undefined && dto.type !== currentPosted.type) ||
+        (dto.source_container_id !== undefined &&
+          dto.source_container_id !== currentPosted.source_container_id) ||
+        (dto.destination_container_id !== undefined &&
+          dto.destination_container_id !==
+            currentPosted.destination_container_id);
+
       const merged: CreateTransactionDto = {
         type: dto.type ?? currentPosted.type,
         amount: dto.amount ?? currentPosted.amount,
@@ -335,11 +357,15 @@ export class TransactionsService {
         currency:
           dto.currency !== undefined
             ? dto.currency
-            : currentPosted.currency || undefined,
+            : containersChanged
+              ? undefined
+              : currentPosted.currency || undefined,
         exchange_rate:
           dto.exchange_rate !== undefined
             ? dto.exchange_rate
-            : currentPosted.exchange_rate,
+            : containersChanged
+              ? undefined
+              : currentPosted.exchange_rate,
         notes:
           dto.notes !== undefined ? dto.notes : currentPosted.notes || undefined,
       };
@@ -420,8 +446,21 @@ export class TransactionsService {
         nextPosted,
         'transactions',
       );
+      const receiptChange = await this.applyReceiptChange(
+        client,
+        userId,
+        id,
+        currentRow.receipt_id || null,
+        dto.receipt_id,
+      );
       await client.query('COMMIT');
-      return this.normalize(result.rows[0]);
+      if (receiptChange.released) {
+        void this.releaseReceiptFile(userId, receiptChange.released, id);
+      }
+      if (receiptChange.relocate) {
+        void this.relocateReceipt(userId, receiptChange.relocate, nextPosted);
+      }
+      return this.normalize(receiptChange.row || result.rows[0]);
     } catch (error: any) {
       await client.query('ROLLBACK');
       if (error?.status) throw error;
@@ -473,6 +512,8 @@ export class TransactionsService {
         [userId, id],
       );
       await client.query('COMMIT');
+      // Best-effort: drop the scan unless another live transaction uses it.
+      void this.releaseReceiptFile(userId, row.receipt_id || null, id);
       return { id, deleted: true };
     } catch (error: any) {
       await client.query('ROLLBACK');
@@ -529,6 +570,7 @@ export class TransactionsService {
     const result = await client.query(
       `SELECT id, type, balance, currency FROM financial_containers
        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+         AND space_id IS NULL
        FOR UPDATE`,
       [id, userId],
     );
@@ -544,6 +586,16 @@ export class TransactionsService {
     dto: CreateTransactionDto,
   ): Promise<PostedTx> {
     const baseCurrency = await this.getUserBaseCurrency(client, userId);
+    if (dto.category_id) {
+      const category = await client.query(
+        `SELECT 1 FROM categories
+         WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+        [dto.category_id, userId],
+      );
+      if (!category.rowCount) {
+        throw new BadRequestException('Category not found');
+      }
+    }
     let source: ContainerRow | null = null;
     let destination: ContainerRow | null = null;
 
@@ -605,7 +657,12 @@ export class TransactionsService {
     }
 
     const fxRateToBase = getRate(txCurrency, baseCurrency);
-    const amountBase = convertAmount(dto.amount, txCurrency, baseCurrency);
+    // Tiny amounts in high-denomination currencies can round to 0 in the base
+    // currency, which the journal line side check rejects.
+    const amountBase = Math.max(
+      0.01,
+      convertAmount(dto.amount, txCurrency, baseCurrency),
+    );
 
     return {
       type: dto.type,
@@ -633,9 +690,12 @@ export class TransactionsService {
     sign: 1 | -1,
   ) {
     const amount = Number(dto.amount) * sign;
+    // Reversals undo an earlier posting; the intermediate balance may dip
+    // below zero before the repost, so only enforce on forward postings.
+    const enforce = sign === 1;
 
     if (dto.type === 'expense' && dto.source_container_id) {
-      await this.adjustContainer(client, userId, dto.source_container_id, -amount);
+      await this.adjustContainer(client, userId, dto.source_container_id, -amount, enforce);
     }
 
     if (dto.type === 'income' && dto.destination_container_id) {
@@ -644,6 +704,7 @@ export class TransactionsService {
         userId,
         dto.destination_container_id,
         amount,
+        enforce,
       );
     }
 
@@ -654,6 +715,7 @@ export class TransactionsService {
           userId,
           dto.source_container_id,
           -amount,
+          enforce,
         );
       }
       if (dto.destination_container_id) {
@@ -663,6 +725,7 @@ export class TransactionsService {
           userId,
           dto.destination_container_id,
           destDelta,
+          enforce,
         );
       }
     }
@@ -805,12 +868,14 @@ export class TransactionsService {
     userId: string,
     containerId: string,
     signedAmount: number,
+    enforce = true,
   ) {
+    // Reversals may touch archived containers (editing/deleting history).
     const result = await client.query(
       `SELECT id, type, balance FROM financial_containers
-       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+       WHERE id = $1 AND user_id = $2 AND ($3::boolean OR deleted_at IS NULL)
        FOR UPDATE`,
-      [containerId, userId],
+      [containerId, userId, !enforce],
     );
     if (!result.rowCount) {
       throw new BadRequestException('Financial container not found');
@@ -819,7 +884,7 @@ export class TransactionsService {
     const isLiability = LIABILITY_TYPES.has(row.type);
     const delta = isLiability ? -signedAmount : signedAmount;
     const nextBalance = Number(row.balance) + delta;
-    if (nextBalance < -0.005) {
+    if (enforce && nextBalance < -0.005) {
       throw new BadRequestException(
         isLiability
           ? 'This payment exceeds the outstanding liability balance.'
@@ -838,24 +903,35 @@ export class TransactionsService {
     client: PoolClient,
     userId: string,
     transactionId: string,
-    receiptId?: string,
+    receiptId: string | null | undefined,
+    posted: ReceiptContext,
   ) {
     if (!receiptId) return null;
     const linked = await client.query(
       `UPDATE receipts
        SET ledger_transaction_id = $1, updated_at = NOW()
        WHERE id = $2 AND user_id = $3
-       RETURNING id, file_path, mime_type`,
+       RETURNING id, file_path, mime_type, stored_file_id`,
       [transactionId, receiptId, userId],
     );
     if (!linked.rowCount) return null;
     const file = linked.rows[0];
     const media = await client.query(
-      `SELECT public_token FROM stored_files
-       WHERE object_key = $1 AND user_id = $2`,
-      [file.file_path, userId],
+      `SELECT id, public_token, mime_type FROM stored_files
+       WHERE user_id = $1 AND deleted_at IS NULL
+         AND (id = $2 OR object_key = $3)
+       LIMIT 1`,
+      [userId, file.stored_file_id || null, file.file_path],
     );
-    const token = media.rows[0]?.public_token as string | undefined;
+    const stored = media.rows[0] as
+      | { id: string; public_token: string; mime_type: string | null }
+      | undefined;
+    if (stored && stored.id !== file.stored_file_id) {
+      await client.query(
+        `UPDATE receipts SET stored_file_id = $2 WHERE id = $1`,
+        [file.id, stored.id],
+      );
+    }
     const updated = await client.query(
       `UPDATE ledger_transactions
        SET receipt_id = $2,
@@ -866,12 +942,148 @@ export class TransactionsService {
       [
         transactionId,
         file.id,
-        token ? `/api/media/${token}` : null,
-        file.mime_type || null,
+        stored ? `/api/media/${stored.public_token}` : null,
+        stored?.mime_type || file.mime_type || null,
         userId,
       ],
     );
+    if (stored) {
+      // File the scan under the transaction date / merchant. Runs outside
+      // this DB transaction; the token (and receipt_url) never changes.
+      if (posted) {
+        const fileId = stored.id;
+        setImmediate(() => {
+          void this.storage.relocateFile(fileId, userId, {
+            date: posted.date,
+            label: posted.merchant || posted.description || null,
+          });
+        });
+      }
+    }
     return updated.rows[0] || null;
+  }
+
+  /**
+   * receipt_id on update: undefined = untouched, null/'' = detach,
+   * another id = replace. Returns what to clean up after COMMIT.
+   */
+  private async applyReceiptChange(
+    client: PoolClient,
+    userId: string,
+    transactionId: string,
+    currentReceiptId: string | null,
+    requested: string | null | undefined,
+  ): Promise<{
+    row: Record<string, any> | null;
+    released: string | null;
+    relocate: string | null;
+  }> {
+    if (requested === undefined || (requested && requested === currentReceiptId)) {
+      // Date / merchant may have changed: re-file the existing scan.
+      return { row: null, released: null, relocate: currentReceiptId };
+    }
+    let row: Record<string, any> | null = null;
+    if (requested) {
+      const linked = await client.query(
+        `SELECT id FROM receipts WHERE id = $1 AND user_id = $2`,
+        [requested, userId],
+      );
+      if (!linked.rowCount) {
+        // Same as create: an unknown / foreign receipt id is ignored.
+        return { row: null, released: null, relocate: currentReceiptId };
+      }
+      // Relocation happens after COMMIT via `relocate` below.
+      row = await this.attachReceipt(client, userId, transactionId, requested, null);
+    } else {
+      const cleared = await client.query(
+        `UPDATE ledger_transactions
+         SET receipt_id = NULL, receipt_url = NULL, receipt_mime = NULL
+         WHERE id = $1 AND user_id = $2
+         RETURNING *`,
+        [transactionId, userId],
+      );
+      row = cleared.rows[0] || null;
+    }
+    if (currentReceiptId) {
+      await client.query(
+        `UPDATE receipts
+         SET ledger_transaction_id = NULL, updated_at = NOW()
+         WHERE id = $1 AND user_id = $2 AND ledger_transaction_id = $3`,
+        [currentReceiptId, userId, transactionId],
+      );
+    }
+    return { row, released: currentReceiptId, relocate: requested || null };
+  }
+
+  /** Move a receipt scan to receipts/{YYYY}/{MM}/{yyyymmdd}-{merchant}-... */
+  private async relocateReceipt(
+    userId: string,
+    receiptId: string,
+    posted: ReceiptContext,
+  ) {
+    if (!posted) return;
+    try {
+      const found = await this.pgPool.query(
+        `SELECT stored_file_id FROM receipts WHERE id = $1 AND user_id = $2`,
+        [receiptId, userId],
+      );
+      const fileId = found.rows[0]?.stored_file_id as string | undefined;
+      if (!fileId) return;
+      await this.storage.relocateFile(fileId, userId, {
+        date: posted.date,
+        label: posted.merchant || posted.description || null,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Receipt ${receiptId} relocation skipped: ${describeError(error)}`,
+      );
+    }
+  }
+
+  /**
+   * Delete a receipt's stored scan once no live transaction references it.
+   * Best-effort and logged; never fails the user action.
+   */
+  private async releaseReceiptFile(
+    userId: string,
+    receiptId: string | null,
+    transactionId: string,
+  ) {
+    try {
+      const receipts = await this.pgPool.query(
+        `SELECT r.id, r.stored_file_id, r.file_path
+         FROM receipts r
+         WHERE r.user_id = $1
+           AND (r.id = $2 OR r.ledger_transaction_id = $3)
+           AND NOT EXISTS (
+             SELECT 1 FROM ledger_transactions t
+             WHERE t.user_id = $1 AND t.receipt_id = r.id
+               AND t.deleted_at IS NULL
+           )`,
+        [userId, receiptId, transactionId],
+      );
+      for (const receipt of receipts.rows) {
+        let fileId = receipt.stored_file_id as string | null;
+        if (!fileId) {
+          const byKey = await this.pgPool.query(
+            `SELECT id FROM stored_files WHERE user_id = $1 AND object_key = $2`,
+            [userId, receipt.file_path],
+          );
+          fileId = (byKey.rows[0]?.id as string | undefined) || null;
+        }
+        if (fileId) await this.storage.deleteFileById(fileId, userId);
+        await this.pgPool.query(
+          `UPDATE receipts
+           SET processing_status = 'file_deleted', updated_at = NOW()
+           WHERE id = $1 AND user_id = $2`,
+          [receipt.id, userId],
+        );
+      }
+    } catch (error) {
+      this.logger.warn(
+        `Receipt cleanup for transaction ${transactionId} skipped: ${describeError(error)}`,
+      );
+    }
   }
 
   private normalize(row: Record<string, any>): Record<string, any> {

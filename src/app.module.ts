@@ -10,7 +10,6 @@ import { StorageModule } from './storage/storage.module';
 import { AuthModule } from './api/auth/auth.module';
 import { UserModule } from './api/user/user.module';
 import { ThrottleConfigModule } from './throttle/throttle.module';
-import { ExpenseModule } from './api/expense/expense.module';
 import { CategoriesModule } from './api/categories/categories.module';
 import { AccountsModule } from './api/accounts/accounts.module';
 import { TransactionsModule } from './api/transactions/transactions.module';
@@ -55,7 +54,6 @@ import { PermissionsGuard } from './helper/guards/permissions.guard';
     AuthModule,
     UserModule,
     ThrottleConfigModule,
-    ExpenseModule,
     CategoriesModule,
     AccountsModule,
     TransactionsModule,

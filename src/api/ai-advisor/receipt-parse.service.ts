@@ -5,8 +5,32 @@ import { AccountsService } from '../accounts/accounts.service';
 import { ParseReceiptDto } from './dto/ai-advisor.dto';
 import { AiOmnirouteUsageService } from './ai-omniroute-usage.service';
 import { trySequentialVisionChat } from './providers/omniroute.adapter';
-import { ChatMessage } from './providers/types';
+import { ChatMessage, ProviderChatResult, ProviderConfig } from './providers/types';
+import { runProviderChat } from './providers';
+import { AiSettingsService } from './ai-settings.service';
 import { matchExpenseSource, rankAccountMatches } from './match-container';
+import {
+  RECEIPT_USER_PROMPT,
+  ReceiptConfidence,
+  ReceiptDetails,
+  ReceiptReconciliation,
+  buildReceiptDescription,
+  buildReceiptSystemPrompt,
+  buildTotalsPassPrompt,
+  detectCurrency,
+  extractReceiptDetails,
+  mergeTotalsPass,
+  normalizeMerchantName,
+  normalizePaymentMethod,
+  parseLenientJson,
+  reconcileTotals,
+  resolveReceiptDate,
+  scoreConfidence,
+  secondPassReason,
+  toDtoPaymentStatus,
+} from './receipt-reconcile';
+import { effectiveTimeZone, todayInTimeZone } from './user-dates';
+import { suggestCategoryFromText } from './category-matcher';
 import { ObjectStorageService } from 'src/storage/object-storage.service';
 import type { ReceiptAccountHint } from './match-container';
 
@@ -53,6 +77,14 @@ export type ReceiptParseResult = {
   source_container_id: string | null;
   destination_container_id: string | null;
   extracted: ReceiptExtractedFields;
+  /** Additive: full bill breakdown (taxes, line items, ids). */
+  details?: Omit<ReceiptDetails, 'model_confidence'>;
+  /** Additive: how the amount was chosen / whether totals add up. */
+  reconciliation?: ReceiptReconciliation;
+  /** Additive: 0–1 per key field plus overall. */
+  confidence?: ReceiptConfidence;
+  /** Additive: 1, or 2 when a focused totals/date re-read ran. */
+  passes?: number;
 };
 
 const EMPTY_FIELDS: ReceiptExtractedFields = {
@@ -167,7 +199,16 @@ function asAmount(value: unknown): number | null {
     return Math.round(value * 100) / 100;
   }
   if (typeof value === 'string') {
-    const cleaned = value.replace(/[, ]/g, '').replace(/[₹$€£]/g, '');
+    let cleaned = value.replace(/\s/g, '').replace(/[₹$€£]/g, '');
+    // "12,50" is a decimal comma when it is the only/last separator, is
+    // followed by exactly two digits and there is no dot; otherwise commas
+    // are thousands separators ("1,250" → 1250).
+    if (!cleaned.includes('.') && /,\d{2}$/.test(cleaned)) {
+      const idx = cleaned.lastIndexOf(',');
+      cleaned = `${cleaned.slice(0, idx).replace(/,/g, '')}.${cleaned.slice(idx + 1)}`;
+    } else {
+      cleaned = cleaned.replace(/,/g, '');
+    }
     const parsed = Number(cleaned);
     if (Number.isFinite(parsed) && parsed > 0) {
       return Math.round(parsed * 100) / 100;
@@ -187,25 +228,41 @@ function asCurrency(value: unknown): string | null {
   return null;
 }
 
+function validMonthDay(month: number, day: number): boolean {
+  return month >= 1 && month <= 12 && day >= 1 && day <= 31;
+}
+
 function asDate(value: unknown): string | null {
   const raw = asString(value);
   if (!raw) return null;
   const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  if (iso) {
+    return validMonthDay(Number(iso[2]), Number(iso[3]))
+      ? `${iso[1]}-${iso[2]}-${iso[3]}`
+      : null;
+  }
   const named = raw.match(
     /^(\d{1,2})\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})(?:$|[,\s])/,
   );
   if (named) {
     const month = MONTHS[named[2].toLowerCase()];
-    if (month) return `${named[3]}-${month}-${named[1].padStart(2, '0')}`;
+    if (month && validMonthDay(Number(month), Number(named[1]))) {
+      return `${named[3]}-${month}-${named[1].padStart(2, '0')}`;
+    }
   }
   const dmy = raw.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$/);
   if (dmy) {
-    const day = dmy[1].padStart(2, '0');
-    const month = dmy[2].padStart(2, '0');
+    const first = Number(dmy[1]);
+    const second = Number(dmy[2]);
+    // Default D/M/Y (Indian receipts); switch to M/D/Y only when the second
+    // number cannot be a month but the first can.
+    const [dayNum, monthNum] =
+      first <= 12 && second > 12 ? [second, first] : [first, second];
+    if (!validMonthDay(monthNum, dayNum)) return null;
     let year = dmy[3];
     if (year.length === 2) year = `20${year}`;
-    return `${year}-${month}-${day}`;
+    if (year.length !== 4) return null;
+    return `${year}-${String(monthNum).padStart(2, '0')}-${String(dayNum).padStart(2, '0')}`;
   }
   return null;
 }
@@ -241,12 +298,33 @@ function asLast4(value: unknown): string | null {
   return digits.slice(-4);
 }
 
+/** "+05:30" style offset of `timeZone` on that calendar date. */
+function utcOffsetFor(timeZone: string, date: string): string {
+  try {
+    const name = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      timeZoneName: 'longOffset',
+    })
+      .formatToParts(new Date(`${date}T12:00:00Z`))
+      .find((part) => part.type === 'timeZoneName')?.value;
+    const match = String(name || '').match(/GMT([+-]\d{2}):?(\d{2})?/);
+    if (match) return `${match[1]}:${match[2] || '00'}`;
+    if (/^GMT$/.test(String(name))) return '+00:00';
+  } catch {
+    /* fall through */
+  }
+  return '+05:30';
+}
+
 /**
- * Preserve the receipt's printed wall-clock time.
+ * Preserve the receipt's printed wall-clock time in the user's timezone.
  * Do not use `new Date(y,m,d,h,min)` on the server — Render/UTC would shift IST by ~5.5h.
- * UPI / Indian bank receipts are treated as Asia/Kolkata.
  */
-function paidAtFrom(date: string | null, time: string | null): string | null {
+function paidAtFrom(
+  date: string | null,
+  time: string | null,
+  timeZone = 'Asia/Kolkata',
+): string | null {
   if (!date || !time) return null;
   const [year, month, day] = date.split('-').map(Number);
   const [hour, minute] = time.split(':').map(Number);
@@ -261,7 +339,46 @@ function paidAtFrom(date: string | null, time: string | null): string | null {
   ) {
     return null;
   }
-  return `${date}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00+05:30`;
+  return `${date}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00${utcOffsetFor(timeZone, date)}`;
+}
+
+const BYOK_LABELS: Record<string, string> = {
+  anthropic: 'Anthropic',
+  openai: 'OpenAI',
+  openrouter: 'OpenRouter',
+  vertex: 'Vertex AI',
+};
+
+function describeByokSource(result: ProviderChatResult): {
+  provider: string;
+  model: string;
+} {
+  return {
+    provider: BYOK_LABELS[result.provider] || result.provider,
+    model: result.model,
+  };
+}
+
+/** Providers / models that can read a receipt image (and PDFs where noted). */
+function visionCapable(config: ProviderConfig, mime: string): boolean {
+  const model = String(config.model || '').toLowerCase();
+  const pdf = mime === 'application/pdf';
+  switch (config.provider) {
+    case 'anthropic':
+    case 'vertex':
+      return true;
+    case 'openai':
+      return !pdf && /(gpt-4o|gpt-4\.1|gpt-5|chatgpt-4o|^o[134])/.test(model);
+    case 'openrouter':
+      return (
+        !pdf &&
+        /(gpt-4o|gpt-4\.1|gpt-5|claude|gemini|gemma-3|qwen.*vl|llama-4|pixtral|mistral-(small|medium)-3)/.test(
+          model,
+        )
+      );
+    default:
+      return false;
+  }
 }
 
 function describeVisionSource(modelId: string | null | undefined): {
@@ -471,13 +588,14 @@ export class ReceiptParseService {
     private readonly accounts: AccountsService,
     private readonly omnirouteUsage: AiOmnirouteUsageService,
     private readonly storage: ObjectStorageService,
+    private readonly settings: AiSettingsService,
   ) {}
 
   async parse(userId: string, dto: ParseReceiptDto): Promise<ReceiptParseResult> {
     const mime = dto.mime_type === 'image/jpg' ? 'image/jpeg' : dto.mime_type;
     const saved = await this.persistReceipt(userId, dto, mime);
-    const finish = (result: ReceiptParseResult): ReceiptParseResult =>
-      saved
+    const finish = (result: ReceiptParseResult): ReceiptParseResult => {
+      const out: ReceiptParseResult = saved
         ? {
             ...result,
             stored: true,
@@ -485,97 +603,95 @@ export class ReceiptParseService {
             receipt_url: saved.url,
           }
         : result;
-    const quota = await this.omnirouteUsage.getUsage(userId);
-    if (quota.remaining <= 0) {
+      // CreateTransactionDto only accepts SUCCESS / FAILURE / SUBMITTED /
+      // CANCELLED / UNKNOWN; lowercase values made the scanned form fail
+      // validation on save.
+      out.extracted = {
+        ...out.extracted,
+        payment_status: toDtoPaymentStatus(out.extracted.payment_status),
+      };
+      void this.recordExtraction(userId, saved?.id, out);
+      return out;
+    };
+
+    const [categories, containers, profileRow] = await Promise.all([
+      this.categories.findAll(userId),
+      this.accounts.findAll(userId),
+      this.pgPool
+        .query(
+          `SELECT full_name, currency, timezone FROM users WHERE id = $1 AND deleted_at IS NULL`,
+          [userId],
+        )
+        .then((r) => r.rows[0] || {})
+        .catch(() => ({}) as Record<string, any>),
+    ]);
+    const categoryNames = categories.map((row: { name: string }) => row.name);
+    const containerNames = containers.map(
+      (row: { name: string; institution?: string | null; type?: string }) =>
+        row.institution ? `${row.name} (${row.institution})` : row.name,
+    );
+    const userFullName = asString(profileRow.full_name);
+    const baseCurrency = String(profileRow.currency || 'USD').toUpperCase();
+    const timeZone = effectiveTimeZone(profileRow.timezone, baseCurrency);
+    const today = todayInTimeZone(timeZone);
+    const skipGroq = mime === 'application/pdf';
+
+    const system = buildReceiptSystemPrompt({
+      today,
+      timeZone,
+      baseCurrency,
+      userFullName,
+      categoryNames,
+      accountLabels: containerNames,
+    });
+    const attachment = {
+      name: dto.name || 'receipt',
+      mimeType: mime,
+      dataBase64: dto.data_base64,
+    };
+    const messagesFor = (instruction: string): ChatMessage[] => [
+      { role: 'system', content: system },
+      { role: 'user', content: instruction, attachments: [attachment] },
+    ];
+
+    // Route: the user's own vision-capable provider when active (stronger
+    // models, no free quota), else Opal Free vision (Groq → Gemini).
+    let byok = await this.resolveVisionProvider(userId, mime);
+    let quotaChecked = false;
+    const runVision = async (
+      instruction: string,
+    ): Promise<{ result: ProviderChatResult | null; errors: string[]; viaFree: boolean; blocked?: boolean }> => {
+      if (byok) {
+        try {
+          const result = await runProviderChat(byok, messagesFor(instruction), 4096);
+          return { result, errors: [], viaFree: false };
+        } catch (error: any) {
+          console.warn(`[Opal receipts] ${byok.provider} vision failed, using Opal Free: ${error?.message || error}`);
+          byok = null;
+        }
+      }
+      if (!quotaChecked) {
+        quotaChecked = true;
+        const quota = await this.omnirouteUsage.getUsage(userId);
+        if (quota.remaining <= 0) return { result: null, errors: [], viaFree: true, blocked: true };
+      }
+      const { result, errors } = await trySequentialVisionChat(messagesFor(instruction), {
+        skipGroq,
+        maxTokens: 3072,
+      });
+      return { result, errors, viaFree: true };
+    };
+
+    const first = await runVision(RECEIPT_USER_PROMPT);
+    if (first.blocked) {
       return finish(
         emptyResult(
           'Daily free AI limit reached. Fill the transaction from the receipt yourself. The scan image was saved.',
         ),
       );
     }
-
-    const categories = await this.categories.findAll(userId);
-    const containers = await this.accounts.findAll(userId);
-    const categoryNames = categories.map((row: { name: string }) => row.name);
-    const containerNames = containers.map(
-      (row: { name: string; institution?: string | null }) =>
-        row.institution ? `${row.name} (${row.institution})` : row.name,
-    );
-    const userNameRow = await this.pgPool.query(
-      `SELECT full_name FROM users WHERE id = $1 AND deleted_at IS NULL`,
-      [userId],
-    );
-    const userFullName = asString(userNameRow.rows[0]?.full_name);
-    const skipGroq = mime === 'application/pdf';
-
-    const messages: ChatMessage[] = [
-      {
-        role: 'system',
-        content: [
-          'You extract UPI payment screenshots, GPay/PhonePe/Paytm receipts, bank PDFs, invoices, and bills.',
-          'Return a JSON object only. Never invent IDs, accounts, amounts, or times that are not visible.',
-          'Use null for any field you cannot read. Amount is the total shown.',
-          'Dates as YYYY-MM-DD. Times as 24-hour HH:mm exactly as printed on the receipt (8:39 pm -> 20:39).',
-          'Do NOT convert the printed time to UTC or any other timezone. Keep the wall-clock time shown.',
-          'payment_status must be one of: success, failed, pending (or null).',
-          '  failed = Failed / Declined / Unsuccessful / Payment not done / Cancelled / Error.',
-          '  pending = Pending / Processing / In progress.',
-          '  success = Successful / Paid / Completed / Credited / Received.',
-          'transaction_type must be one of: expense, income, transfer.',
-          '  expense = user paid / sent money to a merchant or another person (not themselves).',
-          '  income = user received / was credited money from someone else (salary, refund, money received).',
-          '  transfer = money moved between the user\'s OWN banks/wallets (self-pay / bank-to-bank / Paid to self).',
-          'CRITICAL — bank-to-bank / self-transfer (very common in India):',
-          '  - GPay/PhonePe "Paid to [user\'s own name]", "Transfer to self", "Self transfer", NEFT/IMPS between own accounts → transaction_type = transfer.',
-          '  - If payee name matches the account holder / looks like the same person paying themselves → transfer (not expense).',
-          '  - Always fill BOTH sides when two accounts are shown:',
-          '      container_*/bank_name/account_* = debit / From / Paid using / Debited from account.',
-          '      destination_* = credit / To / Credited to / Transferred to account.',
-          '  - Example: From "HDFC ••••4521" to "SBI ••••8890" → bank_name=HDFC, account_last4=4521, destination_bank_name=SBI, destination_account_last4=8890, transaction_type=transfer.',
-          '  - merchant for self-transfer: null or "Self" (never invent a shop name).',
-          'For expense: container_* describe the paying account; destination_* usually null.',
-          'For income: destination_* = credited account; container_* may be null.',
-          userFullName
-            ? `The app user\'s name is "${userFullName}". If the receipt payee/payer is this person (or clearly the same person), prefer transaction_type=transfer when money moved between banks/wallets.`
-            : 'If the payee looks like the same person as the payer (self), use transaction_type=transfer.',
-          'upi_txn_id is the UPI transaction ID. platform_txn_id is the app id (Google transaction ID, PhonePe UTR, Paytm order id). They are different.',
-          'platform is the app: Google Pay, PhonePe, Paytm, BHIM, bank PDF, etc.',
-          'account_label / destination_account_label are the bank/account strings exactly as shown (e.g. "Karur Vysya Bank 2324").',
-          'NOTES — Google Pay, PhonePe, and Paytm have a Note / Message / Remarks written by the sender. Read it. It is often the only explanation of the payment.',
-          '  The note can mean different things. Decide from the words, do not leave it as a raw dump when it clearly fills another field:',
-          '  - What was bought or why: "headphones", "dinner", "rent for March", "medicines" → description is that purpose. merchant stays the payee on the receipt.',
-          '  - Who it was really for: "paid back to Rahul for the shoes he bought me", "for mom", "splitting cab with Priya" → description states that. This is still an expense to the payee, not a self-transfer, unless the payee is the user\'s own account.',
-          '  - A category: if the note names or clearly means one of the user categories below (groceries, travel, rent, food, repayment, and so on) → set category_name to that category.',
-          '  - Mixed: one note can set description AND category. Example note "groceries for the week" → description "Groceries for the week", category_name the groceries category if one exists.',
-          '  - Always copy the note text itself into notes, even after you used it for description or category. notes is null only when no note is visible.',
-          '  - Do not put UPI ids, bank names, or the payee name into notes.',
-          '  - If there is no note, description can fall back to the payee or bill purpose shown on the receipt.',
-          'container_name / destination_container_name must be one of these user accounts when it matches, else null:',
-          containerNames.slice(0, 40).join(', ') || '(none)',
-          'category_name must be one of these user categories when it reasonably matches, else null. Prefer "Transfers" for self-transfers:',
-          categoryNames.slice(0, 80).join(', ') || '(none)',
-        ].join('\n'),
-      },
-      {
-        role: 'user',
-        content:
-          'Extract JSON keys: merchant, description, amount, currency, date, time, payment_method, payment_status, transaction_type, upi_vpa, upi_txn_id, platform, platform_txn_id, notes, category_name, container_name, bank_name, account_last4, account_label, destination_container_name, destination_bank_name, destination_account_last4, destination_account_label. If this is a self/bank-to-bank transfer, set transaction_type to transfer and fill both source and destination account fields. If a Note, Message, or Remarks line is visible, use it for description and category_name when it explains the payment, and still copy that text into notes.',
-        attachments: [
-          {
-            name: dto.name || 'receipt',
-            mimeType: mime,
-            dataBase64: dto.data_base64,
-          },
-        ],
-      },
-    ];
-
-    const { result: vision, errors } = await trySequentialVisionChat(
-      messages,
-      { skipGroq },
-    );
-    if (!vision) {
-      const hint = errors
+    if (!first.result) {
+      const hint = first.errors
         .map((item) => item.replace(/key[=:][^\s]+/gi, 'key=***'))
         .slice(0, 2)
         .join(' · ');
@@ -585,16 +701,89 @@ export class ReceiptParseService {
           : 'Could not read this receipt with free AI or Gemini. Fill the form manually. The scan image was saved.',
       ));
     }
+    if (first.viaFree) {
+      await this.omnirouteUsage.recordSuccessfulRequest(userId).catch(() => undefined);
+    }
+    const source = first.viaFree
+      ? describeVisionSource(first.result.model)
+      : describeByokSource(first.result);
 
-    await this.omnirouteUsage.recordSuccessfulRequest(userId).catch(() => undefined);
+    const json = parseLenientJson(first.result.content) || {};
+    let details = extractReceiptDetails(json);
+    let extractedRaw = this.parseModelJson(json, userFullName);
+    let reconciliation = reconcileTotals(details);
+    const dateHints = { currency: asCurrency(json.currency), baseCurrency, timeZone };
+    let dateResult = resolveReceiptDate(json.date ?? json.paid_at, details.date_raw, dateHints);
+    const isPaymentScreen =
+      details.document_type === 'upi_payment' ||
+      details.document_type === 'bank_transfer' ||
+      Boolean(extractedRaw.platform || extractedRaw.upi_txn_id);
+    let passes = 1;
 
-    const extracted = applyNoteInsights(
-      this.parseModelJson(vision.content, userFullName),
-      categoryNames,
-    );
+    // Focused second pass on the totals / date when the first reading does
+    // not reconcile or has low confidence.
+    const reason =
+      extractedRaw.payment_status === 'failed'
+        ? null
+        : secondPassReason({
+            reconciliation,
+            details,
+            date: dateResult.date,
+            isPayment: isPaymentScreen,
+          });
+    if (reason) {
+      const second = await runVision(buildTotalsPassPrompt(details, reason));
+      const json2 = second.result ? parseLenientJson(second.result.content) : null;
+      if (json2) {
+        passes = 2;
+        details = mergeTotalsPass(details, extractReceiptDetails(json2));
+        reconciliation = reconcileTotals(details);
+        const date2 = resolveReceiptDate(json2.date ?? json.date, details.date_raw, {
+          ...dateHints,
+          currency: asCurrency(json2.currency) || dateHints.currency,
+        });
+        if (date2.date && (!dateResult.date || date2.confidence > dateResult.confidence)) {
+          dateResult = date2;
+        }
+        if (!extractedRaw.time) extractedRaw = { ...extractedRaw, time: asTime(json2.time) };
+        if (!json.currency && json2.currency) json.currency = json2.currency;
+      }
+    }
+
+    const evidence = [
+      details.merchant_tax_id ? `gstin ${details.merchant_tax_id}` : '',
+      details.taxes.map((t) => t.label).join(' '),
+      details.merchant_address,
+      extractedRaw.platform,
+      extractedRaw.upi_vpa ? 'upi' : '',
+      details.total_label,
+    ]
+      .filter(Boolean)
+      .join(' ');
+    const currency = detectCurrency(json.currency ?? extractedRaw.currency, evidence, baseCurrency);
+    const merchant =
+      extractedRaw.merchant && /^self$/i.test(extractedRaw.merchant)
+        ? extractedRaw.merchant
+        : normalizeMerchantName(extractedRaw.merchant);
+    const time = extractedRaw.time;
+    const fields: ReceiptExtractedFields = {
+      ...extractedRaw,
+      merchant,
+      amount: reconciliation.total ?? extractedRaw.amount,
+      currency: currency.currency,
+      date: dateResult.date,
+      time,
+      paid_at: paidAtFrom(dateResult.date, time, timeZone),
+      payment_method: normalizePaymentMethod(extractedRaw.payment_method, details.card_last4),
+      account_last4: extractedRaw.account_last4 || details.card_last4,
+      notes:
+        extractedRaw.notes ||
+        (details.invoice_number ? `Invoice ${details.invoice_number}` : null),
+    };
+
+    const extracted = applyNoteInsights(fields, categoryNames);
     const status = extracted.payment_status;
     if (status === 'failed') {
-      const source = describeVisionSource(vision.model);
       return finish(emptyResult(
         'This looks like a failed payment. It was not added as a transaction. The scan image was saved.',
         {
@@ -606,7 +795,6 @@ export class ReceiptParseService {
       ));
     }
     if (status === 'pending') {
-      const source = describeVisionSource(vision.model);
       return finish(emptyResult(
         'This payment is still pending. Wait for success before adding it. The scan image was saved.',
         {
@@ -621,26 +809,69 @@ export class ReceiptParseService {
     const resolved = this.resolveTransferAccounts(containers, extracted);
     Object.assign(extracted, resolved.extracted);
 
-    const category = await this.resolveCategory(
+    let category = await this.resolveCategory(
       userId,
       categories,
       extracted.category_name,
       extracted.merchant,
       extracted.transaction_type,
     );
+    if (!category && extracted.transaction_type !== 'transfer') {
+      // Semantic fallback over the user's own categories (never invented).
+      category = suggestCategoryFromText(
+        categories,
+        [
+          extracted.merchant,
+          details.merchant_legal_name,
+          details.document_type?.replace(/_/g, ' '),
+          extracted.description,
+          extracted.notes,
+          details.line_items.slice(0, 8).map((item) => item.name).join(' '),
+        ]
+          .filter(Boolean)
+          .join(' '),
+        extracted.transaction_type || 'expense',
+      );
+    }
 
-    const source = describeVisionSource(vision.model);
+    if (extracted.transaction_type !== 'transfer') {
+      extracted.description =
+        buildReceiptDescription({
+          modelDescription: extracted.description,
+          merchant: extracted.merchant,
+          documentType: details.document_type,
+          categoryName: category?.name || extracted.category_name,
+          lineItems: details.line_items,
+        }) || extracted.description;
+    }
+
+    const confidence = scoreConfidence({
+      details,
+      reconciliation,
+      merchant: extracted.merchant,
+      dateConfidence: dateResult.date ? dateResult.confidence : 0,
+      currencyConfidence: currency.confidence,
+      categoryMatched: Boolean(category),
+    });
+
     const hasCore = Boolean(
       extracted.amount ||
         extracted.merchant ||
         extracted.transaction_type === 'transfer',
     );
+    const warnings = [
+      hasCore ? resolved.warning : 'AI ran but could not find a merchant or amount. Review the form before saving.',
+      reconciliation.status === 'mismatch'
+        ? 'The bill totals do not add up — please double-check the amount.'
+        : null,
+      dateResult.note && !dateResult.date ? `${dateResult.note} Pick the date manually.` : null,
+      hasCore && confidence.overall < 0.5 ? 'Low-confidence scan — review every field before saving.' : null,
+    ].filter(Boolean) as string[];
+
     return finish({
       ok: hasCore,
       stored: Boolean(saved),
-      warning: hasCore
-        ? resolved.warning
-        : 'AI ran but could not find a merchant or amount. Review the form before saving.',
+      warning: warnings.length ? warnings.join(' ') : undefined,
       used_provider: source.provider,
       used_model: source.model,
       category_id: category?.id || null,
@@ -648,7 +879,84 @@ export class ReceiptParseService {
       source_container_id: resolved.sourceId,
       destination_container_id: resolved.destinationId,
       extracted,
+      details: {
+        document_type: details.document_type,
+        merchant_legal_name: details.merchant_legal_name,
+        merchant_address: details.merchant_address,
+        merchant_tax_id: details.merchant_tax_id,
+        invoice_number: details.invoice_number,
+        date_raw: details.date_raw,
+        subtotal: details.subtotal,
+        taxes: details.taxes,
+        tax_total: details.tax_total,
+        discount_total: details.discount_total,
+        tip: details.tip,
+        service_charge: details.service_charge,
+        round_off: details.round_off,
+        grand_total: details.grand_total,
+        amount_paid: details.amount_paid,
+        total_label: details.total_label,
+        card_last4: details.card_last4,
+        card_network: details.card_network,
+        line_items: details.line_items,
+      },
+      reconciliation,
+      confidence,
+      passes,
     });
+  }
+
+  /** The user's active provider when it can read this file type, else null. */
+  private async resolveVisionProvider(
+    userId: string,
+    mime: string,
+  ): Promise<ProviderConfig | null> {
+    if (String(process.env.RECEIPT_USE_ACTIVE_PROVIDER || 'true').toLowerCase() === 'false') {
+      return null;
+    }
+    try {
+      const { config } = await this.settings.loadActiveProviderConfig(userId);
+      return visionCapable(config, mime) ? config : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Best-effort audit of what was extracted onto the stored receipt row. */
+  private async recordExtraction(
+    userId: string,
+    receiptId: string | undefined,
+    result: ReceiptParseResult,
+  ): Promise<void> {
+    if (!receiptId) return;
+    try {
+      await this.pgPool.query(
+        `UPDATE receipts
+         SET extracted_data = $3::jsonb,
+             confidence_score = $4,
+             processing_status = $5,
+             updated_at = NOW()
+         WHERE id = $1 AND user_id = $2`,
+        [
+          receiptId,
+          userId,
+          JSON.stringify({
+            extracted: result.extracted,
+            details: result.details ?? null,
+            reconciliation: result.reconciliation ?? null,
+            category_id: result.category_id,
+            used_provider: result.used_provider,
+            used_model: result.used_model,
+            passes: result.passes ?? 0,
+            warning: result.warning ?? null,
+          }),
+          result.confidence ? Math.min(1, Math.max(0, result.confidence.overall)) : null,
+          result.ok ? 'processed' : result.blocked_reason ? 'blocked' : 'failed',
+        ],
+      );
+    } catch {
+      /* audit only */
+    }
   }
 
   private async persistReceipt(
@@ -837,15 +1145,12 @@ export class ReceiptParseService {
     };
   }
 
+  /** Flat transaction fields from the (leniently parsed) model JSON. */
   private parseModelJson(
-    content: string,
+    parsed: Record<string, unknown>,
     userFullName?: string | null,
   ): ReceiptExtractedFields {
     try {
-      const cleaned = String(content || '')
-        .replace(/<think>[\s\S]*?<\/think>/gi, '')
-        .trim();
-      const parsed = JSON.parse(stripJsonFence(cleaned)) as Record<string, unknown>;
       const lineNotes = Array.isArray(parsed.line_items)
         ? parsed.line_items
             .map((item) => {
@@ -858,6 +1163,7 @@ export class ReceiptParseService {
             })
             .filter(Boolean)
             .join(', ')
+            .slice(0, 500) || null
         : null;
       let merchant = asString(parsed.merchant);
       const description = cleanDescription(asString(parsed.description), merchant);
@@ -930,7 +1236,7 @@ export class ReceiptParseService {
       return {
         merchant,
         description,
-        amount: asAmount(parsed.amount),
+        amount: asAmount(parsed.grand_total ?? parsed.amount),
         currency: asCurrency(parsed.currency),
         date,
         time,

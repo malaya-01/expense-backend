@@ -42,13 +42,15 @@ export class AuthorizationGuard implements CanActivate {
     }
 
     try {
-      const secret =
-        process.env.JWT_ACCESS_SECRET ||
-        process.env.JWT_SECRET ||
-        appConfiguration().JWT.SECRET;
+      const secret = appConfiguration().JWT.SECRET;
 
       const payload = await this.jwtService.verifyAsync(token, { secret });
       if (!payload?.sub) {
+        throw new UnauthorizedException('Unauthorized access');
+      }
+      // Refresh tokens must never be accepted as access tokens (they may be
+      // signed with the same secret when only JWT_SECRET is configured).
+      if (payload.typ === 'refresh') {
         throw new UnauthorizedException('Unauthorized access');
       }
 

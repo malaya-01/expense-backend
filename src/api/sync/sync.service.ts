@@ -58,6 +58,32 @@ const TABLE_BY_TYPE: Partial<
   },
 };
 
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** sync_client_ops.entity_id is UUID; drop client ids that are not UUIDs. */
+function syncEntityUuid(entityId?: string | null): string | null {
+  const id = String(entityId || '').trim();
+  return UUID_RE.test(id) ? id : null;
+}
+
+/** A `pending` op older than this is assumed abandoned and may be re-claimed. */
+const STALE_PENDING_MINUTES = 10;
+
+/** Re-deliver rows committed up to this long before the pull started. */
+const PULL_CURSOR_OVERLAP_MS = 120_000;
+
+function parseBooleanInput(value: unknown): boolean | null {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') {
+    const v = value.trim().toLowerCase();
+    if (v === 'true' || v === '1' || v === 'yes' || v === 'on') return true;
+    if (v === 'false' || v === '0' || v === 'no' || v === 'off') return false;
+  }
+  return null;
+}
+
 export type SyncOpResult = {
   client_op_id: string;
   status: 'applied' | 'conflict' | 'error' | 'duplicate';
@@ -134,20 +160,25 @@ export class SyncService {
   async push(userId: string, dto: SyncPushDto): Promise<{ results: SyncOpResult[] }> {
     const results: SyncOpResult[] = [];
     for (const change of dto.changes) {
-      const existing = await this.pgPool.query(
-        `SELECT status, result_json FROM sync_client_ops
-         WHERE user_id = $1 AND client_op_id = $2`,
-        [userId, change.client_op_id],
-      );
-      if (existing.rowCount) {
+      // Claim the op first so concurrent pushes of the same client_op_id
+      // cannot both apply it. Only the request that claims it applies it.
+      let claim: Awaited<ReturnType<SyncService['claimOp']>>;
+      try {
+        claim = await this.claimOp(userId, change);
+      } catch (error: any) {
         results.push({
           client_op_id: change.client_op_id,
-          status: 'duplicate',
-          server_row: existing.rows[0].result_json?.server_row ?? null,
+          status: 'error',
+          error: error?.message || 'Failed to record change',
         });
         continue;
       }
+      if (!claim.claimed) {
+        results.push(claim.result);
+        continue;
+      }
 
+      let result: SyncOpResult;
       try {
         await this.assertEntityPermission(
           userId,
@@ -156,33 +187,34 @@ export class SyncService {
         );
         const conflict = await this.detectConflict(userId, change);
         if (conflict) {
-          const result: SyncOpResult = {
+          result = {
             client_op_id: change.client_op_id,
             status: 'conflict',
             server_row: conflict,
           };
-          await this.recordOp(userId, change, result);
-          results.push(result);
-          continue;
+        } else {
+          const serverRow = await this.applyChange(userId, change);
+          result = {
+            client_op_id: change.client_op_id,
+            status: 'applied',
+            server_row: serverRow as Record<string, unknown>,
+          };
         }
-
-        const serverRow = await this.applyChange(userId, change);
-        const result: SyncOpResult = {
-          client_op_id: change.client_op_id,
-          status: 'applied',
-          server_row: serverRow as Record<string, unknown>,
-        };
-        await this.recordOp(userId, change, result);
-        results.push(result);
       } catch (error: any) {
-        const result: SyncOpResult = {
+        result = {
           client_op_id: change.client_op_id,
           status: 'error',
           error: error?.message || 'Failed to apply change',
         };
-        await this.recordOp(userId, change, result);
-        results.push(result);
       }
+
+      try {
+        await this.recordOp(userId, change, result);
+      } catch {
+        // Recording the outcome must not abort the rest of the batch, nor
+        // turn an applied change into an error the client would re-send.
+      }
+      results.push(result);
     }
 
     await this.pgPool.query(
@@ -202,6 +234,16 @@ export class SyncService {
 
     const allowed = await this.allowedEntityTypes(userId);
     const empty = { rows: [] as Record<string, unknown>[] };
+
+    // Take the next cursor from the DB clock *before* reading, minus an
+    // overlap window: rows written by transactions that started earlier but
+    // commit during/after this pull still have updated_at < now, and would be
+    // skipped forever if the cursor were taken after the queries.
+    const clock = await this.pgPool.query<{ now: Date }>(
+      `SELECT clock_timestamp() AS now`,
+    );
+    const serverTime = new Date(clock.rows[0].now);
+    const nextCursor = new Date(serverTime.getTime() - PULL_CURSOR_OVERLAP_MS);
 
     const [
       accounts,
@@ -278,17 +320,16 @@ export class SyncService {
         : empty,
     ]);
 
-    const serverTime = new Date();
     await this.pgPool.query(
       `INSERT INTO user_sync_state (user_id, device_id, pull_cursor, updated_at)
        VALUES ($1, $2, $3, NOW())
        ON CONFLICT (user_id, device_id)
        DO UPDATE SET pull_cursor = EXCLUDED.pull_cursor, updated_at = NOW()`,
-      [userId, deviceId || 'unknown', serverTime.toISOString()],
+      [userId, deviceId || 'unknown', nextCursor.toISOString()],
     );
 
     return {
-      cursor: serverTime.toISOString(),
+      cursor: nextCursor.toISOString(),
       server_time: serverTime.toISOString(),
       changes: {
         accounts: accounts.rows,
@@ -308,9 +349,13 @@ export class SyncService {
   }
 
   private async pullTable(userId: string, table: string, cursor: Date) {
+    // Space wallets live in financial_containers too, but belong to the
+    // shared space, not the personal ledger synced here.
+    const scope =
+      table === 'financial_containers' ? ' AND space_id IS NULL' : '';
     return this.pgPool.query(
       `SELECT * FROM ${table}
-       WHERE user_id = $1 AND updated_at > $2
+       WHERE user_id = $1 AND updated_at > $2${scope}
        ORDER BY updated_at ASC`,
       [userId, cursor],
     );
@@ -339,6 +384,103 @@ export class SyncService {
     return null;
   }
 
+  /**
+   * Claim a client op as `pending` before applying it.
+   *
+   * - New op: inserted as pending → caller applies it.
+   * - Previously failed (`error`) or stale pending op: atomically re-claimed
+   *   → caller re-applies it (so a transient failure is not reported as a
+   *   duplicate and silently dropped by the client).
+   * - Previously applied: reported as `duplicate` with the stored server row.
+   * - Previously a conflict: reported as `conflict` again.
+   * - Currently pending (another request is applying it): reported as `error`
+   *   so the client keeps the op and retries later.
+   */
+  private async claimOp(
+    userId: string,
+    change: SyncChangeDto,
+  ): Promise<
+    { claimed: true } | { claimed: false; result: SyncOpResult }
+  > {
+    const inserted = await this.pgPool.query(
+      `INSERT INTO sync_client_ops
+        (user_id, client_op_id, entity_type, entity_id, op, status)
+       VALUES ($1, $2, $3, $4, $5, 'pending')
+       ON CONFLICT (user_id, client_op_id) DO NOTHING
+       RETURNING id`,
+      [
+        userId,
+        change.client_op_id,
+        change.entity_type,
+        syncEntityUuid(change.entity_id),
+        change.op,
+      ],
+    );
+    if (inserted.rowCount) return { claimed: true };
+
+    const reclaimed = await this.pgPool.query(
+      `UPDATE sync_client_ops
+       SET status = 'pending',
+           entity_type = $3,
+           entity_id = $4,
+           op = $5,
+           result_json = NULL,
+           created_at = NOW()
+       WHERE user_id = $1 AND client_op_id = $2
+         AND (
+           status = 'error'
+           OR (status = 'pending' AND created_at < NOW() - INTERVAL '${STALE_PENDING_MINUTES} minutes')
+         )
+       RETURNING id`,
+      [
+        userId,
+        change.client_op_id,
+        change.entity_type,
+        syncEntityUuid(change.entity_id),
+        change.op,
+      ],
+    );
+    if (reclaimed.rowCount) return { claimed: true };
+
+    const existing = await this.pgPool.query(
+      `SELECT status, result_json FROM sync_client_ops
+       WHERE user_id = $1 AND client_op_id = $2`,
+      [userId, change.client_op_id],
+    );
+    const row = existing.rows[0];
+    const serverRow = row?.result_json?.server_row ?? null;
+    if (row?.status === 'applied') {
+      return {
+        claimed: false,
+        result: {
+          client_op_id: change.client_op_id,
+          status: 'duplicate',
+          server_row: serverRow,
+        },
+      };
+    }
+    if (row?.status === 'conflict') {
+      return {
+        claimed: false,
+        result: {
+          client_op_id: change.client_op_id,
+          status: 'conflict',
+          server_row: serverRow,
+        },
+      };
+    }
+    // Still pending in another request (or the row vanished): retry later.
+    return {
+      claimed: false,
+      result: {
+        client_op_id: change.client_op_id,
+        status: 'error',
+        error: 'Change is still being processed — will retry',
+      },
+    };
+  }
+
+  /** Store the final outcome on the op claimed by `claimOp`. */
   private async recordOp(
     userId: string,
     change: SyncChangeDto,
@@ -348,12 +490,14 @@ export class SyncService {
       `INSERT INTO sync_client_ops
         (user_id, client_op_id, entity_type, entity_id, op, status, result_json)
        VALUES ($1,$2,$3,$4,$5,$6,$7)
-       ON CONFLICT (user_id, client_op_id) DO NOTHING`,
+       ON CONFLICT (user_id, client_op_id) DO UPDATE SET
+         status = EXCLUDED.status,
+         result_json = EXCLUDED.result_json`,
       [
         userId,
         change.client_op_id,
         change.entity_type,
-        change.entity_id || null,
+        syncEntityUuid(change.entity_id),
         change.op,
         result.status === 'duplicate' ? 'applied' : result.status,
         JSON.stringify(result),
@@ -469,36 +613,43 @@ export class SyncService {
     userId: string,
     payload: Record<string, unknown>,
   ) {
-    const memoryEnabled =
-      payload.memory_enabled === undefined
-        ? null
-        : Boolean(payload.memory_enabled);
-    const masterPrompt =
-      payload.master_prompt === undefined
-        ? null
-        : (payload.master_prompt as string | null);
-    const activeProvider =
-      payload.active_provider === undefined
-        ? null
-        : (payload.active_provider as string | null);
-    const activeModel =
-      payload.active_model === undefined
-        ? null
-        : (payload.active_model as string | null);
+    // Only touch keys the client actually sent, so a field can be cleared
+    // (explicit null) and omitted fields are left unchanged.
+    const columns: string[] = [];
+    const values: unknown[] = [];
+    const has = (key: string) =>
+      Object.prototype.hasOwnProperty.call(payload, key) &&
+      payload[key] !== undefined;
 
+    for (const key of ['active_provider', 'active_model', 'master_prompt']) {
+      if (!has(key)) continue;
+      const value = payload[key];
+      if (value !== null && typeof value !== 'string') {
+        throw new BadRequestException(`${key} must be a string or null`);
+      }
+      columns.push(key);
+      values.push(value);
+    }
+    if (has('memory_enabled') && payload.memory_enabled !== null) {
+      const memoryEnabled = parseBooleanInput(payload.memory_enabled);
+      if (memoryEnabled === null) {
+        throw new BadRequestException('memory_enabled must be a boolean');
+      }
+      columns.push('memory_enabled');
+      values.push(memoryEnabled);
+    }
+
+    const placeholders = columns.map((_, i) => `$${i + 2}`);
+    const updates = columns.map((col) => `${col} = EXCLUDED.${col}`);
     const result = await this.pgPool.query(
       `INSERT INTO user_ai_preferences
-        (user_id, active_provider, active_model, master_prompt, memory_enabled, updated_at)
-       VALUES ($1, $2, $3, $4, COALESCE($5, TRUE), NOW())
+        (user_id, ${[...columns, 'updated_at'].join(', ')})
+       VALUES ($1, ${[...placeholders, 'NOW()'].join(', ')})
        ON CONFLICT (user_id) DO UPDATE SET
-         active_provider = COALESCE($2, user_ai_preferences.active_provider),
-         active_model = COALESCE($3, user_ai_preferences.active_model),
-         master_prompt = COALESCE($4, user_ai_preferences.master_prompt),
-         memory_enabled = COALESCE($5, user_ai_preferences.memory_enabled),
-         updated_at = NOW()
+         ${[...updates, 'updated_at = NOW()'].join(',\n         ')}
        RETURNING user_id, active_provider, active_model, master_prompt,
                  memory_enabled, sync_version, created_at, updated_at`,
-      [userId, activeProvider, activeModel, masterPrompt, memoryEnabled],
+      [userId, ...values],
     );
     return result.rows[0];
   }
@@ -517,9 +668,13 @@ export class SyncService {
            content = EXCLUDED.content,
            updated_at = NOW(),
            deleted_at = NULL
+         WHERE ai_memories.user_id = EXCLUDED.user_id
          RETURNING id, user_id, content, source, sync_version, created_at, updated_at, deleted_at`,
         [payload.id, userId, content, payload.source || 'user'],
       );
+      if (!result.rowCount) {
+        throw new BadRequestException('Memory id is already in use');
+      }
       return result.rows[0];
     }
     return this.aiAdvisor.addMemory(userId, content);

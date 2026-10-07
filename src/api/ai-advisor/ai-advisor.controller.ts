@@ -563,7 +563,7 @@ export class AiAdvisorController {
   @Post('receipts/parse')
   @ApiOperation({
     summary:
-      'Extract receipt fields with free vision then Gemini. Image is not stored.',
+      'Extract receipt / bill fields (active vision provider, else Opal Free vision), reconcile totals and suggest a category. The scan is stored.',
   })
   @ApiBody({ type: ParseReceiptDto })
   @RequireAnyPermission('ai.create', 'expenses.create')
@@ -639,6 +639,17 @@ export class AiAdvisorController {
     }
     res.write(': connected\n\n');
 
+    // SSE comment heartbeat: providers (and continuation / title generation)
+    // can be silent for a long time; the client aborts after 180s without
+    // bytes and proxies drop idle streams. Comments are ignored by parsers.
+    const heartbeat = setInterval(() => {
+      if (res.writableEnded || ac.signal.aborted) return;
+      res.write(': ping\n\n');
+      if (typeof (res as any).flush === 'function') {
+        (res as any).flush();
+      }
+    }, 15_000);
+
     try {
       for await (const event of this.advisorService.chatStream(
         userId,
@@ -675,6 +686,7 @@ export class AiAdvisorController {
         );
       }
     } finally {
+      clearInterval(heartbeat);
       if (!res.writableEnded) {
         res.write('data: {"type":"close"}\n\n');
         res.end();

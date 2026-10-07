@@ -7,18 +7,33 @@ const BLOCKED_HOSTS = new Set([
   '169.254.169.254',
 ]);
 
-function isPrivateIp(hostname: string): boolean {
-  if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1') {
-    return true;
+function isPrivateIp(rawHostname: string): boolean {
+  // WHATWG URL keeps IPv6 hosts in brackets ("[::1]").
+  let hostname = rawHostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (hostname === 'localhost' || hostname.endsWith('.localhost')) return true;
+  if (hostname.includes(':')) {
+    if (hostname === '::1' || hostname === '::') return true;
+    if (/^f[cd][0-9a-f]{2}:/.test(hostname)) return true; // fc00::/7 ULA
+    if (/^fe[89ab][0-9a-f]:/.test(hostname)) return true; // fe80::/10
+    const mapped = hostname.match(/^::ffff:(.+)$/);
+    if (!mapped) return false;
+    hostname = mapped[1];
+    const hex = hostname.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hex) {
+      const hi = parseInt(hex[1], 16);
+      const lo = parseInt(hex[2], 16);
+      hostname = [hi >> 8, hi & 255, lo >> 8, lo & 255].join('.');
+    }
   }
   const m = hostname.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
   if (!m) return false;
   const a = Number(m[1]);
   const b = Number(m[2]);
-  if (a === 10) return true;
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 169 && b === 254) return true; // link-local / cloud metadata
+  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
   if (a === 172 && b >= 16 && b <= 31) return true;
   if (a === 192 && b === 168) return true;
-  if (a === 127) return true;
   return false;
 }
 
@@ -33,6 +48,11 @@ export function validateModelBaseUrl(raw?: string | null): string | null {
   }
   if (!['http:', 'https:'].includes(url.protocol)) {
     throw new BadRequestException('Base URL must use http or https.');
+  }
+  if (url.search || url.hash || url.username || url.password) {
+    throw new BadRequestException(
+      'Base URL must not include credentials, a query string or a fragment.',
+    );
   }
   const host = url.hostname.toLowerCase();
   if (BLOCKED_HOSTS.has(host)) {

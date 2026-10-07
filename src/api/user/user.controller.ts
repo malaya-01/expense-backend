@@ -4,9 +4,12 @@ import {
   Delete,
   Get,
   HttpStatus,
+  Param,
+  ParseUUIDPipe,
   Patch,
   Post,
   Put,
+  Query,
   Req,
   Res,
   UploadedFile,
@@ -27,7 +30,16 @@ import {
   UpdateProfileDto,
 } from './dto/update-profile.dto';
 import { UpdateThemePreferencesDto } from './dto/theme-preferences.dto';
-import { SaveFaceLoginDto } from './dto/face-login.dto';
+import {
+  DeleteAccountDto,
+  RevokeOtherSessionsDto,
+  UserPreferencesDto,
+} from './dto/user-preferences.dto';
+import {
+  REFRESH_COOKIE_NAME,
+  clearRefreshCookieOptions,
+  readPresentedRefreshToken,
+} from 'src/api/auth/refresh-cookie';
 import { errorResponse, successResponse } from 'src/utils/response/response';
 import { RequirePermissions } from 'src/helper/decorators/permissions.decorator';
 
@@ -247,62 +259,151 @@ export class UserController {
     }
   }
 
-  @Get('face-login')
-  @ApiOperation({ summary: 'Whether face login is saved for this account' })
-  async getFaceLogin(@Req() req: Request, @Res() res: Response) {
+  @Get('preferences')
+  @ApiOperation({ summary: 'Get app preferences (formats, defaults, appearance)' })
+  @RequirePermissions('dashboard.access')
+  async getPreferences(@Req() req: Request, @Res() res: Response) {
     try {
-      const data = await this.userService.getFaceLogin(
+      const data = await this.userService.getPreferences(
         (req as any).user.id as string,
       );
-      return res.status(HttpStatus.OK).send(successResponse(data, 'Face login'));
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Preferences'));
     } catch (error) {
       const statusCode = error.status || error.statusCode || HttpStatus.BAD_REQUEST;
       return res
         .status(statusCode)
-        .send(errorResponse(error.message || 'Could not read face login', statusCode));
+        .send(errorResponse(error.message || 'Failed to load preferences', statusCode));
     }
   }
 
-  @Put('face-login')
-  @ApiOperation({ summary: 'Save face login in cloud storage' })
-  @RequirePermissions('settings.update')
-  async saveFaceLogin(
+  @Patch('preferences')
+  @ApiOperation({ summary: 'Merge app preferences' })
+  @RequirePermissions('dashboard.access')
+  async updatePreferences(
     @Req() req: Request,
-    @Body() dto: SaveFaceLoginDto,
+    @Body() dto: UserPreferencesDto,
     @Res() res: Response,
   ) {
     try {
-      const data = await this.userService.saveFaceLogin(
+      const data = await this.userService.updatePreferences(
         (req as any).user.id as string,
         dto,
       );
       return res
         .status(HttpStatus.OK)
-        .send(successResponse(data, 'Face login saved'));
+        .send(successResponse(data, 'Preferences saved'));
     } catch (error) {
       const statusCode = error.status || error.statusCode || HttpStatus.BAD_REQUEST;
       return res
         .status(statusCode)
-        .send(errorResponse(error.message || 'Could not save face login', statusCode));
+        .send(errorResponse(error.message || 'Failed to save preferences', statusCode));
     }
   }
 
-  @Delete('face-login')
-  @ApiOperation({ summary: 'Remove face login from cloud storage' })
-  @RequirePermissions('settings.update')
-  async deleteFaceLogin(@Req() req: Request, @Res() res: Response) {
+  @Get('sessions')
+  @ApiOperation({
+    summary: 'List active sign-in sessions',
+    description:
+      'Pass `current` (SHA-256 hex of this device refresh token) to flag the current session.',
+  })
+  @RequirePermissions('settings.read')
+  async listSessions(
+    @Req() req: Request,
+    @Query('current') current: string | undefined,
+    @Res() res: Response,
+  ) {
     try {
-      const data = await this.userService.deleteFaceLogin(
+      const data = await this.userService.listSessions(
         (req as any).user.id as string,
+        typeof current === 'string' ? current : null,
       );
       return res
         .status(HttpStatus.OK)
-        .send(successResponse(data, 'Face login removed'));
+        .send(successResponse(data, 'Sessions'));
     } catch (error) {
       const statusCode = error.status || error.statusCode || HttpStatus.BAD_REQUEST;
       return res
         .status(statusCode)
-        .send(errorResponse(error.message || 'Could not remove face login', statusCode));
+        .send(errorResponse(error.message || 'Failed to load sessions', statusCode));
+    }
+  }
+
+  @Post('sessions/revoke-others')
+  @ApiOperation({ summary: 'Sign out of every other device' })
+  @RequirePermissions('settings.update')
+  async revokeOtherSessions(
+    @Req() req: Request,
+    @Body() _dto: RevokeOtherSessionsDto,
+    @Res() res: Response,
+  ) {
+    try {
+      const data = await this.userService.revokeOtherSessions(
+        (req as any).user.id as string,
+        readPresentedRefreshToken(req),
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Other sessions signed out'));
+    } catch (error) {
+      const statusCode = error.status || error.statusCode || HttpStatus.BAD_REQUEST;
+      return res
+        .status(statusCode)
+        .send(errorResponse(error.message || 'Failed to sign out other sessions', statusCode));
+    }
+  }
+
+  @Delete('sessions/:id')
+  @ApiOperation({ summary: 'Revoke one sign-in session' })
+  @RequirePermissions('settings.update')
+  async revokeSession(
+    @Req() req: Request,
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Res() res: Response,
+  ) {
+    try {
+      const data = await this.userService.revokeSession(
+        (req as any).user.id as string,
+        id,
+      );
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Session revoked'));
+    } catch (error) {
+      const statusCode = error.status || error.statusCode || HttpStatus.BAD_REQUEST;
+      return res
+        .status(statusCode)
+        .send(errorResponse(error.message || 'Failed to revoke session', statusCode));
+    }
+  }
+
+  @Post('delete-account')
+  @ApiOperation({
+    summary: 'Delete (soft) the account',
+    description:
+      'Requires the current password and confirmation "DELETE". Marks the user deleted and revokes all sessions.',
+  })
+  @RequirePermissions('settings.update')
+  async deleteAccount(
+    @Req() req: Request,
+    @Body() dto: DeleteAccountDto,
+    @Res() res: Response,
+  ) {
+    try {
+      const data = await this.userService.deleteAccount(
+        (req as any).user.id as string,
+        dto,
+      );
+      res.clearCookie(REFRESH_COOKIE_NAME, clearRefreshCookieOptions());
+      return res
+        .status(HttpStatus.OK)
+        .send(successResponse(data, 'Account deleted'));
+    } catch (error) {
+      const statusCode = error.status || error.statusCode || HttpStatus.BAD_REQUEST;
+      return res
+        .status(statusCode)
+        .send(errorResponse(error.message || 'Failed to delete account', statusCode));
     }
   }
 }

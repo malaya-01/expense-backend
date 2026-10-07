@@ -105,10 +105,10 @@ export class CategoriesController {
     description: 'Delete a category.'
   })
   @RequirePermissions('categories.delete')
-  remove(@Param('category_id') category_id: string , @Res() res: Response, @Req() req: Request) {
+  async remove(@Param('category_id') category_id: string , @Res() res: Response, @Req() req: Request) {
     try{
       const user_id = req['user'].id as string  
-      const result = this.categoriesService.remove(user_id, category_id)
+      const result = await this.categoriesService.remove(user_id, category_id)
       return res.status(HttpStatus.OK).send(successResponse(result, 'cateogry deleted successfully.'))
     }catch(error){
       const message = error.message || 'An unexpected error occured'

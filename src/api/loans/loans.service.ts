@@ -12,7 +12,7 @@ import {
   UpdateLoanDto,
 } from './dto/loan.dto';
 import { requireDateOnly } from 'src/common/date/to-date-only';
-import { roundMoney } from 'src/common/currency/currency.data';
+import { getRate, roundMoney } from 'src/common/currency/currency.data';
 
 @Injectable()
 export class LoansService {
@@ -167,30 +167,130 @@ export class LoansService {
     if (loan.status !== 'active') {
       throw new BadRequestException('Only active debts can receive payments.');
     }
-    if (dto.amount > loan.outstanding_balance + 0.005) {
+
+    const client = await this.pgPool.connect();
+    try {
+      await client.query('BEGIN');
+      const source = await client.query(
+        `SELECT currency FROM financial_containers
+         WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+        [dto.source_container_id, userId],
+      );
+      if (!source.rowCount) {
+        throw new BadRequestException('Financial container not found');
+      }
+      const sourceCurrency = String(source.rows[0].currency).toUpperCase();
+      const loanCurrency = String(loan.currency).toUpperCase();
+      // Units of loan currency per unit of source currency.
+      const rate =
+        sourceCurrency === loanCurrency
+          ? 1
+          : dto.exchange_rate && dto.exchange_rate > 0
+            ? dto.exchange_rate
+            : getRate(sourceCurrency, loanCurrency);
+
+      // Interest accrued since the previous payment (or the loan start). The
+      // instalment covers that first; only the rest reduces the liability.
+      const last = await client.query(
+        `SELECT to_char(MAX(date), 'YYYY-MM-DD') AS last_date
+         FROM ledger_transactions
+         WHERE user_id = $1 AND destination_container_id = $2
+           AND type = 'transfer' AND deleted_at IS NULL AND date <= $3`,
+        [userId, loan.container_id, dto.date],
+      );
+      const accrualStart: string = last.rows[0]?.last_date || loan.start_date;
+      const days = Math.max(
+        0,
+        Math.round(
+          (Date.parse(`${dto.date}T00:00:00Z`) -
+            Date.parse(`${accrualStart}T00:00:00Z`)) /
+            86_400_000,
+        ),
+      );
+      const interestBase =
+        loan.interest_type === 'simple'
+          ? loan.principal
+          : loan.outstanding_balance;
+      const interestDue = roundMoney(
+        (interestBase * (loan.annual_interest_rate / 100) * days) / 365,
+      );
+      const interestPart = roundMoney(
+        Math.min(dto.amount, interestDue / rate),
+      );
+      const principalPart = roundMoney(dto.amount - interestPart);
+      const principalInLoanCurrency = roundMoney(principalPart * rate);
+      if (principalInLoanCurrency > loan.outstanding_balance + 0.005) {
+        const maxPayable = roundMoney(
+          interestPart + loan.outstanding_balance / rate,
+        );
+        throw new BadRequestException(
+          `Payment cannot exceed the outstanding balance plus accrued interest (${maxPayable}).`,
+        );
+      }
+
+      let interestTransaction: Record<string, any> | null = null;
+      if (interestPart >= 0.01) {
+        interestTransaction = await this.transactionsService.createWithClient(
+          client,
+          userId,
+          {
+            type: 'expense',
+            amount: interestPart,
+            description: `Debt interest · ${loan.name}`,
+            date: dto.date,
+            source_container_id: dto.source_container_id,
+            notes: dto.notes || `Interest on ${loan.name}`,
+          },
+          'loans',
+        );
+      }
+      let transaction: Record<string, any> | null = null;
+      if (principalPart >= 0.01) {
+        transaction = await this.transactionsService.createWithClient(
+          client,
+          userId,
+          {
+            type: 'transfer',
+            amount: principalPart,
+            description: `Debt payment · ${loan.name}`,
+            date: dto.date,
+            source_container_id: dto.source_container_id,
+            destination_container_id: loan.container_id,
+            exchange_rate: dto.exchange_rate,
+            notes: dto.notes || `Loan payment for ${loan.name}`,
+          },
+          'loans',
+        );
+      }
+
+      const balance = await client.query(
+        `SELECT balance FROM financial_containers WHERE id = $1 AND user_id = $2`,
+        [loan.container_id, userId],
+      );
+      if (Number(balance.rows[0]?.balance ?? 0) <= 0.005) {
+        await client.query(
+          `UPDATE loans SET status = 'closed', updated_at = NOW()
+           WHERE id = $1 AND user_id = $2`,
+          [id, userId],
+        );
+      }
+      await client.query('COMMIT');
+      return {
+        transaction: transaction ?? interestTransaction,
+        interest_transaction: interestTransaction,
+        interest_paid: interestPart,
+        principal_paid: principalPart,
+        loan: await this.findOne(userId, id),
+      };
+    } catch (error: any) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      if (error?.status) throw error;
       throw new BadRequestException(
-        'Payment cannot exceed the outstanding balance.',
+        error?.message || 'Could not record debt payment',
       );
+    } finally {
+      client.release();
     }
-    const transaction = await this.transactionsService.create(userId, {
-      type: 'transfer',
-      amount: dto.amount,
-      description: `Debt payment · ${loan.name}`,
-      date: dto.date,
-      source_container_id: dto.source_container_id,
-      destination_container_id: loan.container_id,
-      exchange_rate: dto.exchange_rate,
-      notes: dto.notes || `Loan payment for ${loan.name}`,
-    });
-    const refreshed = await this.findOne(userId, id);
-    if (refreshed.outstanding_balance <= 0.005) {
-      await this.pgPool.query(
-        `UPDATE loans SET status = 'closed', updated_at = NOW()
-         WHERE id = $1 AND user_id = $2`,
-        [id, userId],
-      );
-    }
-    return { transaction, loan: await this.findOne(userId, id) };
   }
 
   async amortization(userId: string, id: string) {
@@ -203,7 +303,10 @@ export class LoansService {
       loan.interest_type,
     );
     let balance = loan.principal;
-    const start = new Date(`${loan.start_date}T00:00:00`);
+    const [startYear, startMonth, startDay] = String(loan.start_date)
+      .split('-')
+      .map(Number);
+    const anchorDay = loan.payment_day || startDay;
     const schedule: Array<{
       installment: number;
       due_date: string;
@@ -226,28 +329,25 @@ export class LoansService {
                 loan.term_months,
             )
           : roundMoney(balance * monthlyRate);
+      // The last instalment clears any rounding residue.
       const principal =
-        loan.interest_type === 'simple'
-          ? roundMoney(Math.min(balance, loan.principal / loan.term_months))
-          : roundMoney(Math.min(balance, payment - interest));
+        installment === loan.term_months
+          ? balance
+          : loan.interest_type === 'simple'
+            ? roundMoney(Math.min(balance, loan.principal / loan.term_months))
+            : roundMoney(Math.min(balance, payment - interest));
       balance = roundMoney(Math.max(0, balance - principal));
-      const due = new Date(start);
-      due.setMonth(start.getMonth() + installment);
-      if (loan.payment_day) {
-        due.setDate(
-          Math.min(
-            loan.payment_day,
-            new Date(due.getFullYear(), due.getMonth() + 1, 0).getDate(),
-          ),
-        );
-      }
+      // Clamp to month end instead of overflowing (Jan 31 + 1 month = Feb 28).
+      const monthIndex = startMonth - 1 + installment;
+      const lastDay = new Date(
+        Date.UTC(startYear, monthIndex + 1, 0),
+      ).getUTCDate();
+      const due = new Date(
+        Date.UTC(startYear, monthIndex, Math.min(anchorDay, lastDay)),
+      );
       schedule.push({
         installment,
-        due_date: [
-          due.getFullYear(),
-          String(due.getMonth() + 1).padStart(2, '0'),
-          String(due.getDate()).padStart(2, '0'),
-        ].join('-'),
+        due_date: due.toISOString().slice(0, 10),
         payment: roundMoney(principal + interest),
         principal,
         interest,

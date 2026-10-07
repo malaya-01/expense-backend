@@ -2,15 +2,14 @@ import {
   BadRequestException,
   Inject,
   Injectable,
-  Logger,
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { Pool } from 'pg';
-import { randomBytes } from 'crypto';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
 import * as bcrypt from 'bcrypt';
+import { createHash } from 'crypto';
 import {
   getCountry,
   isSupportedCurrency,
@@ -20,20 +19,18 @@ import {
   UpdateProfileDto,
 } from './dto/update-profile.dto';
 import {
+  DeleteAccountDto,
+  sanitizeUserPreferences,
+  type UserPreferences,
+} from './dto/user-preferences.dto';
+import {
   assertAvatarFile,
   deleteAvatarFile,
 } from './avatar-storage';
 import { ObjectStorageService } from 'src/storage/object-storage.service';
-import { SaveFaceLoginDto } from './dto/face-login.dto';
-import {
-  assertDescriptor,
-  encryptFaceTemplate,
-} from 'src/storage/face-template.crypto';
 
 @Injectable()
 export class UserService {
-  private readonly logger = new Logger(UserService.name);
-
   constructor(
     @Inject('PG_POOL') private readonly pgPool: Pool,
     @Inject(CACHE_MANAGER)
@@ -56,7 +53,8 @@ export class UserService {
   async findOne(id: string) {
     const result = await this.pgPool.query(
       `SELECT id, full_name, email, country, currency, timezone, locale,
-              avatar_url, email_verified, is_admin, created_at, updated_at
+              avatar_url, email_verified, is_admin, preferences,
+              created_at, updated_at
        FROM users
        WHERE id = $1 AND deleted_at IS NULL`,
       [id],
@@ -93,10 +91,22 @@ export class UserService {
     }
     if (dto.timezone !== undefined) {
       timezone = dto.timezone.trim() || 'UTC';
+      if (!isValidTimeZone(timezone)) {
+        throw new BadRequestException('Unsupported timezone');
+      }
     }
     if (dto.locale !== undefined) {
       locale = dto.locale.trim() || 'en-US';
+      if (!isValidLocale(locale)) {
+        throw new BadRequestException('Unsupported locale');
+      }
     }
+    // Offline sync pushes this payload without the ValidationPipe, so the
+    // preferences object is re-sanitised here; it is merged, not replaced.
+    const preferencesPatch =
+      dto.preferences !== undefined
+        ? sanitizeUserPreferences(dto.preferences)
+        : {};
 
     const result = await this.pgPool.query(
       `UPDATE users
@@ -105,11 +115,20 @@ export class UserService {
            currency = $4,
            timezone = $5,
            locale = $6,
+           preferences = COALESCE(preferences, '{}'::jsonb) || $7::jsonb,
            updated_at = NOW()
        WHERE id = $1 AND deleted_at IS NULL
        RETURNING id, full_name, email, country, currency, timezone, locale,
-                 avatar_url, email_verified, created_at, updated_at`,
-      [userId, fullName, country, currency, timezone, locale],
+                 avatar_url, email_verified, preferences, created_at, updated_at`,
+      [
+        userId,
+        fullName,
+        country,
+        currency,
+        timezone,
+        locale,
+        JSON.stringify(preferencesPatch),
+      ],
     );
     return result.rows[0];
   }
@@ -129,18 +148,25 @@ export class UserService {
     const previous = existing.avatar_url as string | null;
     const avatarUrl = saved.publicPath;
 
-    const result = await this.pgPool.query(
-      `UPDATE users
-       SET avatar_url = $2, updated_at = NOW()
-       WHERE id = $1 AND deleted_at IS NULL
-       RETURNING id, full_name, email, country, currency, timezone, locale,
-                 avatar_url, email_verified, created_at, updated_at`,
-      [userId, avatarUrl],
-    );
+    let result;
+    try {
+      result = await this.pgPool.query(
+        `UPDATE users
+         SET avatar_url = $2, updated_at = NOW()
+         WHERE id = $1 AND deleted_at IS NULL
+         RETURNING id, full_name, email, country, currency, timezone, locale,
+                   avatar_url, email_verified, created_at, updated_at`,
+        [userId, avatarUrl],
+      );
+    } catch (error) {
+      await this.storage.deletePublicPath(avatarUrl, userId);
+      throw error;
+    }
 
     if (previous && previous !== avatarUrl) {
+      // Best-effort (never throws): legacy local file + previous R2 object.
       deleteAvatarFile(previous);
-      await this.storage.deletePublicPath(previous);
+      await this.storage.deletePublicPath(previous, userId);
     }
 
     return result.rows[0];
@@ -160,7 +186,7 @@ export class UserService {
       [userId],
     );
     deleteAvatarFile(previous);
-    await this.storage.deletePublicPath(previous);
+    await this.storage.deletePublicPath(previous, userId);
     return result.rows[0];
   }
 
@@ -180,10 +206,31 @@ export class UserService {
     if (!valid) throw new UnauthorizedException('Current password is incorrect');
 
     const passwordHash = await bcrypt.hash(dto.newPassword, 10);
-    await this.pgPool.query(
-      `UPDATE users SET password_hash = $2, updated_at = NOW() WHERE id = $1`,
-      [userId, passwordHash],
-    );
+    const client = await this.pgPool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE users SET password_hash = $2, updated_at = NOW() WHERE id = $1`,
+        [userId, passwordHash],
+      );
+      // A password change signs out every existing refresh-token session.
+      await client.query(
+        `UPDATE user_sessions
+         SET revoked_at = NOW(), updated_at = NOW()
+         WHERE user_id = $1 AND revoked_at IS NULL`,
+        [userId],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        /* ignore rollback errors */
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
     return { message: 'Password updated successfully' };
   }
 
@@ -282,123 +329,205 @@ export class UserService {
     };
   }
 
-  async getFaceLogin(userId: string) {
+  // -- App preferences ----------------------------------------------------
+
+  async getPreferences(userId: string) {
     const result = await this.pgPool.query(
-      `SELECT email FROM face_login_profiles WHERE user_id = $1`,
+      `SELECT preferences, updated_at FROM users
+       WHERE id = $1 AND deleted_at IS NULL`,
       [userId],
     );
-    if (!result.rowCount) {
-      return { enabled: false, email: null };
-    }
+    if (!result.rowCount) throw new NotFoundException('User not found');
     return {
-      enabled: true,
-      email: result.rows[0].email as string,
+      preferences: sanitizeUserPreferences(result.rows[0].preferences),
+      updated_at: result.rows[0].updated_at,
     };
   }
 
-  async saveFaceLogin(userId: string, dto: SaveFaceLoginDto) {
-    const user = await this.findOne(userId);
-    if (!user) throw new NotFoundException('User not found');
-    const descriptor = assertDescriptor(dto.descriptor);
-    const envelope = encryptFaceTemplate(descriptor);
-    const existing = await this.pgPool.query(
-      `SELECT preview_token, preview_object_key FROM face_login_profiles WHERE user_id = $1`,
-      [userId],
+  /** Merge a validated preferences patch into users.preferences. */
+  async updatePreferences(userId: string, patch: UserPreferences) {
+    const clean = sanitizeUserPreferences(patch);
+    const result = await this.pgPool.query(
+      `UPDATE users
+       SET preferences = COALESCE(preferences, '{}'::jsonb) || $2::jsonb,
+           updated_at = NOW()
+       WHERE id = $1 AND deleted_at IS NULL
+       RETURNING preferences, updated_at`,
+      [userId, JSON.stringify(clean)],
     );
-    const previousPreview = existing.rows[0]?.preview_object_key as
-      | string
-      | undefined;
-    const previewToken = existing.rows[0]?.preview_token as string | undefined;
-    if (previewToken) {
-      await this.storage.deletePublicPath(`/api/media/${previewToken}`);
-    }
-
-    let objectKey = `inline:${userId}`;
-    let previewObjectKey: string | null = null;
-    let storedInR2 = false;
-    try {
-      objectKey = `face-login/${userId}/profile.json`;
-      await this.storage.putJson(objectKey, envelope);
-      const photo = jpegFromPreview(dto.preview_base64);
-      if (photo) {
-        previewObjectKey = `face-login/${userId}/${randomBytes(16).toString('hex')}.jpg`;
-        await this.storage.putBytes(previewObjectKey, photo, 'image/jpeg');
-      }
-      storedInR2 = true;
-    } catch (error) {
-      objectKey = `inline:${userId}`;
-      previewObjectKey = null;
-      const message = error instanceof Error ? error.message : 'R2 upload failed';
-      this.logger.warn(`Face data was not stored in R2: ${message}`);
-    }
-
-    if (
-      previousPreview &&
-      previousPreview !== previewObjectKey &&
-      !previousPreview.startsWith('inline:')
-    ) {
-      try {
-        await this.storage.deleteKey(previousPreview);
-      } catch {
-        /* previous photo may already be gone */
-      }
-    }
-
-    await this.pgPool.query(
-      `INSERT INTO face_login_profiles
-         (user_id, email, object_key, preview_token, preview_object_key, template, updated_at)
-       VALUES ($1, $2, $3, NULL, $4, $5::jsonb, NOW())
-       ON CONFLICT (user_id) DO UPDATE SET
-         email = EXCLUDED.email,
-         object_key = EXCLUDED.object_key,
-         preview_token = NULL,
-         preview_object_key = EXCLUDED.preview_object_key,
-         template = EXCLUDED.template,
-         updated_at = NOW()`,
-      [userId, user.email, objectKey, previewObjectKey, JSON.stringify(envelope)],
-    );
-    return { ...(await this.getFaceLogin(userId)), stored_in_r2: storedInR2 };
+    if (!result.rowCount) throw new NotFoundException('User not found');
+    return {
+      preferences: sanitizeUserPreferences(result.rows[0].preferences),
+      updated_at: result.rows[0].updated_at,
+    };
   }
 
-  async deleteFaceLogin(userId: string) {
-    const existing = await this.pgPool.query(
-      `SELECT object_key, preview_token, preview_object_key FROM face_login_profiles WHERE user_id = $1`,
-      [userId],
+  // -- Sessions -----------------------------------------------------------
+
+  /**
+   * Live refresh-token sessions for the user. `currentTokenHash` is the
+   * SHA-256 hex of this device's refresh token (as stored), used only to flag
+   * the row as the current device.
+   */
+  async listSessions(userId: string, currentTokenHash?: string | null) {
+    const current =
+      currentTokenHash && /^[0-9a-f]{64}$/i.test(currentTokenHash)
+        ? currentTokenHash.toLowerCase()
+        : null;
+    const result = await this.pgPool.query(
+      `SELECT id, user_agent, host(ip_address) AS ip_address,
+              created_at, updated_at AS last_used_at, expires_at,
+              ($2::text IS NOT NULL AND refresh_token = $2::text) AS current
+       FROM user_sessions
+       WHERE user_id = $1
+         AND revoked_at IS NULL
+         AND expires_at > NOW()
+         AND COALESCE(is_delete, false) = false
+       ORDER BY updated_at DESC NULLS LAST, created_at DESC
+       LIMIT 50`,
+      [userId, current],
     );
-    if (existing.rowCount) {
-      const row = existing.rows[0];
-      const objectKey = String(row.object_key || '');
-      const previewObjectKey = String(row.preview_object_key || '');
-      for (const key of [objectKey, previewObjectKey]) {
-        if (!key || key.startsWith('inline:')) continue;
-        try {
-          await this.storage.deleteKey(key);
-        } catch {
-          /* already removed */
-        }
-      }
-      if (row.preview_token) {
-        await this.storage.deletePublicPath(`/api/media/${row.preview_token}`);
-      }
-      await this.pgPool.query(
-        `DELETE FROM face_login_profiles WHERE user_id = $1`,
-        [userId],
+    return result.rows.map((row) => ({
+      id: row.id as string,
+      user_agent: (row.user_agent as string | null) ?? null,
+      ip_address: (row.ip_address as string | null) ?? null,
+      created_at: row.created_at,
+      last_used_at: row.last_used_at,
+      expires_at: row.expires_at,
+      current: Boolean(row.current),
+    }));
+  }
+
+  async revokeSession(userId: string, sessionId: string) {
+    const result = await this.pgPool.query(
+      `UPDATE user_sessions
+       SET revoked_at = NOW(), updated_at = NOW()
+       WHERE id = $2 AND user_id = $1 AND revoked_at IS NULL
+       RETURNING id`,
+      [userId, sessionId],
+    );
+    if (!result.rowCount) throw new NotFoundException('Session not found');
+    return { id: result.rows[0].id as string, revoked: true };
+  }
+
+  /**
+   * Revoke every live session except the one behind `presentedRefreshToken`.
+   * Refuses when the current session cannot be identified, so the caller is
+   * never signed out by accident.
+   */
+  async revokeOtherSessions(userId: string, presentedRefreshToken: string) {
+    const token = String(presentedRefreshToken || '').trim();
+    if (!token) {
+      throw new BadRequestException(
+        'Could not identify this device. Sign in again, then retry.',
       );
     }
-    return { enabled: false };
+    const currentHash = hashSessionToken(token);
+    const current = await this.pgPool.query(
+      `SELECT id FROM user_sessions
+       WHERE user_id = $1 AND refresh_token = $2
+         AND revoked_at IS NULL AND expires_at > NOW()`,
+      [userId, currentHash],
+    );
+    if (!current.rowCount) {
+      throw new BadRequestException(
+        'Could not identify this device. Sign in again, then retry.',
+      );
+    }
+    const result = await this.pgPool.query(
+      `UPDATE user_sessions
+       SET revoked_at = NOW(), updated_at = NOW()
+       WHERE user_id = $1 AND id <> $2 AND revoked_at IS NULL
+       RETURNING id`,
+      [userId, current.rows[0].id],
+    );
+    return { revoked: result.rowCount || 0 };
+  }
+
+  // -- Account deletion ---------------------------------------------------
+
+  /**
+   * Soft-delete the account: marks the user deleted/inactive and revokes
+   * every session. Data rows are kept (recoverable by an operator).
+   */
+  async deleteAccount(userId: string, dto: DeleteAccountDto) {
+    const found = await this.pgPool.query(
+      `SELECT password_hash FROM users WHERE id = $1 AND deleted_at IS NULL`,
+      [userId],
+    );
+    if (!found.rowCount) throw new NotFoundException('User not found');
+    const valid = await bcrypt.compare(
+      dto.password,
+      found.rows[0].password_hash,
+    );
+    // 400, not 401: a 401 makes the web client refresh + retry the request.
+    if (!valid) throw new BadRequestException('Password is incorrect');
+
+    const client = await this.pgPool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE users
+         SET deleted_at = NOW(), is_active = false, is_delete = true,
+             updated_at = NOW()
+         WHERE id = $1 AND deleted_at IS NULL`,
+        [userId],
+      );
+      await client.query(
+        `UPDATE user_sessions
+         SET revoked_at = NOW(), updated_at = NOW()
+         WHERE user_id = $1 AND revoked_at IS NULL`,
+        [userId],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        /* ignore rollback errors */
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+    // Drop the user from the auth guard's cache so access tokens stop working.
+    try {
+      await this.syncUsersToCache();
+    } catch {
+      /* cache refresh is best-effort */
+    }
+    // Remove uploaded files (avatar, receipts, ...) under users/{id}/.
+    // Best-effort: the account is already deleted, so never fail here.
+    try {
+      await this.storage.purgeUserFiles(userId);
+    } catch (error) {
+      console.error(
+        `[user] purgeUserFiles failed for deleted user ${userId}:`,
+        (error as Error)?.message || error,
+      );
+    }
+    return { deleted: true };
   }
 }
 
-function jpegFromPreview(value: string | undefined): Buffer | null {
-  if (!value) return null;
-  const trimmed = value.trim();
-  const comma = trimmed.indexOf(',');
-  const payload = trimmed.startsWith('data:') && comma >= 0
-    ? trimmed.slice(comma + 1)
-    : trimmed;
-  if (!payload || payload.length > 1_500_000) return null;
-  const bytes = Buffer.from(payload, 'base64');
-  if (bytes.length < 32 || bytes.length > 1_200_000) return null;
-  if (bytes[0] !== 0xff || bytes[1] !== 0xd8) return null;
-  return bytes;
+/** Same scheme as auth.service hashRefreshToken (SHA-256 hex). */
+function hashSessionToken(token: string): string {
+  return createHash('sha256').update(token).digest('hex');
+}
+
+function isValidTimeZone(timeZone: string): boolean {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isValidLocale(locale: string): boolean {
+  try {
+    return Intl.getCanonicalLocales(locale).length > 0;
+  } catch {
+    return false;
+  }
 }

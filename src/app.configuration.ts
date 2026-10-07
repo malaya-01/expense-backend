@@ -1,5 +1,38 @@
 import './load-env';
 
+const DEV_FALLBACK_ACCESS_SECRET = 'dev-only-insecure-access-secret-change-me';
+const DEV_FALLBACK_REFRESH_SECRET = 'dev-only-insecure-refresh-secret-change-me';
+let warnedAboutJwtFallback = false;
+
+/**
+ * JWT secrets come from the environment. Production refuses to start without
+ * them; other environments fall back to distinct, clearly-marked dev values.
+ */
+function resolveJwtSecrets() {
+  const access =
+    process.env.JWT_ACCESS_SECRET?.trim() || process.env.JWT_SECRET?.trim();
+  const refresh =
+    process.env.JWT_REFRESH_SECRET?.trim() || process.env.JWT_SECRET?.trim();
+  if (access && refresh) return { access, refresh };
+
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'JWT secret is not configured. Set JWT_SECRET (or JWT_ACCESS_SECRET and JWT_REFRESH_SECRET).',
+    );
+  }
+  if (!warnedAboutJwtFallback) {
+    warnedAboutJwtFallback = true;
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[Opal] JWT_SECRET / JWT_ACCESS_SECRET / JWT_REFRESH_SECRET not set — using insecure development fallbacks. Never run like this in production.',
+    );
+  }
+  return {
+    access: access || DEV_FALLBACK_ACCESS_SECRET,
+    refresh: refresh || DEV_FALLBACK_REFRESH_SECRET,
+  };
+}
+
 export default () => ({
   PROJECT: 'Opal',
   PORT: parseInt(process.env.PORT || '9000'),
@@ -13,17 +46,14 @@ export default () => ({
     process.env.PUBLIC_APP_URL ||
     process.env.WEB_APP_URL ||
     '',
-  JWT: {
-    SECRET:
-      process.env.JWT_ACCESS_SECRET ||
-      process.env.JWT_SECRET ||
-      'kjhdiuwidh76uuh5egd8hd2nd93dg5hyqyshuyq',
-    REFRESH_SECRET:
-      process.env.JWT_REFRESH_SECRET ||
-      process.env.JWT_SECRET ||
-      'kjhdiuwidh76uuh5egd8hd2nd93dg5hyqyshuyq',
-    EXP: process.env.JWT_EXPIRES_IN || '2d',
-  },
+  JWT: (() => {
+    const secrets = resolveJwtSecrets();
+    return {
+      SECRET: secrets.access,
+      REFRESH_SECRET: secrets.refresh,
+      EXP: process.env.JWT_EXPIRES_IN || '2d',
+    };
+  })(),
   CACHE: {
     REDIS_URL: process.env.REDIS_URL || 'redis://localhost:6379',
     REDIS_TTL: parseInt(process.env.REDIS_TTL || '43200'),
@@ -49,9 +79,13 @@ export default () => ({
   },
   AI: {
     CREDENTIALS_ENCRYPTION_KEY: process.env.AI_CREDENTIALS_ENCRYPTION_KEY || '',
+    // Private/loopback model hosts are an SSRF risk on a shared server; only
+    // allow them by default outside production (e.g. a local Ollama).
     ALLOW_PRIVATE_MODEL_HOSTS:
-      (process.env.AI_ALLOW_PRIVATE_MODEL_HOSTS || 'true').toLowerCase() !==
-      'false',
+      (
+        process.env.AI_ALLOW_PRIVATE_MODEL_HOSTS ||
+        (process.env.NODE_ENV === 'production' ? 'false' : 'true')
+      ).toLowerCase() !== 'false',
     /** Fast free LLM for Opal Free (preferred). */
     GROQ_API_KEY: process.env.GROQ_API_KEY || '',
     GEMINI_API_KEY:

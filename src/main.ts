@@ -23,6 +23,10 @@ async function bootstrap() {
   const configuration = appConfiguration();
   const port = configuration.PORT || 9000;
 
+  // Render (and most PaaS) terminate TLS at a proxy. Trust the first hop so
+  // req.ip is the real client IP — rate limiting and session IPs depend on it.
+  app.set('trust proxy', 1);
+
   ensureAvatarUploadDir();
   app.useStaticAssets(join(process.cwd(), 'uploads'), {
     prefix: '/uploads',
@@ -52,8 +56,16 @@ async function bootstrap() {
     'capacitor://localhost',
     'ionic://localhost',
   ];
+  // Tolerate env values like `"https://app.vercel.app/", https://x.com` —
+  // browsers send Origin without quotes or a trailing slash.
   const configuredOrigins = configuration.CLIENT_HOST.split(',')
-    .map((origin) => origin.trim())
+    .map((origin) =>
+      origin
+        .trim()
+        .replace(/^['"]+|['"]+$/g, '')
+        .trim()
+        .replace(/\/+$/, ''),
+    )
     .filter(Boolean);
   const allowedOrigins = new Set([...configuredOrigins, ...capacitorOrigins]);
 
@@ -76,6 +88,8 @@ async function bootstrap() {
       'X-Finos-Client',
       'X-Requested-With',
     ],
+    // Let the web client read rate-limit back-off hints cross-origin.
+    exposedHeaders: ['Retry-After', 'Retry-After-default', 'Retry-After-burst'],
   });
   useContainer(app.select(AppModule), { fallbackOnErrors: true });
   const config = new DocumentBuilder()
