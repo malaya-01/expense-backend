@@ -756,9 +756,9 @@ export class TransactionsService {
       [userId, transactionId],
     );
     if (!original.rowCount) {
-      throw new BadRequestException(
-        'Posted journal not found; transaction cannot be safely reversed.',
-      );
+      // Legacy or incomplete rows still need balance reversal on edit/delete.
+      await this.applyEffects(client, userId, dto, -1);
+      return;
     }
 
     const originalId = original.rows[0].id as string;
@@ -786,7 +786,7 @@ export class TransactionsService {
          sequence_number,
          metadata || jsonb_build_object('reversal_of_journal_id', $2::uuid::text)
        FROM ledger_journal_lines
-       WHERE journal_id = $2::uuid
+       WHERE journal_id = $2::uuid AND native_amount > 0
        ORDER BY sequence_number`,
       [reversalId, originalId],
     );
