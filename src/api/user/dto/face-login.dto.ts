@@ -6,6 +6,7 @@ import {
   IsString,
   ArrayMaxSize,
   ArrayMinSize,
+  MaxLength,
 } from 'class-validator';
 
 export class SaveFaceLoginDto {
@@ -19,6 +20,7 @@ export class SaveFaceLoginDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(1_500_000)
   preview_base64?: string;
 }
 

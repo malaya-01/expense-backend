@@ -144,6 +144,15 @@ export class ObjectStorageService {
     await this.putObject(config, objectKey, body, 'application/json');
   }
 
+  async putBytes(
+    objectKey: string,
+    body: Buffer,
+    contentType: string,
+  ): Promise<void> {
+    const config = await this.getConfig();
+    await this.putObject(config, objectKey, body, contentType);
+  }
+
   async getJson<T>(objectKey: string): Promise<T | null> {
     try {
       const config = await this.getConfig();
@@ -168,6 +177,10 @@ export class ObjectStorageService {
         accessKeyId: config.accessKeyId,
         secretAccessKey: config.secretAccessKey,
       },
+      // R2 PutObject does not implement the flexible checksum headers
+      // the AWS SDK sends by default (x-amz-checksum-algorithm / aws-chunked).
+      requestChecksumCalculation: 'WHEN_REQUIRED',
+      responseChecksumValidation: 'WHEN_REQUIRED',
     });
     this.clientBucket = config.bucket;
     return this.client;

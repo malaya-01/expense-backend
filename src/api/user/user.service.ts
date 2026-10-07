@@ -2,10 +2,12 @@ import {
   BadRequestException,
   Inject,
   Injectable,
+  Logger,
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { Pool } from 'pg';
+import { randomBytes } from 'crypto';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
 import * as bcrypt from 'bcrypt';
@@ -30,6 +32,8 @@ import {
 
 @Injectable()
 export class UserService {
+  private readonly logger = new Logger(UserService.name);
+
   constructor(
     @Inject('PG_POOL') private readonly pgPool: Pool,
     @Inject(CACHE_MANAGER)
@@ -297,48 +301,78 @@ export class UserService {
     if (!user) throw new NotFoundException('User not found');
     const descriptor = assertDescriptor(dto.descriptor);
     const envelope = encryptFaceTemplate(descriptor);
-    let objectKey = `inline:${userId}`;
-    try {
-      objectKey = `face-login/${userId}/profile.json`;
-      await this.storage.putJson(objectKey, envelope);
-    } catch {
-      objectKey = `inline:${userId}`;
-    }
-
     const existing = await this.pgPool.query(
-      `SELECT preview_token FROM face_login_profiles WHERE user_id = $1`,
+      `SELECT preview_token, preview_object_key FROM face_login_profiles WHERE user_id = $1`,
       [userId],
     );
+    const previousPreview = existing.rows[0]?.preview_object_key as
+      | string
+      | undefined;
     const previewToken = existing.rows[0]?.preview_token as string | undefined;
     if (previewToken) {
       await this.storage.deletePublicPath(`/api/media/${previewToken}`);
     }
 
+    let objectKey = `inline:${userId}`;
+    let previewObjectKey: string | null = null;
+    let storedInR2 = false;
+    try {
+      objectKey = `face-login/${userId}/profile.json`;
+      await this.storage.putJson(objectKey, envelope);
+      const photo = jpegFromPreview(dto.preview_base64);
+      if (photo) {
+        previewObjectKey = `face-login/${userId}/${randomBytes(16).toString('hex')}.jpg`;
+        await this.storage.putBytes(previewObjectKey, photo, 'image/jpeg');
+      }
+      storedInR2 = true;
+    } catch (error) {
+      objectKey = `inline:${userId}`;
+      previewObjectKey = null;
+      const message = error instanceof Error ? error.message : 'R2 upload failed';
+      this.logger.warn(`Face data was not stored in R2: ${message}`);
+    }
+
+    if (
+      previousPreview &&
+      previousPreview !== previewObjectKey &&
+      !previousPreview.startsWith('inline:')
+    ) {
+      try {
+        await this.storage.deleteKey(previousPreview);
+      } catch {
+        /* previous photo may already be gone */
+      }
+    }
+
     await this.pgPool.query(
-      `INSERT INTO face_login_profiles (user_id, email, object_key, preview_token, template, updated_at)
-       VALUES ($1, $2, $3, NULL, $4::jsonb, NOW())
+      `INSERT INTO face_login_profiles
+         (user_id, email, object_key, preview_token, preview_object_key, template, updated_at)
+       VALUES ($1, $2, $3, NULL, $4, $5::jsonb, NOW())
        ON CONFLICT (user_id) DO UPDATE SET
          email = EXCLUDED.email,
          object_key = EXCLUDED.object_key,
          preview_token = NULL,
+         preview_object_key = EXCLUDED.preview_object_key,
          template = EXCLUDED.template,
          updated_at = NOW()`,
-      [userId, user.email, objectKey, JSON.stringify(envelope)],
+      [userId, user.email, objectKey, previewObjectKey, JSON.stringify(envelope)],
     );
-    return this.getFaceLogin(userId);
+    return { ...(await this.getFaceLogin(userId)), stored_in_r2: storedInR2 };
   }
 
   async deleteFaceLogin(userId: string) {
     const existing = await this.pgPool.query(
-      `SELECT object_key, preview_token FROM face_login_profiles WHERE user_id = $1`,
+      `SELECT object_key, preview_token, preview_object_key FROM face_login_profiles WHERE user_id = $1`,
       [userId],
     );
     if (existing.rowCount) {
       const row = existing.rows[0];
       const objectKey = String(row.object_key || '');
-      if (objectKey && !objectKey.startsWith('inline:')) {
+      const previewObjectKey = String(row.preview_object_key || '');
+      for (const key of [objectKey, previewObjectKey]) {
+        if (!key || key.startsWith('inline:')) continue;
         try {
-          await this.storage.deleteKey(objectKey);
+          await this.storage.deleteKey(key);
         } catch {
           /* already removed */
         }
@@ -353,4 +387,18 @@ export class UserService {
     }
     return { enabled: false };
   }
+}
+
+function jpegFromPreview(value: string | undefined): Buffer | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  const comma = trimmed.indexOf(',');
+  const payload = trimmed.startsWith('data:') && comma >= 0
+    ? trimmed.slice(comma + 1)
+    : trimmed;
+  if (!payload || payload.length > 1_500_000) return null;
+  const bytes = Buffer.from(payload, 'base64');
+  if (bytes.length < 32 || bytes.length > 1_200_000) return null;
+  if (bytes[0] !== 0xff || bytes[1] !== 0xd8) return null;
+  return bytes;
 }
