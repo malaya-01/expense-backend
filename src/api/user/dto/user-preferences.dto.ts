@@ -35,6 +35,15 @@ export const NUMBER_FORMATS = [
 export const WEEK_STARTS = [0, 1, 6] as const;
 export const TRANSACTION_TYPES = ['expense', 'income', 'transfer'] as const;
 export const DENSITIES = ['comfortable', 'compact'] as const;
+/** Per-type transaction defaults (account / category ids). */
+export const TYPE_DEFAULT_KEYS = [
+  'default_expense_account_id',
+  'default_expense_category_id',
+  'default_income_account_id',
+  'default_income_category_id',
+  'default_transfer_from_account_id',
+  'default_transfer_to_account_id',
+] as const;
 export const FONT_SCALE_MIN = 90;
 export const FONT_SCALE_MAX = 120;
 
@@ -45,6 +54,12 @@ export type UserPreferences = {
   default_account_id?: string | null;
   default_category_id?: string | null;
   default_transaction_type?: (typeof TRANSACTION_TYPES)[number];
+  default_expense_account_id?: string | null;
+  default_expense_category_id?: string | null;
+  default_income_account_id?: string | null;
+  default_income_category_id?: string | null;
+  default_transfer_from_account_id?: string | null;
+  default_transfer_to_account_id?: string | null;
   remember_last_account?: boolean;
   confirm_before_delete?: boolean;
   density?: (typeof DENSITIES)[number];
@@ -87,6 +102,11 @@ export function sanitizeUserPreferences(input: unknown): UserPreferences {
   if ('default_category_id' in raw) {
     const id = uuidOrNull(raw.default_category_id);
     if (id !== undefined) out.default_category_id = id;
+  }
+  for (const key of TYPE_DEFAULT_KEYS) {
+    if (!(key in raw)) continue;
+    const id = uuidOrNull(raw[key]);
+    if (id !== undefined) out[key] = id;
   }
   const txType = pick(TRANSACTION_TYPES, raw.default_transaction_type);
   if (txType) out.default_transaction_type = txType;
@@ -144,6 +164,42 @@ export class UserPreferencesDto {
   @IsOptional()
   @IsIn(TRANSACTION_TYPES)
   default_transaction_type?: (typeof TRANSACTION_TYPES)[number];
+
+  @ApiPropertyOptional({ nullable: true, format: 'uuid' })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsUUID()
+  default_expense_account_id?: string | null;
+
+  @ApiPropertyOptional({ nullable: true, format: 'uuid' })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsUUID()
+  default_expense_category_id?: string | null;
+
+  @ApiPropertyOptional({ nullable: true, format: 'uuid' })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsUUID()
+  default_income_account_id?: string | null;
+
+  @ApiPropertyOptional({ nullable: true, format: 'uuid' })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsUUID()
+  default_income_category_id?: string | null;
+
+  @ApiPropertyOptional({ nullable: true, format: 'uuid' })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsUUID()
+  default_transfer_from_account_id?: string | null;
+
+  @ApiPropertyOptional({ nullable: true, format: 'uuid' })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsUUID()
+  default_transfer_to_account_id?: string | null;
 
   @ApiPropertyOptional()
   @IsOptional()
