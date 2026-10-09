@@ -83,11 +83,13 @@ async function checkAndShowMigrations() {
         console.log(`   ${index + 1}. ${file}`);
       });
       pendingMigrations = files;
-      return { isValid: true, pendingMigrations };
+      return { isValid: true, pendingMigrations, outOfOrder: [], appliedOutOfOrder: false };
     }
 
-    // Get migrations from database
-    const dbResult = await pool.query('SELECT name FROM pgmigrations');
+    // Get migrations from database, in the order they actually ran.
+    const dbResult = await pool.query(
+      'SELECT name FROM pgmigrations ORDER BY run_on, id',
+    );
     const dbNames = new Set(dbResult.rows.map(r => r.name));
     const fileNamesWithoutExt = files.map(f => f.replace(/\.sql$/, ''));
 
@@ -119,6 +121,17 @@ async function checkAndShowMigrations() {
       ? pendingMigrations.filter(file => file.replace(/\.sql$/, '') < latestApplied)
       : [];
 
+    // Migrations that already ran in a different order than their file names
+    // (an older file deployed after a newer one). node-pg-migrate compares the
+    // run order with the file order and refuses every later deploy with a
+    // misleading "Not run migration X is preceding already run migration Y".
+    const ranInOrder = dbResult.rows.map(r => r.name);
+    const ranSorted = [...ranInOrder].sort();
+    const appliedOutOfOrder = ranInOrder.some((name, i) => name !== ranSorted[i]);
+    if (appliedOutOfOrder) {
+      console.log('ℹ️  Some migrations were applied out of file order earlier; skipping the order check.');
+    }
+
     // Show pending migrations (new files to be run - this is normal)
     if (pendingMigrations.length > 0) {
       console.log(`\n📋 ${pendingMigrations.length} pending migration(s) will be run:`);
@@ -129,17 +142,17 @@ async function checkAndShowMigrations() {
       console.log('\n✅ No pending migrations. Database is up to date!');
     }
 
-    return { isValid, pendingMigrations, outOfOrder };
+    return { isValid, pendingMigrations, outOfOrder, appliedOutOfOrder };
   } catch (error) {
     console.error('Error checking migrations:', error.message);
-    return { isValid: false, pendingMigrations: [], outOfOrder: [] };
+    return { isValid: false, pendingMigrations: [], outOfOrder: [], appliedOutOfOrder: false };
   } finally {
     await pool.end();
   }
 }
 
 async function runMigrations() {
-  const { isValid, pendingMigrations, outOfOrder } =
+  const { isValid, pendingMigrations, outOfOrder = [], appliedOutOfOrder = false } =
     await checkAndShowMigrations();
   
   if (!isValid && command === 'up') {
@@ -181,6 +194,9 @@ async function runMigrations() {
       console.log('⚠️  Running migration(s) older than the newest applied one:');
       outOfOrder.forEach(file => console.log(`   - ${file}`));
       console.log('');
+      migrationCommand += ' --no-check-order';
+    } else if (command === 'up' && appliedOutOfOrder) {
+      // Only pending files run; already-applied ones are never re-run.
       migrationCommand += ' --no-check-order';
     }
 
