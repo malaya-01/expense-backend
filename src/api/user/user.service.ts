@@ -467,8 +467,11 @@ export class UserService {
     try {
       await client.query('BEGIN');
       await client.query(
+        // users.email is UNIQUE; swap in a placeholder so the address can be
+        // used to sign up again after the account is deleted.
         `UPDATE users
          SET deleted_at = NOW(), is_active = false, is_delete = true,
+             email = 'deleted+' || id::text || '@deleted.invalid',
              updated_at = NOW()
          WHERE id = $1 AND deleted_at IS NULL`,
         [userId],

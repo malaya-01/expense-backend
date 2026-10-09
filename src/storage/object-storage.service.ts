@@ -348,6 +348,42 @@ export class ObjectStorageService {
     return Boolean(file.userId && file.userId === userId);
   }
 
+  /** True when R2 credentials are available (DB app_config or R2_* env). */
+  async isConfigured(): Promise<boolean> {
+    try {
+      await this.getConfig();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Read a whole stored file into memory after an access check (owner, or
+   * space member for space files). Returns null when missing / not allowed.
+   */
+  async readFileBuffer(
+    fileId: string,
+    userId: string,
+    maxBytes = 32 * 1024 * 1024,
+  ): Promise<{ body: Buffer; mimeType: string } | null> {
+    const file = await this.findById(fileId);
+    if (!file || !(await this.canAccess(file, userId))) return null;
+    const object = await this.openObject(file);
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for await (const chunk of object.body) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += buf.length;
+      if (total > maxBytes) {
+        object.body.destroy();
+        throw new Error('Stored file exceeds read limit');
+      }
+      chunks.push(buf);
+    }
+    return { body: Buffer.concat(chunks), mimeType: file.mimeType };
+  }
+
   /**
    * Open the object for streaming. Retries once with a fresh row when the
    * object was relocated between the DB read and the GET.

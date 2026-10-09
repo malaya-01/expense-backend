@@ -3,9 +3,11 @@ import {
   HttpException,
   Inject,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { Pool } from 'pg';
+import { ObjectStorageService } from 'src/storage/object-storage.service';
 import { AiSettingsService } from './ai-settings.service';
 import { AiOmnirouteUsageService } from './ai-omniroute-usage.service';
 import { AiToolsService, Citation } from './ai-tools.service';
@@ -136,6 +138,8 @@ type ParsedProposal = {
 
 @Injectable()
 export class AiAdvisorService {
+  private readonly documentLogger = new Logger('AiAdvisorDocuments');
+
   constructor(
     @Inject('PG_POOL')
     private readonly pgPool: Pool,
@@ -143,6 +147,7 @@ export class AiAdvisorService {
     private readonly toolsService: AiToolsService,
     private readonly webSearchService: AiWebSearchService,
     private readonly omnirouteUsage: AiOmnirouteUsageService,
+    private readonly storage: ObjectStorageService,
   ) {}
 
   async listConversations(
@@ -219,6 +224,15 @@ export class AiAdvisorService {
       [id, userId],
     );
     if (!result.rowCount) throw new NotFoundException('Conversation not found');
+    // Documents uploaded into this conversation go with it.
+    const documents = await this.pgPool.query(
+      `UPDATE ai_documents
+       SET deleted_at = NOW(), updated_at = NOW(), content = NULL
+       WHERE conversation_id = $1 AND user_id = $2 AND deleted_at IS NULL
+       RETURNING stored_file_id`,
+      [id, userId],
+    );
+    this.releaseDocumentFiles(userId, documents.rows);
     return { id };
   }
 
@@ -346,18 +360,81 @@ export class AiAdvisorService {
               summary, analysis_confidence, extracted_sections, suggested_actions,
               related_accounts, related_transactions,
               status, analysis_error, created_at, updated_at
-              ${includeContent ? ', content' : ''}
+              ${includeContent ? ', content, stored_file_id' : ''}
        FROM ai_documents
        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
       [id, userId],
     );
     if (!result.rowCount) throw new NotFoundException('Document not found');
     const row = result.rows[0];
-    if (includeContent && row.content) {
-      row.data_base64 = Buffer.from(row.content).toString('base64');
+    if (includeContent) {
+      const bytes = await this.readDocumentBytes(userId, row);
+      if (bytes) row.data_base64 = bytes.toString('base64');
       delete row.content;
+      delete row.stored_file_id;
     }
     return row;
+  }
+
+  /** Document bytes: inline (legacy / fallback) or from R2, owner-checked. */
+  private async readDocumentBytes(
+    userId: string,
+    row: { content?: Buffer | null; stored_file_id?: string | null },
+  ): Promise<Buffer | null> {
+    if (row.content) return Buffer.from(row.content);
+    if (!row.stored_file_id) return null;
+    try {
+      const file = await this.storage.readFileBuffer(row.stored_file_id, userId);
+      return file?.body || null;
+    } catch (error) {
+      this.documentLogger.warn(
+        `Document file ${row.stored_file_id} unreadable: ${error instanceof Error ? error.message : error}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Store an uploaded document in R2 under
+   * users/{userId}/documents/{YYYY}/{MM}/{slug}-{id}.{ext}. Returns null when
+   * R2 is not configured / unavailable so the caller keeps the bytes inline.
+   * Invalid files (type / content mismatch) are rejected.
+   */
+  private async storeDocumentFile(
+    userId: string,
+    dto: { name: string; mime_type: string },
+    buffer: Buffer,
+  ): Promise<string | null> {
+    if (!(await this.storage.isConfigured())) return null;
+    try {
+      const saved = await this.storage.saveFile({
+        userId,
+        kind: 'document',
+        body: buffer,
+        mimeType: dto.mime_type,
+        filename: dto.name,
+        label: dto.name.replace(/\.[a-z0-9]{1,8}$/i, ''),
+      });
+      return saved.id;
+    } catch (error) {
+      if (error instanceof BadRequestException) throw error;
+      this.documentLogger.warn(
+        `Document kept in Postgres (R2 unavailable): ${error instanceof Error ? error.message : error}`,
+      );
+      return null;
+    }
+  }
+
+  /** Best-effort release of R2 objects behind deleted documents. */
+  private releaseDocumentFiles(
+    userId: string,
+    rows: Array<{ stored_file_id?: string | null }>,
+  ) {
+    for (const row of rows) {
+      if (row.stored_file_id) {
+        void this.storage.deleteFileById(row.stored_file_id, userId);
+      }
+    }
   }
 
   async uploadDocument(
@@ -397,34 +474,45 @@ export class AiAdvisorService {
       buffer,
     );
 
+    // Bytes go to R2; Postgres keeps them only when R2 is not configured.
+    const storedFileId = await this.storeDocumentFile(userId, dto, buffer);
+
     // Persist immediately so upload HTTP progress matches "file received".
     // Heavy provider analysis continues in the background.
-    const inserted = await this.pgPool.query(
-      `INSERT INTO ai_documents
-        (user_id, conversation_id, name, mime_type, size_bytes, content,
-         detected_type, summary, analysis_confidence, extracted_sections,
-         suggested_actions, related_accounts, related_transactions, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'analyzing')
-       RETURNING id, conversation_id, name, mime_type, size_bytes, detected_type,
-                 summary, analysis_confidence, extracted_sections, suggested_actions,
-                 related_accounts, related_transactions,
-                 status, analysis_error, created_at, updated_at`,
-      [
-        userId,
-        dto.conversation_id || null,
-        dto.name.trim().slice(0, 180),
-        dto.mime_type,
-        buffer.length,
-        buffer,
-        localAnalysis.detected_type,
-        localAnalysis.summary,
-        localAnalysis.analysis_confidence,
-        JSON.stringify(localAnalysis.extracted_sections),
-        JSON.stringify(localAnalysis.suggested_actions),
-        JSON.stringify(localAnalysis.related_accounts),
-        JSON.stringify(localAnalysis.related_transactions),
-      ],
-    );
+    let inserted;
+    try {
+      inserted = await this.pgPool.query(
+        `INSERT INTO ai_documents
+          (user_id, conversation_id, name, mime_type, size_bytes, content,
+           detected_type, summary, analysis_confidence, extracted_sections,
+           suggested_actions, related_accounts, related_transactions, status,
+           stored_file_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'analyzing', $14)
+         RETURNING id, conversation_id, name, mime_type, size_bytes, detected_type,
+                   summary, analysis_confidence, extracted_sections, suggested_actions,
+                   related_accounts, related_transactions,
+                   status, analysis_error, created_at, updated_at`,
+        [
+          userId,
+          dto.conversation_id || null,
+          dto.name.trim().slice(0, 180),
+          dto.mime_type,
+          buffer.length,
+          storedFileId ? null : buffer,
+          localAnalysis.detected_type,
+          localAnalysis.summary,
+          localAnalysis.analysis_confidence,
+          JSON.stringify(localAnalysis.extracted_sections),
+          JSON.stringify(localAnalysis.suggested_actions),
+          JSON.stringify(localAnalysis.related_accounts),
+          JSON.stringify(localAnalysis.related_transactions),
+          storedFileId,
+        ],
+      );
+    } catch (error) {
+      if (storedFileId) await this.storage.deleteFileById(storedFileId, userId);
+      throw error;
+    }
     const row = inserted.rows[0];
 
     void this.finalizeDocumentAnalysis(userId, row.id, dto, localAnalysis).catch(
@@ -494,12 +582,13 @@ export class AiAdvisorService {
   async deleteDocument(userId: string, id: string) {
     const result = await this.pgPool.query(
       `UPDATE ai_documents
-       SET deleted_at = NOW(), updated_at = NOW()
+       SET deleted_at = NOW(), updated_at = NOW(), content = NULL
        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-       RETURNING id`,
+       RETURNING id, stored_file_id`,
       [id, userId],
     );
     if (!result.rowCount) throw new NotFoundException('Document not found');
+    this.releaseDocumentFiles(userId, result.rows);
     return { id };
   }
 

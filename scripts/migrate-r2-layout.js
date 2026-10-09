@@ -11,6 +11,11 @@
  * (PutObject + stored_files row with space_id + space_expenses.receipt_file_id),
  * then NULLs receipt_base64 for that row.
  *
+ * Phase 3 moves AI-advisor documents stored in ai_documents.content (BYTEA)
+ * into users/{userId}/documents/{YYYY}/{MM}/{slug|document}-{id}.{ext}
+ * (PutObject + stored_files row + ai_documents.stored_file_id), then NULLs
+ * content for that row.
+ *
  * Dry run is the DEFAULT. Nothing is written unless --apply is passed.
  *
  * Usage:
@@ -20,8 +25,8 @@
  *     --apply           execute (CopyObject -> UPDATE stored_files/receipts -> DeleteObject)
  *     --keep-old        with --apply: leave the legacy object in place
  *     --hash            with --apply: download each object to backfill stored_files.sha256
- *     --only <phase>    layout | space-receipts (default: both)
- *     --user <uuid>     layout phase: only this user's files
+ *     --only <phase>    layout | space-receipts | ai-documents (default: all)
+ *     --user <uuid>     layout / ai-documents phases: only this user's files
  *     --space <uuid>    space-receipts phase: only this space
  *     --limit <n>       process at most n rows per phase this run
  *     --verbose         print every planned move (default: first 20)
@@ -87,12 +92,13 @@ const VERBOSE = flag('verbose');
 const ONLY_USER = option('user');
 const ONLY_SPACE = option('space');
 const ONLY_PHASE = option('only');
-if (ONLY_PHASE && !['layout', 'space-receipts'].includes(ONLY_PHASE)) {
-  console.error('--only must be "layout" or "space-receipts"');
+if (ONLY_PHASE && !['layout', 'space-receipts', 'ai-documents'].includes(ONLY_PHASE)) {
+  console.error('--only must be "layout", "space-receipts" or "ai-documents"');
   process.exit(1);
 }
 const RUN_LAYOUT = !ONLY_PHASE || ONLY_PHASE === 'layout';
 const RUN_SPACE_RECEIPTS = !ONLY_PHASE || ONLY_PHASE === 'space-receipts';
+const RUN_AI_DOCUMENTS = !ONLY_PHASE || ONLY_PHASE === 'ai-documents';
 const LIMIT = option('limit') ? Math.max(1, Number(option('limit'))) : null;
 const LEGACY_PREFIXES = ['avatar/', 'receipt/', 'face-login/', 'face_preview/'];
 
@@ -416,6 +422,176 @@ async function migrateSpaceReceipts({ pool, s3, config, keys }) {
   if (summary.failed) process.exitCode = 1;
 }
 
+// ---------------------------------------------- phase 3: AI documents
+
+async function migrateAiDocuments({ pool, s3, config, keys }) {
+  const { randomBytes } = require('crypto');
+  const summary = { found: 0, planned: 0, moved: 0, invalid: 0, skipped: 0, failed: 0, bytes: 0 };
+  const samples = [];
+  const params = [];
+  let userFilter = '';
+  if (ONLY_USER) {
+    if (!keys.isUuid(ONLY_USER)) throw new Error('--user must be a UUID');
+    params.push(ONLY_USER);
+    userFilter = `AND d.user_id = $${params.length}`;
+  }
+  let limitClause = '';
+  if (LIMIT) {
+    params.push(LIMIT);
+    limitClause = `LIMIT $${params.length}`;
+  }
+  const rows = await pool.query(
+    `SELECT d.id, d.user_id, d.name, d.mime_type, d.created_at,
+            octet_length(d.content) AS size_bytes, u.timezone
+     FROM ai_documents d
+     LEFT JOIN users u ON u.id = d.user_id
+     WHERE d.content IS NOT NULL
+       AND d.stored_file_id IS NULL
+       AND d.deleted_at IS NULL
+       ${userFilter}
+     ORDER BY d.created_at
+     ${limitClause}`,
+    params,
+  );
+  const deleted = await pool.query(
+    `SELECT COUNT(*)::int AS n FROM ai_documents
+     WHERE content IS NOT NULL AND deleted_at IS NOT NULL`,
+  );
+
+  console.log('\n--- Phase 3: AI-advisor documents (ai_documents.content -> R2) ---');
+  for (const row of rows.rows) {
+    summary.found += 1;
+    try {
+      if (!row.user_id || !keys.isUuid(row.user_id)) {
+        summary.skipped += 1;
+        console.warn(`skip ai_documents ${row.id}: no owning user`);
+        continue;
+      }
+      // Load one payload at a time (up to 5 MB each).
+      const payload = await pool.query(`SELECT content FROM ai_documents WHERE id = $1`, [
+        row.id,
+      ]);
+      const body = payload.rows[0] && payload.rows[0].content;
+      if (!body || !body.length) {
+        summary.skipped += 1;
+        continue;
+      }
+      const checked = keys.checkUpload('document', row.mime_type, body);
+      if (!checked.ok) {
+        summary.invalid += 1;
+        console.warn(`invalid ai_documents ${row.id}: ${checked.error} (left in Postgres)`);
+        continue;
+      }
+      const mimeType = checked.mimeType;
+      const target = keys.buildObjectKey({
+        kind: 'document',
+        userId: row.user_id,
+        mimeType,
+        date: row.created_at,
+        timeZone: row.timezone,
+        label: String(row.name || '').replace(/\.[a-z0-9]{1,8}$/i, ''),
+        shortId: stableShortId(row.id),
+      });
+      summary.planned += 1;
+      summary.bytes += body.length;
+      if (VERBOSE || samples.length < 20) {
+        samples.push(`ai_documents ${row.id} (${formatBytes(body.length)})\n    -> ${target}`);
+      }
+      if (!APPLY) continue;
+
+      const filename = keys.cleanOriginalName(row.name);
+      const sha256 = keys.sha256Hex(body);
+      const { PutObjectCommand } = require('@aws-sdk/client-s3');
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: config.bucket,
+          Key: target,
+          Body: body,
+          ContentType: mimeType,
+          ContentDisposition: keys.contentDisposition('inline', filename, mimeType),
+          Metadata: {
+            'user-id': row.user_id,
+            kind: 'document',
+            sha256,
+            'original-name': keys.metadataValue(filename),
+          },
+        }),
+      );
+
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const existing = await client.query(
+          `SELECT id FROM stored_files
+           WHERE object_key = $1 AND user_id = $2 AND deleted_at IS NULL
+           LIMIT 1`,
+          [target, row.user_id],
+        );
+        let fileId = existing.rows[0] && existing.rows[0].id;
+        if (!fileId) {
+          const inserted = await client.query(
+            `INSERT INTO stored_files
+              (user_id, kind, object_key, public_token, mime_type,
+               size_bytes, original_filename, sha256)
+             VALUES ($1, 'document', $2, $3, $4, $5, $6, $7)
+             RETURNING id`,
+            [
+              row.user_id,
+              target,
+              randomBytes(24).toString('hex'),
+              mimeType,
+              body.length,
+              filename,
+              sha256,
+            ],
+          );
+          fileId = inserted.rows[0].id;
+        }
+        const updated = await client.query(
+          `UPDATE ai_documents
+           SET stored_file_id = $2, content = NULL
+           WHERE id = $1 AND stored_file_id IS NULL AND content IS NOT NULL`,
+          [row.id, fileId],
+        );
+        if (!updated.rowCount) {
+          await client.query('ROLLBACK');
+          summary.skipped += 1;
+          console.warn(`skip ai_documents ${row.id}: row changed during migration`);
+          continue;
+        }
+        await client.query('COMMIT');
+        summary.moved += 1;
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+    } catch (error) {
+      summary.failed += 1;
+      console.error(`failed ai_documents ${row.id}: ${error.message || error}`);
+    }
+  }
+
+  if (samples.length) {
+    console.log(`\nPlanned document uploads${VERBOSE ? '' : ' (first 20)'}:`);
+    for (const line of samples) console.log(`  ${line}`);
+  }
+  console.log('\nAI documents summary:');
+  console.log(`  documents in Postgres found:   ${summary.found}`);
+  console.log(`  planned uploads:               ${summary.planned} (${formatBytes(summary.bytes)})`);
+  console.log(`  invalid (left in Postgres):    ${summary.invalid}`);
+  if (APPLY) {
+    console.log(`  moved to R2 + content cleared: ${summary.moved}`);
+    console.log(`  failed (re-run to retry):      ${summary.failed}`);
+  }
+  console.log(`  skipped:                       ${summary.skipped}`);
+  console.log(
+    `  deleted documents still holding content: ${deleted.rows[0].n} (not migrated; can be NULLed)`,
+  );
+  if (summary.failed) process.exitCode = 1;
+}
+
 // ---------------------------------------------------------------- main
 
 async function main() {
@@ -442,11 +618,12 @@ async function main() {
     const hasMetadataColumns = await pool.query(
       `SELECT 1 FROM information_schema.columns
        WHERE (table_name = 'stored_files' AND column_name = 'legacy_object_key')
-          OR (table_name = 'space_expenses' AND column_name = 'receipt_file_id')`,
+          OR (table_name = 'space_expenses' AND column_name = 'receipt_file_id')
+          OR (table_name = 'ai_documents' AND column_name = 'stored_file_id')`,
     );
-    if ((hasMetadataColumns.rowCount || 0) < 2) {
+    if ((hasMetadataColumns.rowCount || 0) < 3) {
       throw new Error(
-        'Run "npm run migration:up" first (1786300000000_storage-layout-metadata.sql).',
+        'Run "npm run migration:up" first (1786300000000_storage-layout-metadata.sql, 1786320000000_ai-documents-r2.sql).',
       );
     }
 
@@ -623,6 +800,10 @@ async function main() {
 
     if (RUN_SPACE_RECEIPTS) {
       await migrateSpaceReceipts({ pool, s3, config, keys });
+    }
+
+    if (RUN_AI_DOCUMENTS) {
+      await migrateAiDocuments({ pool, s3, config, keys });
     }
 
     if (s3) {

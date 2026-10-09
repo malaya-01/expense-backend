@@ -17,6 +17,7 @@ import {
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { Response, Request as ExpressRequest } from 'express';
 import { AiSettingsService } from './ai-settings.service';
 import { AiAdvisorService } from './ai-advisor.service';
@@ -43,6 +44,8 @@ import { RequireAnyPermission, RequirePermissions } from 'src/helper/decorators/
 @ApiBearerAuth('bearer')
 @ApiTags('ai-advisor')
 @RequirePermissions('ai.access')
+// LLM calls cost money and provider quota; they get tighter per-user
+// limits than the global 600/min via @Throttle on the routes below.
 @Controller('ai')
 export class AiAdvisorController {
   constructor(
@@ -110,6 +113,7 @@ export class AiAdvisorController {
   }
 
   @Post('providers/:provider/test')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({ summary: 'Test provider connection' })
   @RequirePermissions('ai.create')
   async test(
@@ -133,6 +137,7 @@ export class AiAdvisorController {
   }
 
   @Get('providers/:provider/models')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
   @ApiOperation({ summary: 'List models for a provider' })
   @RequirePermissions('ai.read')
   async models(
@@ -223,6 +228,7 @@ export class AiAdvisorController {
   }
 
   @Post('suggest-category-icon')
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @ApiOperation({
     summary: 'Suggest a category icon id from name/description (AI + fallback)',
   })
@@ -518,6 +524,7 @@ export class AiAdvisorController {
   }
 
   @Post('documents')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({ summary: 'Upload a document into the AI library' })
   @ApiBody({ type: UploadAiDocumentDto })
   @RequirePermissions('ai.create')
@@ -561,6 +568,7 @@ export class AiAdvisorController {
   }
 
   @Post('receipts/parse')
+  @Throttle({ default: { limit: 15, ttl: 60_000 } })
   @ApiOperation({
     summary:
       'Extract receipt / bill fields (active vision provider, else Opal Free vision), reconcile totals and suggest a category. The scan is stored.',
@@ -591,6 +599,7 @@ export class AiAdvisorController {
   }
 
   @Post('chat')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
   @ApiOperation({ summary: 'Send a message to Opal AI Advisor' })
   @ApiBody({ type: ChatMessageDto })
   @RequirePermissions('ai.create')
@@ -611,6 +620,7 @@ export class AiAdvisorController {
   }
 
   @Post('chat/stream')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
   @ApiOperation({ summary: 'Stream an Opal AI Advisor reply (SSE)' })
   @ApiBody({ type: ChatMessageDto })
   @RequirePermissions('ai.create')

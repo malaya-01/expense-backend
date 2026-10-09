@@ -611,6 +611,15 @@ export class ReceiptParseService {
         payment_status: toDtoPaymentStatus(out.extracted.payment_status),
       };
       void this.recordExtraction(userId, saved?.id, out);
+      if (saved && (out.extracted.date || out.extracted.merchant)) {
+        // File the scan under the bill date / merchant
+        // (receipts/{YYYY}/{MM}/{yyyymmdd}-{merchant}-...). Best-effort;
+        // the token in receipt_url never changes.
+        void this.storage.relocateFile(saved.fileId, userId, {
+          date: out.extracted.date,
+          label: out.extracted.merchant,
+        });
+      }
       return out;
     };
 
@@ -963,7 +972,7 @@ export class ReceiptParseService {
     userId: string,
     dto: ParseReceiptDto,
     mime: string,
-  ): Promise<{ id: string; url: string } | null> {
+  ): Promise<{ id: string; url: string; fileId: string } | null> {
     try {
       const body = Buffer.from(dto.data_base64 || '', 'base64');
       if (!body.length || body.length > 8 * 1024 * 1024) return null;
@@ -976,18 +985,24 @@ export class ReceiptParseService {
       });
       const inserted = await this.pgPool.query(
         `INSERT INTO receipts
-          (user_id, original_filename, file_path, file_size, mime_type, processing_status)
-         VALUES ($1, $2, $3, $4, $5, 'stored')
+          (user_id, original_filename, file_path, file_size, mime_type, processing_status,
+           stored_file_id)
+         VALUES ($1, $2, $3, $4, $5, 'stored', $6)
          RETURNING id`,
         [
           userId,
           (dto.name || 'receipt').slice(0, 255),
           saved.objectKey,
           body.length,
-          mime || 'image/jpeg',
+          saved.mimeType,
+          saved.id,
         ],
       );
-      return { id: inserted.rows[0].id as string, url: saved.publicPath };
+      return {
+        id: inserted.rows[0].id as string,
+        url: saved.publicPath,
+        fileId: saved.id,
+      };
     } catch {
       return null;
     }
