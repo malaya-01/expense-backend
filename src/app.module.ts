@@ -24,6 +24,7 @@ import { RecurringModule } from './api/recurring/recurring.module';
 import { SpacesModule } from './api/spaces/spaces.module';
 import { SyncModule } from './api/sync/sync.module';
 import { PermissionsModule } from './api/permissions/permissions.module';
+import { TutorialModule } from './api/tutorial/tutorial.module';
 import { ScheduleModule } from '@nestjs/schedule';
 import { AuthorizationGuard } from './helper/guards/authorization.guard';
 import { PermissionsGuard } from './helper/guards/permissions.guard';
@@ -68,6 +69,7 @@ import { PermissionsGuard } from './helper/guards/permissions.guard';
     SpacesModule,
     SyncModule,
     PermissionsModule,
+    TutorialModule,
   ],
   controllers: [AppController],
   providers: [AppService,
