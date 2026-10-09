@@ -59,6 +59,7 @@ const command = process.argv[2] || 'up';
 async function checkAndShowMigrations() {
   let isValid = true;
   let pendingMigrations = [];
+  let outOfOrder = [];
 
   try {
     // Check if pgmigrations table exists
@@ -110,6 +111,14 @@ async function checkAndShowMigrations() {
       isValid = false;
     }
 
+    // Pending files older than the newest applied one (usually a branch
+    // merged after a later migration was deployed). node-pg-migrate refuses
+    // these by default; runMigrations() allows them explicitly.
+    const latestApplied = fileNamesWithoutExt.filter(name => dbNames.has(name)).sort().pop();
+    outOfOrder = latestApplied
+      ? pendingMigrations.filter(file => file.replace(/\.sql$/, '') < latestApplied)
+      : [];
+
     // Show pending migrations (new files to be run - this is normal)
     if (pendingMigrations.length > 0) {
       console.log(`\n📋 ${pendingMigrations.length} pending migration(s) will be run:`);
@@ -120,17 +129,18 @@ async function checkAndShowMigrations() {
       console.log('\n✅ No pending migrations. Database is up to date!');
     }
 
-    return { isValid, pendingMigrations };
+    return { isValid, pendingMigrations, outOfOrder };
   } catch (error) {
     console.error('Error checking migrations:', error.message);
-    return { isValid: false, pendingMigrations: [] };
+    return { isValid: false, pendingMigrations: [], outOfOrder: [] };
   } finally {
     await pool.end();
   }
 }
 
 async function runMigrations() {
-  const { isValid, pendingMigrations } = await checkAndShowMigrations();
+  const { isValid, pendingMigrations, outOfOrder } =
+    await checkAndShowMigrations();
   
   if (!isValid && command === 'up') {
     console.log('\n❌ Cannot run migrations due to mismatches. Please fix them first.');
@@ -160,9 +170,19 @@ async function runMigrations() {
 
     process.env.DB_URL = dbUrl;
 
-    const migrationCommand = command === 'down' 
+    let migrationCommand = command === 'down' 
       ? 'node-pg-migrate down'
       : 'node-pg-migrate up';
+
+    // Keep node-pg-migrate's order check unless an older migration is
+    // genuinely pending; then run it late (migrations here are written to be
+    // idempotent and independent) instead of blocking every deploy.
+    if (command === 'up' && outOfOrder.length > 0) {
+      console.log('⚠️  Running migration(s) older than the newest applied one:');
+      outOfOrder.forEach(file => console.log(`   - ${file}`));
+      console.log('');
+      migrationCommand += ' --no-check-order';
+    }
 
     execSync(
       `${migrationCommand} -m src/database/migrations --database-url-var DB_URL`,
