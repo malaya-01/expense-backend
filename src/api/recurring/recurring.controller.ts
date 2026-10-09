@@ -64,6 +64,15 @@ export class RecurringController {
     );
   }
 
+  @Post(':id/skip-missed')
+  @RequirePermissions('recurring.update')
+  async skipMissed(@Req() req: Request, @Param('id') id: string) {
+    return successResponse(
+      await this.recurringService.skipMissed((req as any).user.id, id),
+      'Missed runs skipped.',
+    );
+  }
+
   @Patch(':id')
   @RequirePermissions('recurring.update')
   async update(

@@ -12,6 +12,10 @@ import {
   UpdateRecurringScheduleDto,
 } from './dto/recurring.dto';
 import { requireDateOnly } from 'src/common/date/to-date-only';
+import {
+  effectiveTimeZone,
+  todayInTimeZone,
+} from '../ai-advisor/user-dates';
 
 @Injectable()
 export class RecurringService {
@@ -211,7 +215,7 @@ export class RecurringService {
     if (schedule.status !== 'active') {
       throw new BadRequestException('Only active schedules can run.');
     }
-    const today = await this.today();
+    const today = await this.today(userId);
     if (schedule.next_execution > today) {
       throw new BadRequestException(
         `This schedule is not due until ${schedule.next_execution}.`,
@@ -342,22 +346,60 @@ export class RecurringService {
     }
   }
 
+  /**
+   * Jump an overdue schedule to its next date on or after today without
+   * posting the missed runs (e.g. a start date set far in the past).
+   */
+  async skipMissed(userId: string, id: string) {
+    const schedule = await this.findOne(userId, id);
+    if (schedule.status !== 'active' && schedule.status !== 'paused') {
+      throw new BadRequestException('Only active or paused schedules can skip.');
+    }
+    const today = await this.today(userId);
+    let next = schedule.next_execution as string;
+    let skipped = 0;
+    while (next < today && skipped < 5000) {
+      next = this.nextDate(next, schedule.frequency, schedule.start_date);
+      skipped += 1;
+    }
+    if (!skipped) return { skipped: 0, next_execution: next };
+    const completed = Boolean(schedule.end_date && next > schedule.end_date);
+    await this.pgPool.query(
+      `UPDATE recurring_schedules
+       SET next_execution = $3,
+           status = CASE WHEN $4 THEN 'completed' ELSE status END,
+           updated_at = NOW()
+       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+      [id, userId, next, completed],
+    );
+    return { skipped, next_execution: next, completed };
+  }
+
   @Interval(60_000)
   async processDueSchedules() {
     if (this.processing) return;
     this.processing = true;
     try {
+      // CURRENT_DATE + 1 covers every timezone ahead of the server; the
+      // per-user check below decides what is actually due today.
       const due = await this.pgPool.query(
-        `SELECT id, user_id
-         FROM recurring_schedules
-         WHERE status = 'active'
-           AND execution_mode = 'automatic'
-           AND deleted_at IS NULL
-           AND next_execution <= CURRENT_DATE
-         ORDER BY next_execution
-         LIMIT 25`,
+        `SELECT s.id, s.user_id,
+                to_char(s.next_execution, 'YYYY-MM-DD') AS next_execution,
+                u.timezone, u.currency
+         FROM recurring_schedules s
+         JOIN users u ON u.id = s.user_id
+         WHERE s.status = 'active'
+           AND s.execution_mode = 'automatic'
+           AND s.deleted_at IS NULL
+           AND s.next_execution <= CURRENT_DATE + 1
+         ORDER BY s.next_execution
+         LIMIT 50`,
       );
       for (const row of due.rows) {
+        const today = todayInTimeZone(
+          effectiveTimeZone(row.timezone, row.currency),
+        );
+        if (row.next_execution > today) continue;
         try {
           await this.execute(row.user_id, row.id);
         } catch {
@@ -436,12 +478,18 @@ export class RecurringService {
     }
   }
 
-  /** Use the DB calendar date so it matches the scheduler's CURRENT_DATE. */
-  private async today(): Promise<string> {
+  /**
+   * Today's calendar date in the user's timezone. The server runs in UTC, so
+   * CURRENT_DATE is still "yesterday" for users ahead of UTC (00:00-05:30 in
+   * India) and a schedule due today would be refused.
+   */
+  private async today(userId: string): Promise<string> {
     const result = await this.pgPool.query(
-      `SELECT to_char(CURRENT_DATE, 'YYYY-MM-DD') AS today`,
+      `SELECT timezone, currency FROM users WHERE id = $1`,
+      [userId],
     );
-    return result.rows[0].today;
+    const row = result.rows[0] || {};
+    return todayInTimeZone(effectiveTimeZone(row.timezone, row.currency));
   }
 
   /**
