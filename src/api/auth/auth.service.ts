@@ -28,6 +28,10 @@ import {
 import appConfiguration from 'src/app.configuration';
 import { REFRESH_COOKIE_NAME, refreshCookieOptions } from './refresh-cookie';
 import {
+  SESSION_REPLACED_MESSAGE,
+  rememberSessionState,
+} from './session-state';
+import {
   buildRecoveryEmailHtml,
   buildRecoveryEmailText,
   buildVerificationEmailHtml,
@@ -646,7 +650,6 @@ export class AuthService {
       [user.id],
     );
 
-    const accessToken = await this.signAccessToken(user.id, user.email);
     const refreshToken = await this.signRefreshToken(user.id);
     const refreshTokenHash = hashRefreshToken(refreshToken);
     const clientHeader =
@@ -662,13 +665,35 @@ export class AuthService {
       ? `[opal:${clientPlatform}] ${rawUa || ''}`.trim()
       : rawUa;
 
-    await client.query(
+    // One signed-in device per account: this login replaces every other
+    // session (phone signs out the web and vice versa).
+    const replaced = await client.query(
+      `UPDATE user_sessions
+       SET revoked_at = NOW(), revoked_reason = 'replaced', updated_at = NOW()
+       WHERE user_id = $1 AND revoked_at IS NULL
+       RETURNING id`,
+      [user.id],
+    );
+    const inserted = await client.query(
       `INSERT INTO user_sessions
         (user_id, session_token, refresh_token, user_agent, ip_address, expires_at)
-       VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '7 days')`,
+       VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '7 days')
+       RETURNING id`,
       [user.id, randomUUID(), refreshTokenHash, userAgent, req.ip],
     );
     await client.query('COMMIT');
+    const sessionId = String(inserted.rows[0].id);
+    await Promise.all([
+      ...replaced.rows.map((row) =>
+        rememberSessionState(this.cacheManager, String(row.id), 'replaced'),
+      ),
+      rememberSessionState(this.cacheManager, sessionId, 'active'),
+    ]);
+    const accessToken = await this.signAccessToken(
+      user.id,
+      user.email,
+      sessionId,
+    );
 
     const access = await this.permissionsService.mePayload(user.id);
     return {
@@ -689,9 +714,19 @@ export class AuthService {
     };
   }
 
-  private signAccessToken(userId: string, email?: string | null) {
+  /** `sid` ties the token to its session so a replaced device is cut off. */
+  private signAccessToken(
+    userId: string,
+    email?: string | null,
+    sessionId?: string | null,
+  ) {
     return this.jwtService.signAsync(
-      { sub: userId, ...(email ? { email } : {}), typ: 'access' },
+      {
+        sub: userId,
+        ...(email ? { email } : {}),
+        ...(sessionId ? { sid: sessionId } : {}),
+        typ: 'access',
+      },
       {
         expiresIn: ACCESS_TOKEN_TTL,
         secret: appConfiguration().JWT.SECRET,
@@ -714,11 +749,17 @@ export class AuthService {
     userId: string,
     client: Pick<Pool, 'query'> | PoolClient = this.pgPool,
   ) {
-    await client.query(
+    const revoked = await client.query(
       `UPDATE user_sessions
        SET revoked_at = NOW(), updated_at = NOW()
-       WHERE user_id = $1 AND revoked_at IS NULL`,
+       WHERE user_id = $1 AND revoked_at IS NULL
+       RETURNING id`,
       [userId],
+    );
+    await Promise.all(
+      revoked.rows.map((row) =>
+        rememberSessionState(this.cacheManager, String(row.id), 'ended'),
+      ),
     );
   }
 
@@ -796,16 +837,13 @@ export class AuthService {
       throw new UnauthorizedException('Session not found');
     }
 
-    const newAccessToken = await this.signAccessToken(
-      userId,
-      userResult.rows[0].email,
-    );
     const newRefreshToken = await this.signRefreshToken(userId);
     const newRefreshTokenHash = hashRefreshToken(newRefreshToken);
 
     // Rotate atomically: only the request whose token still matches the
     // stored hash wins, so a token can be exchanged once.
     let rotated = false;
+    let sessionId: string | null = null;
     if (payload.typ === 'refresh') {
       const result = await this.pgPool.query(
         `UPDATE user_sessions
@@ -819,6 +857,7 @@ export class AuthService {
         [userId, presentedHash, newRefreshTokenHash, randomUUID()],
       );
       rotated = Boolean(result.rowCount);
+      sessionId = result.rows[0]?.id ? String(result.rows[0].id) : null;
     } else {
       const legacy = await this.findLegacyBcryptSession(userId, refreshToken);
       if (legacy) {
@@ -833,6 +872,7 @@ export class AuthService {
           [legacy.id, legacy.refresh_token, newRefreshTokenHash, randomUUID()],
         );
         rotated = Boolean(result.rowCount);
+        sessionId = result.rows[0]?.id ? String(result.rows[0].id) : null;
       }
     }
 
@@ -852,7 +892,7 @@ export class AuthService {
       // ended (logout, "sign out other devices", per-session revoke) or that
       // expired: reject it without touching the user's other sessions.
       const ended = await this.pgPool.query(
-        `SELECT 1 FROM user_sessions
+        `SELECT revoked_reason FROM user_sessions
          WHERE user_id = $1 AND refresh_token = $2
            AND (revoked_at IS NOT NULL OR expires_at <= NOW())
          LIMIT 1`,
@@ -860,7 +900,9 @@ export class AuthService {
       );
       if (ended.rowCount) {
         throw new UnauthorizedException(
-          'Session expired or was signed out. Please sign in again.',
+          ended.rows[0].revoked_reason === 'replaced'
+            ? SESSION_REPLACED_MESSAGE
+            : 'Session expired or was signed out. Please sign in again.',
         );
       }
       // A validly signed refresh token that matches no session row was
@@ -871,6 +913,11 @@ export class AuthService {
       );
     }
 
+    const newAccessToken = await this.signAccessToken(
+      userId,
+      userResult.rows[0].email,
+      sessionId,
+    );
     const tokens = {
       accessToken: newAccessToken,
       refreshToken: newRefreshToken,
@@ -908,6 +955,9 @@ export class AuthService {
        RETURNING id`,
       [tokenHash],
     );
+    for (const row of revoked.rows) {
+      await rememberSessionState(this.cacheManager, String(row.id), 'ended');
+    }
     if (!revoked.rowCount) {
       // Legacy (pre-SHA-256) session: needs the user id to find the row.
       try {

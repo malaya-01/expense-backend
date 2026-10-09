@@ -12,6 +12,10 @@ import { Cache } from 'cache-manager';
 import { Pool } from 'pg';
 import appConfiguration from 'src/app.configuration';
 import { isEmailVerificationRequired } from 'src/api/auth/auth.service';
+import {
+  SESSION_REPLACED_MESSAGE,
+  readSessionState,
+} from 'src/api/auth/session-state';
 
 @Injectable()
 export class AuthorizationGuard implements CanActivate {
@@ -53,6 +57,21 @@ export class AuthorizationGuard implements CanActivate {
       if (payload.typ === 'refresh') {
         throw new UnauthorizedException('Unauthorized access');
       }
+      // Tokens carry their session: a device replaced by a newer login (or
+      // signed out) is cut off now, not when its access token expires.
+      if (payload.sid) {
+        const state = await readSessionState(
+          this.cache,
+          this.pgPool,
+          String(payload.sid),
+        );
+        if (state === 'replaced') {
+          throw new UnauthorizedException(SESSION_REPLACED_MESSAGE);
+        }
+        if (state === 'ended') {
+          throw new UnauthorizedException('Unauthorized access');
+        }
+      }
 
       const allUsers: any[] = (await this.cache.get('all_users')) || [];
       let profile =
@@ -84,6 +103,12 @@ export class AuthorizationGuard implements CanActivate {
       return true;
     } catch (error) {
       if (error instanceof ForbiddenException) throw error;
+      if (
+        error instanceof UnauthorizedException &&
+        error.message === SESSION_REPLACED_MESSAGE
+      ) {
+        throw error;
+      }
       throw new UnauthorizedException('Unauthorized access');
     }
   }
