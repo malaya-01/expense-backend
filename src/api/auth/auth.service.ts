@@ -107,6 +107,7 @@ export class AccountLockedException extends ForbiddenException {
 }
 
 export type OtherLogin = {
+  id: string;
   user_agent: string | null;
   created_at: string | null;
   last_used_at: string | null;
@@ -652,11 +653,20 @@ export class AuthService {
         );
       }
 
+      if (dto.revoke_session_id && !dto.replace_other_sessions) {
+        await client.query(
+          `UPDATE user_sessions
+           SET revoked_at = NOW(), updated_at = NOW()
+           WHERE id = $2 AND user_id = $1 AND revoked_at IS NULL`,
+          [user.id, dto.revoke_session_id],
+        );
+      }
+
       if (!dto.replace_other_sessions) {
         const presented = readPresentedRefreshToken(req);
         const currentHash = presented ? hashRefreshToken(presented) : null;
         const active = await client.query(
-          `SELECT user_agent, created_at, updated_at AS last_used_at
+          `SELECT id, user_agent, created_at, updated_at AS last_used_at
            FROM user_sessions
            WHERE user_id = $1
              AND revoked_at IS NULL
@@ -677,6 +687,7 @@ export class AuthService {
           await client.query('COMMIT');
           throw new ActiveSessionException(
             active.rows.map((row) => ({
+              id: String(row.id),
               user_agent: (row.user_agent as string | null) ?? null,
               created_at: row.created_at
                 ? new Date(row.created_at).toISOString()

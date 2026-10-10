@@ -1,6 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
 import { Transform } from "class-transformer";
-import { IsBoolean, IsEmail, IsIn, IsOptional, IsString, Length, MinLength } from "class-validator";
+import { IsBoolean, IsEmail, IsIn, IsOptional, IsString, IsUUID, Length, MinLength } from "class-validator";
 import { COUNTRIES, SUPPORTED_CURRENCIES } from "src/common/currency/currency.data";
 
 const COUNTRY_CODES = COUNTRIES.map((c) => c.code);
@@ -83,6 +83,14 @@ export class LoginAuthDto {
     @Transform(({ value }) => value === true || value === 'true')
     @IsBoolean()
     replace_other_sessions?: boolean;
+
+    @ApiPropertyOptional({
+        description:
+            'Sign out this one open session, the same control as Settings. Password is checked again.',
+    })
+    @IsOptional()
+    @IsUUID()
+    revoke_session_id?: string;
 }
 
 
