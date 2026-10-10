@@ -1,5 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
-import { IsEmail, IsIn, IsOptional, IsString, Length, MinLength } from "class-validator";
+import { Transform } from "class-transformer";
+import { IsBoolean, IsEmail, IsIn, IsOptional, IsString, Length, MinLength } from "class-validator";
 import { COUNTRIES, SUPPORTED_CURRENCIES } from "src/common/currency/currency.data";
 
 const COUNTRY_CODES = COUNTRIES.map((c) => c.code);
@@ -73,6 +74,15 @@ export class LoginAuthDto {
     @IsString()
     @MinLength(8)
     password: string;
+
+    @ApiPropertyOptional({
+        description:
+            'Set only after the sign-in screen has shown the other open sessions and the person chose to log them out.',
+    })
+    @IsOptional()
+    @Transform(({ value }) => value === true || value === 'true')
+    @IsBoolean()
+    replace_other_sessions?: boolean;
 }
 
 

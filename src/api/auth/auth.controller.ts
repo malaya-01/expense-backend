@@ -62,13 +62,26 @@ export class AuthController {
           : typeof error?.lockedUntil === 'string'
             ? error.lockedUntil
             : undefined
+      const payload =
+        response && typeof response === 'object'
+          ? (response as { code?: unknown; sessions?: unknown })
+          : null
+      const code = typeof payload?.code === 'string' ? payload.code : undefined
+      const sessions = Array.isArray(payload?.sessions)
+        ? payload.sessions
+        : undefined
+      const extra = {
+        ...(lockedUntil ? { lockedUntil } : {}),
+        ...(code ? { code } : {}),
+        ...(sessions ? { sessions } : {}),
+      }
       return res
         .status(statusCode)
         .send(
           errorResponse(
             message,
             statusCode,
-            lockedUntil ? { lockedUntil } : undefined,
+            Object.keys(extra).length ? extra : undefined,
           ),
         )
     }

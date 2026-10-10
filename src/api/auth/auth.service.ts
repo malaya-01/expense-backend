@@ -26,7 +26,11 @@ import {
   isSupportedCurrency,
 } from 'src/common/currency/currency.data';
 import appConfiguration from 'src/app.configuration';
-import { REFRESH_COOKIE_NAME, refreshCookieOptions } from './refresh-cookie';
+import {
+  REFRESH_COOKIE_NAME,
+  readPresentedRefreshToken,
+  refreshCookieOptions,
+} from './refresh-cookie';
 import {
   SESSION_REPLACED_MESSAGE,
   rememberSessionState,
@@ -99,6 +103,24 @@ export class AccountLockedException extends ForbiddenException {
       `Account temporarily locked. ${formatLockRemaining(until)}`,
     );
     this.lockedUntil = until.toISOString();
+  }
+}
+
+export type OtherLogin = {
+  user_agent: string | null;
+  created_at: string | null;
+  last_used_at: string | null;
+};
+
+/** Password was correct, but another device is still signed in. */
+export class ActiveSessionException extends ConflictException {
+  constructor(sessions: OtherLogin[]) {
+    super({
+      code: 'ACTIVE_SESSION',
+      message:
+        'ACTIVE_SESSION: This account is already signed in on another device.',
+      sessions,
+    });
   }
 }
 
@@ -630,9 +652,50 @@ export class AuthService {
         );
       }
 
+      if (!dto.replace_other_sessions) {
+        const presented = readPresentedRefreshToken(req);
+        const currentHash = presented ? hashRefreshToken(presented) : null;
+        const active = await client.query(
+          `SELECT user_agent, created_at, updated_at AS last_used_at
+           FROM user_sessions
+           WHERE user_id = $1
+             AND revoked_at IS NULL
+             AND expires_at > NOW()
+             AND COALESCE(is_delete, false) = false
+             AND ($2::text IS NULL OR refresh_token IS DISTINCT FROM $2::text)
+           ORDER BY updated_at DESC NULLS LAST, created_at DESC
+           LIMIT 20`,
+          [user.id, currentHash],
+        );
+        if (active.rowCount) {
+          await client.query(
+            `UPDATE users
+             SET failed_login_attempts = 0, locked_until = NULL
+             WHERE id = $1`,
+            [user.id],
+          );
+          await client.query('COMMIT');
+          throw new ActiveSessionException(
+            active.rows.map((row) => ({
+              user_agent: (row.user_agent as string | null) ?? null,
+              created_at: row.created_at
+                ? new Date(row.created_at).toISOString()
+                : null,
+              last_used_at: row.last_used_at
+                ? new Date(row.last_used_at).toISOString()
+                : null,
+            })),
+          );
+        }
+      }
+
       return await this.issueSession(client, user, req);
     } catch (error) {
-      await client.query('ROLLBACK');
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        /* The active-session check already committed. */
+      }
       throw error;
     } finally {
       client.release();
@@ -665,8 +728,8 @@ export class AuthService {
       ? `[opal:${clientPlatform}] ${rawUa || ''}`.trim()
       : rawUa;
 
-    // One signed-in device per account: this login replaces every other
-    // session (phone signs out the web and vice versa).
+    // Reached only when no other device is signed in, or the person
+    // confirmed on the sign-in screen that those sessions should end.
     const replaced = await client.query(
       `UPDATE user_sessions
        SET revoked_at = NOW(), revoked_reason = 'replaced', updated_at = NOW()

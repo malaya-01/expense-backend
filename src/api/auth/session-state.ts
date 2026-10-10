@@ -21,6 +21,10 @@ export async function rememberSessionState(
   sessionId: string,
   state: SessionState,
 ) {
+  // An "active" entry must not be cached. A request that read the row before
+  // this login would otherwise overwrite "replaced" and the phone would keep
+  // working for the whole TTL.
+  if (state === 'active') return;
   try {
     await cache.set(key(sessionId), state, STATE_TTL_MS);
   } catch {
@@ -36,7 +40,7 @@ export async function readSessionState(
 ): Promise<SessionState> {
   try {
     const cached = await cache.get<SessionState>(key(sessionId));
-    if (cached) return cached;
+    if (cached === 'replaced' || cached === 'ended') return cached;
   } catch {
     /* fall through to the DB */
   }
