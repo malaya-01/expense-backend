@@ -190,6 +190,128 @@ export type Citation = {
   source_type?: 'module' | 'web';
 };
 
+const LEDGER_ROW_SELECT = `SELECT t.id, t.date, t.type, t.amount, t.currency, t.amount_base,
+         t.description, t.merchant, t.notes,
+         c.name AS category_name,
+         sc.name AS source_name,
+         dc.name AS destination_name
+  FROM ledger_transactions t
+  LEFT JOIN categories c ON c.id = t.category_id
+  LEFT JOIN financial_containers sc ON sc.id = t.source_container_id
+  LEFT JOIN financial_containers dc ON dc.id = t.destination_container_id`;
+
+function roundMoney(value: unknown): number {
+  const amount = Number(value);
+  return Number.isFinite(amount) ? Math.round(amount * 100) / 100 : 0;
+}
+
+/** One ledger row as the model sees it (ids kept for edit proposals). */
+function compactLedgerRow(row: any) {
+  const amount = Number(row.amount);
+  const amountBase = row.amount_base == null ? null : Number(row.amount_base);
+  return {
+    id: row.id,
+    date: row.date,
+    type: row.type,
+    amount,
+    currency: row.currency,
+    // Only when it differs (foreign-currency row).
+    amount_base:
+      amountBase != null && Math.abs(amountBase - amount) > 0.005
+        ? amountBase
+        : undefined,
+    description: row.description || undefined,
+    merchant: row.merchant || undefined,
+    category: row.category_name || undefined,
+    from: row.source_name || undefined,
+    to: row.destination_name || undefined,
+    note: row.notes ? String(row.notes).slice(0, 120) : undefined,
+  };
+}
+
+const SEARCH_STOPWORDS = new Set(
+  `a about above after again all also am an and any are as at be been before being below between both but by can cannot could did do does doing done down during each few for from further get got had has have having he her here hers him his how i if in into is it its itself just me more most my myself no nor not now of off on once only or other our ours out over own same she should so some such than that the their them then there these they this those through to too under until up very was we were what when where which while who whom why will with would you your yours
+  much many spend spent spending pay paid paying payment payments cost costs bought buy buying transaction transactions money amount total totals show list find give tell see check please opal advisor month months week weeks year years today yesterday last this next previous recent recently ago day days time times expense expenses income ledger account accounts rupees rs inr usd dollars want know help
+  financial finance finances health healthy concrete action actions advice advise suggest suggestion suggestions plan planning improve improvement better best good bad worst risk risks risky overspend overspending overspent against budget budgets goal goals saving savings save invest investing investment investments afford affordable new should could would doing going need needs right currently overall summary summarize explain analyse analyze review status track progress compare next steps step fastest biggest`
+    .split(/\s+/)
+    .filter(Boolean),
+);
+
+const MONTHS = [
+  'january', 'february', 'march', 'april', 'may', 'june',
+  'july', 'august', 'september', 'october', 'november', 'december',
+];
+const MONTH_ALIASES: Record<string, number> = Object.fromEntries(
+  MONTHS.flatMap((name, index) => [
+    [name, index],
+    [name.slice(0, 3), index],
+  ]),
+);
+
+/** Words worth searching for (merchant, category, note) and plain amounts. */
+export function searchTermsFrom(question: string): {
+  terms: string[];
+  amounts: number[];
+} {
+  const text = question.toLowerCase().replace(/^\/\w+\s*/, '').replace(/@\w+/g, ' ');
+  const amounts = Array.from(
+    new Set(
+      (text.match(/(?:₹|rs\.?\s?|inr\s?|\$)?\b\d{2,7}(?:\.\d{1,2})?\b/g) || [])
+        .map((raw) => Number(raw.replace(/[^\d.]/g, '')))
+        .filter((n) => Number.isFinite(n) && n >= 10 && !(n >= 1990 && n <= 2100)),
+    ),
+  ).slice(0, 4);
+  const terms = Array.from(
+    new Set(
+      (text.match(/[a-z][a-z0-9&'-]{2,}/g) || [])
+        .map((word) => word.replace(/'s$/, ''))
+        .filter(
+          (word) =>
+            word.length >= 3 &&
+            !SEARCH_STOPWORDS.has(word) &&
+            !(word in MONTH_ALIASES),
+        ),
+    ),
+  ).slice(0, 6);
+  return { terms, amounts };
+}
+
+function isoDay(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+/** "this month", "last month", "in September" → inclusive date range. */
+export function dateRangeFrom(
+  question: string,
+  today?: string,
+): { start: string; end: string } | null {
+  const text = question.toLowerCase();
+  const now = today ? new Date(`${today}T00:00:00Z`) : new Date();
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth();
+  const monthRange = (year: number, month: number) => ({
+    start: isoDay(new Date(Date.UTC(year, month, 1))),
+    end: isoDay(new Date(Date.UTC(year, month + 1, 0))),
+  });
+  if (/\bthis month\b/.test(text)) return monthRange(y, m);
+  if (/\b(last|previous) month\b/.test(text)) return monthRange(y, m - 1);
+  if (/\bthis year\b/.test(text)) {
+    return { start: `${y}-01-01`, end: `${y}-12-31` };
+  }
+  if (/\blast year\b/.test(text)) {
+    return { start: `${y - 1}-01-01`, end: `${y - 1}-12-31` };
+  }
+  for (const [alias, month] of Object.entries(MONTH_ALIASES)) {
+    const pattern = alias === 'may' ? /\bmay\s+(?:20\d\d|month)\b|\bin may\b/ : new RegExp(`\\b${alias}\\b`);
+    if (!pattern.test(text)) continue;
+    const yearMatch = text.match(/\b(20\d\d)\b/);
+    // A named month without a year is the most recent one (not the future).
+    const year = yearMatch ? Number(yearMatch[1]) : month > m ? y - 1 : y;
+    return monthRange(year, month);
+  }
+  return null;
+}
+
 @Injectable()
 export class AiToolsService {
   constructor(
@@ -209,7 +331,11 @@ export class AiToolsService {
 
   async gatherContext(
     userId: string,
-    options?: { deepTools?: string[] },
+    options?: {
+      deepTools?: string[];
+      /** The user's question: drives the whole-ledger transaction search. */
+      query?: string;
+    },
   ): Promise<{
     context: Record<string, unknown>;
     activity: ToolActivity[];
@@ -236,25 +362,23 @@ export class AiToolsService {
     const txLimit = deep.has('list_transactions') ? 60 : 30;
     const categoryLimit = deep.has('list_categories') ? 200 : 150;
 
+    // The profile (today / timezone) scopes the question search below.
     await this.safeLoad(activity, 'get_user_profile', async () => {
       const profile = await this.loadUserProfile(userId);
       context.user = profile;
       return `Today is ${profile.today} (${profile.timezone})`;
     });
+    const profile = context.user as AiUserProfile | undefined;
 
-    await this.safeLoad(
-      activity,
-      'get_financial_overview',
-      async () => {
+    // Independent loads run together (they used to run one after another,
+    // ~12 round trips in series before the model was even called).
+    await Promise.all([
+      this.safeLoad(activity, 'get_financial_overview', async () => {
         context.overview = await this.reportsService.overview(userId, 6);
         return 'Loaded 6-month twin overview';
-      },
-    );
+      }),
 
-    await this.safeLoad(
-      activity,
-      'list_accounts',
-      async () => {
+      this.safeLoad(activity, 'list_accounts', async () => {
         const accounts = await this.accountsService.findAll(userId);
         context.accounts = accounts.slice(0, accountLimit).map((a: any) => ({
           id: a.id,
@@ -269,122 +393,173 @@ export class AiToolsService {
             : undefined,
         }));
         return `${accounts.length} containers`;
-      },
-    );
+      }),
 
-    await this.safeLoad(
-      activity,
-      'list_transactions',
-      async () => {
-        const tx = await this.transactionsService.findAll(userId);
-        const rows = Array.isArray(tx) ? tx : [];
-        context.recent_transactions = rows.slice(0, txLimit).map((t: any) => ({
-          id: t.id,
-          type: t.type,
-          amount: t.amount,
-          amount_base: t.amount_base,
-          currency: t.currency,
-          description: t.description,
-          merchant: t.merchant,
-          date: t.date,
-          category_id: t.category_id,
-          category_name: t.category_name,
+      this.safeLoad(activity, 'list_transactions', async () => {
+        const rows = await this.recentTransactions(userId, txLimit);
+        context.recent_transactions = rows;
+        return `${rows.length} recent ledger rows`;
+      }),
+
+      this.safeLoad(activity, 'ledger_stats', async () => {
+        context.ledger_stats = await this.ledgerStats(userId);
+        return 'Ledger totals computed';
+      }),
+
+      options?.query
+        ? this.safeLoad(activity, 'search_transactions', async () => {
+            const found = await this.searchTransactions(
+              userId,
+              options.query || '',
+              profile?.today,
+            );
+            if (!found) return 'No search terms in the question';
+            // A broad advice question with no hits is not a lookup; leave the
+            // empty search out so the model does not report "nothing matched".
+            const specific =
+              Boolean(found.amounts || found.date_range) ||
+              (found.search_terms?.length || 0) <= 2;
+            if (!found.match_count && !specific) return 'No matching transactions';
+            context.matching_transactions = found;
+            return `${found.match_count} matching transactions`;
+          })
+        : Promise.resolve(),
+
+      this.safeLoad(activity, 'list_budgets', async () => {
+        const budgets = await this.budgetsService.findAll(userId);
+        context.budgets = budgets.map((b: any) => ({
+          id: b.id,
+          name: b.name,
+          category: b.category_name || undefined,
+          period: b.period_type,
+          currency: b.currency,
+          amount: b.amount,
+          spent: b.spent,
+          remaining: b.remaining,
+          percent: b.percent,
+          status: b.status,
         }));
-        return `${Math.min(rows.length, txLimit)} recent ledger rows`;
-      },
-    );
+        return 'Budget envelopes loaded';
+      }),
 
-    await this.safeLoad(activity, 'list_budgets', async () => {
-      context.budgets = await this.budgetsService.findAll(userId);
-      return 'Budget envelopes loaded';
-    });
-
-    await this.safeLoad(activity, 'list_goals', async () => {
-      context.goals = await this.goalsService.findAll(userId);
-      return 'Goals loaded';
-    });
-
-    await this.safeLoad(activity, 'list_investments', async () => {
-      context.investments = await this.investmentsService.findAll(userId);
-      return 'Holdings loaded';
-    });
-
-    await this.safeLoad(activity, 'list_loans', async () => {
-      const loans = await this.loansService.findAll(userId);
-      context.loans = (Array.isArray(loans) ? loans : []).slice(0, 30).map(
-        (l: any) => ({
-          id: l.id,
-          name: l.name,
-          lender: l.lender,
-          principal: l.principal,
-          remaining_principal: l.outstanding_balance ?? l.principal,
-          annual_interest_rate: l.annual_interest_rate,
-          term_months: l.term_months,
-          status: l.status,
-          payment_day: l.payment_day,
-          emi: l.monthly_payment,
-          currency: l.currency,
-          payoff_percent: l.payoff_percent,
-        }),
-      );
-      return `${(context.loans as any[])?.length || 0} debt plans`;
-    });
-
-    await this.safeLoad(activity, 'list_recurring', async () => {
-      const schedules = await this.recurringService.findAll(userId);
-      context.recurring = (Array.isArray(schedules) ? schedules : [])
-        .slice(0, 40)
-        .map((s: any) => ({
-          id: s.id,
-          name: s.name,
-          transaction_type: s.transaction_type,
-          amount: s.amount,
-          currency: s.currency,
-          frequency: s.frequency,
-          next_execution: s.next_execution,
-          status: s.status,
-          category_name: s.category_name,
-          description: s.description,
+      this.safeLoad(activity, 'list_goals', async () => {
+        const goals = await this.goalsService.findAll(userId);
+        context.goals = goals.map((g: any) => ({
+          id: g.id,
+          name: g.name,
+          currency: g.currency,
+          target: g.target_amount,
+          current: g.current_amount,
+          remaining: g.remaining,
+          percent: g.percent,
+          status: g.status,
+          target_date: g.target_date || undefined,
+          predicted_date: g.predicted_date || undefined,
+          container: g.container_name || undefined,
         }));
-      return `${(context.recurring as any[])?.length || 0} schedules`;
-    });
+        return 'Goals loaded';
+      }),
 
-    await this.safeLoad(activity, 'list_spaces', async () => {
-      context.spaces = await this.spacesService.overviewForAi(userId);
-      return `${(context.spaces as any[])?.length || 0} collaborative spaces`;
-    });
+      this.safeLoad(activity, 'list_investments', async () => {
+        const investments: any = await this.investmentsService.findAll(userId);
+        context.investments = {
+          summary: investments?.summary,
+          holdings: (investments?.holdings || []).slice(0, 25).map((h: any) => ({
+            id: h.id,
+            name: h.name,
+            symbol: h.symbol || undefined,
+            type: h.asset_type,
+            quantity: h.quantity,
+            currency: h.currency,
+            value: h.current_value ?? h.market_value,
+            gain: h.gain ?? h.unrealized_gain,
+            gain_percent: h.gain_percent,
+            container: h.container_name || undefined,
+          })),
+        };
+        return 'Holdings loaded';
+      }),
 
-    await this.safeLoad(activity, 'list_categories', async () => {
-      const categories = await this.categoriesService.findAll(userId);
-      const rows = Array.isArray(categories) ? categories : [];
-      const names = new Map(rows.map((c: any) => [c.id, c.name]));
-      context.categories = rows.slice(0, categoryLimit).map((c: any) => ({
-        id: c.id,
-        name: c.name,
-        parent: c.parent_id ? names.get(c.parent_id) || undefined : undefined,
-      }));
-      return `${rows.length} categories loaded`;
-    });
+      this.safeLoad(activity, 'list_loans', async () => {
+        const loans = await this.loansService.findAll(userId);
+        context.loans = (Array.isArray(loans) ? loans : []).slice(0, 30).map(
+          (l: any) => ({
+            id: l.id,
+            name: l.name,
+            lender: l.lender,
+            principal: l.principal,
+            remaining_principal: l.outstanding_balance ?? l.principal,
+            annual_interest_rate: l.annual_interest_rate,
+            term_months: l.term_months,
+            status: l.status,
+            payment_day: l.payment_day,
+            emi: l.monthly_payment,
+            currency: l.currency,
+            payoff_percent: l.payoff_percent,
+          }),
+        );
+        return `${(context.loans as any[])?.length || 0} debt plans`;
+      }),
 
-    if (deep.has('list_uncategorized')) {
-      await this.safeLoad(activity, 'list_uncategorized', async () => {
-        const all = await this.transactionsService.findAll(userId);
-        const rows = Array.isArray(all) ? all : [];
-        context.uncategorized_transactions = rows
-          .filter((t: any) => !t.category_id && !t.category_name)
+      this.safeLoad(activity, 'list_recurring', async () => {
+        const schedules = await this.recurringService.findAll(userId);
+        context.recurring = (Array.isArray(schedules) ? schedules : [])
           .slice(0, 40)
-          .map((t: any) => ({
-            id: t.id,
-            type: t.type,
-            amount: t.amount,
-            currency: t.currency,
-            description: t.description,
-            merchant: t.merchant,
-            date: t.date,
+          .map((s: any) => ({
+            id: s.id,
+            name: s.name,
+            transaction_type: s.transaction_type,
+            amount: s.amount,
+            currency: s.currency,
+            frequency: s.frequency,
+            next_execution: s.next_execution,
+            status: s.status,
+            category_name: s.category_name,
+            description: s.description,
           }));
-        return `${(context.uncategorized_transactions as any[])?.length || 0} uncategorized`;
-      });
-    }
+        return `${(context.recurring as any[])?.length || 0} schedules`;
+      }),
+
+      this.safeLoad(activity, 'list_spaces', async () => {
+        context.spaces = await this.spacesService.overviewForAi(userId);
+        return `${(context.spaces as any[])?.length || 0} collaborative spaces`;
+      }),
+
+      this.safeLoad(activity, 'list_categories', async () => {
+        const result = await this.pgPool.query(
+          `SELECT id, name, parent_id FROM categories
+           WHERE user_id = $1 AND deleted_at IS NULL
+           ORDER BY name ASC`,
+          [userId],
+        );
+        const rows = result.rows;
+        const names = new Map(rows.map((c: any) => [c.id, c.name]));
+        context.categories = rows.slice(0, categoryLimit).map((c: any) => ({
+          id: c.id,
+          name: c.name,
+          parent: c.parent_id ? names.get(c.parent_id) || undefined : undefined,
+        }));
+        return `${rows.length} categories loaded`;
+      }),
+
+      deep.has('list_uncategorized')
+        ? this.safeLoad(activity, 'list_uncategorized', async () => {
+            const result = await this.pgPool.query(
+              `SELECT id, type, amount, currency, description, merchant, date
+               FROM ledger_transactions
+               WHERE user_id = $1 AND deleted_at IS NULL AND category_id IS NULL
+               ORDER BY date DESC, created_at DESC
+               LIMIT 40`,
+              [userId],
+            );
+            context.uncategorized_transactions = result.rows.map((t: any) => ({
+              ...t,
+              amount: Number(t.amount),
+            }));
+            return `${result.rows.length} uncategorized`;
+          })
+        : Promise.resolve(),
+    ]);
 
     await this.safeLoad(activity, 'get_cash_flow', async () => {
       const overview = (context.overview as any) || {};
@@ -952,6 +1127,141 @@ export class AiToolsService {
 
   convert(amount: number, from: string, to: string) {
     return convertAmount(amount, from, to);
+  }
+
+  /** Newest ledger rows, compact (no full-ledger load just to keep 30). */
+  private async recentTransactions(userId: string, limit: number) {
+    const result = await this.pgPool.query(
+      `${LEDGER_ROW_SELECT}
+       WHERE t.user_id = $1 AND t.deleted_at IS NULL
+       ORDER BY t.date DESC, t.created_at DESC
+       LIMIT $2`,
+      [userId, limit],
+    );
+    return result.rows.map(compactLedgerRow);
+  }
+
+  /**
+   * Totals the model must quote instead of adding up (possibly trimmed)
+   * lists itself — summing partial lists produced wrong numbers.
+   */
+  private async ledgerStats(userId: string) {
+    const [totals, byCategory] = await Promise.all([
+      this.pgPool.query(
+        `SELECT COUNT(*)::int AS transaction_count,
+                MIN(date) AS first_date,
+                MAX(date) AS last_date,
+                COALESCE(SUM(COALESCE(amount_base, amount))
+                  FILTER (WHERE type = 'income' AND date >= CURRENT_DATE - 90), 0) AS income_90d,
+                COALESCE(SUM(COALESCE(amount_base, amount))
+                  FILTER (WHERE type = 'expense' AND date >= CURRENT_DATE - 90), 0) AS expense_90d
+         FROM ledger_transactions
+         WHERE user_id = $1 AND deleted_at IS NULL`,
+        [userId],
+      ),
+      this.pgPool.query(
+        `SELECT COALESCE(c.name, 'Uncategorized') AS category,
+                SUM(COALESCE(t.amount_base, t.amount)) AS spent,
+                COUNT(*)::int AS count
+         FROM ledger_transactions t
+         LEFT JOIN categories c ON c.id = t.category_id
+         WHERE t.user_id = $1 AND t.deleted_at IS NULL
+           AND t.type = 'expense' AND t.date >= CURRENT_DATE - 90
+         GROUP BY 1
+         ORDER BY spent DESC
+         LIMIT 12`,
+        [userId],
+      ),
+    ]);
+    const row = totals.rows[0] || {};
+    return {
+      note: 'Totals are in the base currency over the WHOLE ledger, not just the rows listed.',
+      transaction_count: Number(row.transaction_count || 0),
+      first_date: row.first_date || undefined,
+      last_date: row.last_date || undefined,
+      last_90_days: {
+        income: roundMoney(row.income_90d),
+        expense: roundMoney(row.expense_90d),
+        expense_by_category: byCategory.rows.map((r: any) => ({
+          category: r.category,
+          spent: roundMoney(r.spent),
+          count: r.count,
+        })),
+      },
+    };
+  }
+
+  /**
+   * Transactions that match the user's question (merchant, category, note,
+   * amount, month), searched over the whole ledger with SQL totals. The
+   * twin only carries the newest rows, so "when did I pay X" used to fail.
+   */
+  private async searchTransactions(
+    userId: string,
+    question: string,
+    today?: string,
+  ) {
+    const { terms, amounts } = searchTermsFrom(question);
+    const range = dateRangeFrom(question, today);
+    if (!terms.length && !amounts.length && !range) return null;
+
+    const params: unknown[] = [userId];
+    const matchers: string[] = [];
+    if (terms.length) {
+      params.push(terms.map((term) => `%${term}%`));
+      matchers.push(
+        `lower(concat_ws(' ', t.description, t.merchant, t.notes, c.name, sc.name, dc.name)) LIKE ANY($${params.length}::text[])`,
+      );
+    }
+    if (amounts.length) {
+      params.push(amounts);
+      matchers.push(`t.amount = ANY($${params.length}::numeric[])`);
+    }
+    let rangeSql = '';
+    if (range) {
+      params.push(range.start, range.end);
+      rangeSql = `AND t.date >= $${params.length - 1}::date AND t.date <= $${params.length}::date`;
+    }
+    const where = `t.user_id = $1 AND t.deleted_at IS NULL ${rangeSql}
+      ${matchers.length ? `AND (${matchers.join(' OR ')})` : ''}`;
+
+    const [rows, totals] = await Promise.all([
+      this.pgPool.query(
+        `${LEDGER_ROW_SELECT}
+         WHERE ${where}
+         ORDER BY t.date DESC, t.created_at DESC
+         LIMIT 25`,
+        params,
+      ),
+      this.pgPool.query(
+        `SELECT COUNT(*)::int AS match_count,
+                MIN(t.date) AS first_date,
+                MAX(t.date) AS last_date,
+                COALESCE(SUM(COALESCE(t.amount_base, t.amount))
+                  FILTER (WHERE t.type = 'expense'), 0) AS expense_total,
+                COALESCE(SUM(COALESCE(t.amount_base, t.amount))
+                  FILTER (WHERE t.type = 'income'), 0) AS income_total
+         FROM ledger_transactions t
+         LEFT JOIN categories c ON c.id = t.category_id
+         LEFT JOIN financial_containers sc ON sc.id = t.source_container_id
+         LEFT JOIN financial_containers dc ON dc.id = t.destination_container_id
+         WHERE ${where}`,
+        params,
+      ),
+    ]);
+    const summary = totals.rows[0] || {};
+    return {
+      note: 'Searched the whole ledger for this question. Totals cover ALL matches (base currency); rows show the newest 25.',
+      search_terms: terms.length ? terms : undefined,
+      amounts: amounts.length ? amounts : undefined,
+      date_range: range || undefined,
+      match_count: Number(summary.match_count || 0),
+      first_date: summary.first_date || undefined,
+      last_date: summary.last_date || undefined,
+      expense_total: roundMoney(summary.expense_total),
+      income_total: roundMoney(summary.income_total),
+      rows: rows.rows.map(compactLedgerRow),
+    };
   }
 
   private async safeLoad(

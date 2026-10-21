@@ -66,19 +66,27 @@ export function fitJsonToBudget(
     const candidates = arrays
       .filter((a) => !isProtected(a.path))
       .sort((a, b) => b.size - a.size);
-    const pick = candidates[0] || arrays.sort((a, b) => b.size - a.size)[0];
+    const pick = candidates[0];
     if (pick) {
       const arr = pick.holder[pick.key] as unknown[];
       if (!originalLengths.has(pick.path)) originalLengths.set(pick.path, arr.length);
       pick.holder[pick.key] = arr.slice(0, Math.max(1, Math.ceil(arr.length / 2)));
     } else {
-      // No arrays left: drop the largest unprotected top-level key.
+      // No unprotected list left to shorten: drop the largest unprotected
+      // section before ever cutting protected ones (accounts, categories…).
       const keys = Object.keys(data)
         .filter((key) => !protect.has(key))
         .sort((a, b) => JSON.stringify(data[b]).length - JSON.stringify(data[a]).length);
-      if (!keys.length) break;
-      trimmed.push(`${keys[0]} (omitted)`);
-      delete data[keys[0]];
+      if (keys.length) {
+        trimmed.push(`${keys[0]} (omitted)`);
+        delete data[keys[0]];
+      } else {
+        const last = arrays.sort((a, b) => b.size - a.size)[0];
+        if (!last) break;
+        const arr = last.holder[last.key] as unknown[];
+        if (!originalLengths.has(last.path)) originalLengths.set(last.path, arr.length);
+        last.holder[last.key] = arr.slice(0, Math.max(1, Math.ceil(arr.length / 2)));
+      }
     }
     json = JSON.stringify(data);
   }

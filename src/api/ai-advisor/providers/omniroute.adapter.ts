@@ -19,6 +19,8 @@ import {
   VISION_ROUTE_TIMEOUT_MS,
 } from './omniroute.free-backends';
 import { buildLocalOpalReply } from './opal-local-reply';
+import { fitJsonToBudget } from '../context-budget';
+import { FINOS_IMMUTABLE_SAFETY_LAYER } from '../prompts/finos-master';
 import {
   TRUNCATION_NOTICE,
   buildContinuationMessages,
@@ -564,6 +566,52 @@ export async function trySequentialVisionChat(
   return { result: null, errors };
 }
 
+const TWIN_MARKER = 'Live Opal twin context (JSON):';
+const LEAN_RETRY_TIMEOUT_MS = 15_000;
+
+/**
+ * A much smaller copy of an advisor turn: safety layer, twin-reading rules,
+ * the essential twin (~7k chars) and the last few messages.
+ */
+function leanAdvisorMessages(messages: ChatMessage[]): ChatMessage[] | null {
+  const system = messages.find((m) => m.role === 'system')?.content || '';
+  const idx = system.indexOf(TWIN_MARKER);
+  if (idx < 0 || system.length < 8000) return null;
+  const rulesStart = system.indexOf('How to use the twin data below:');
+  const rules =
+    rulesStart >= 0 && rulesStart < idx ? system.slice(rulesStart, idx).trim() : '';
+  const jsonChunk = system
+    .slice(idx + TWIN_MARKER.length)
+    .trim()
+    .split(/\n\n(?:Current public web sources|No live web sources)/)[0]
+    .trim();
+  let twin: Record<string, unknown>;
+  try {
+    twin = JSON.parse(jsonChunk);
+  } catch {
+    return null;
+  }
+  const fitted = fitJsonToBudget(twin, 7000, {
+    protect: ['user', 'matching_transactions', 'ledger_stats', 'overview'],
+  }).json;
+  const conversation = messages
+    .filter((m) => m.role !== 'system')
+    .slice(-4)
+    .map((m) => ({
+      ...m,
+      content: m.content.length > 1500 ? `${m.content.slice(0, 1500)}…` : m.content,
+    }));
+  return [
+    {
+      role: 'system',
+      content: [FINOS_IMMUTABLE_SAFETY_LAYER, rules, TWIN_MARKER, fitted]
+        .filter(Boolean)
+        .join(String.fromCharCode(10, 10)),
+    },
+    ...conversation,
+  ];
+}
+
 /**
  * Fast Opal Free provider: Groq/Gemini race, then built-in Opal voice.
  */
@@ -622,6 +670,38 @@ export class OmnirouteAdapter implements AiProviderAdapter {
         model: 'omniroute/opal-local',
         provider: 'omniroute',
       };
+    }
+
+    // The full advisor prompt is often what the free tiers refuse (Groq's
+    // per-minute token cap, Gemini rate limits). One lean retry answers most
+    // questions from the essentials instead of the canned built-in reply.
+    const lean = leanAdvisorMessages(request.messages);
+    if (lean && !options?.signal?.aborted) {
+      onProgress?.('Retrying with a shorter prompt…');
+      const leanRequest = { ...request, messages: lean };
+      const leanMessages = withOpalIdentity(lean);
+      const retried = await raceRemotes(
+        remotes.map((backend) => ({
+          ...backend,
+          timeoutMs: Math.min(
+            backend.timeoutMs || FREE_ROUTE_BUDGET_MS,
+            LEAN_RETRY_TIMEOUT_MS,
+          ),
+        })),
+        leanRequest,
+        leanMessages,
+        onProgress,
+        options?.signal,
+      );
+      if (retried) {
+        return this.continueOnBackend(
+          retried.backend,
+          retried.result,
+          leanRequest,
+          leanMessages,
+          options,
+        );
+      }
     }
 
     onProgress?.('Free models busy — answering as Opal Advisor…');

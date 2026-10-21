@@ -136,6 +136,20 @@ type ParsedProposal = {
   payload: Record<string, unknown>;
 };
 
+/**
+ * How to read the twin. Models were adding up trimmed lists (wrong totals)
+ * and saying a transaction "doesn't exist" when it just wasn't in the newest
+ * rows.
+ */
+const TWIN_GROUNDING_RULES = [
+  'How to use the twin data below:',
+  '- Quote totals from overview, cash_flow, ledger_stats and matching_transactions (server-computed over the whole ledger). Never add up recent_transactions or other lists to get a total — those lists are samples.',
+  '- matching_transactions holds the ledger search for THIS question (merchant / category / note / amount / month). Answer "when / how much / how often" questions from it. If it is present with match_count 0, the thing the user asked about is not in the ledger: say so and suggest checking the spelling or the Transactions page.',
+  '- recent_transactions only shows the newest rows. A transaction missing from it is not proof it does not exist.',
+  "- Amounts are in each row's own currency; amount_base (when present) and all totals are in the user's base currency.",
+  '- Never propose a transaction with an amount of 0 or an invented merchant; ask the user for the missing detail instead.',
+].join(String.fromCharCode(10));
+
 @Injectable()
 export class AiAdvisorService {
   private readonly documentLogger = new Logger('AiAdvisorDocuments');
@@ -1154,6 +1168,7 @@ export class AiAdvisorService {
     const { context, activity, citations } =
       await this.toolsService.gatherContext(userId, {
         deepTools: this.resolveInvokedTools(dto),
+        query: dto.content,
       });
     const slash = parseSlashCommand(dto.content);
     let effectiveContent = dto.content.trim();
@@ -1207,6 +1222,8 @@ export class AiAdvisorService {
     const orderedContext: Record<string, unknown> = {};
     for (const key of [
       'user',
+      'matching_transactions',
+      'ledger_stats',
       'accounts',
       'categories',
       'overview',
@@ -1232,7 +1249,15 @@ export class AiAdvisorService {
     }
     const twinBudget = compactPrompt ? 18000 : invoked.length ? 64000 : 48000;
     const twinJson = fitJsonToBudget(orderedContext, twinBudget, {
-      protect: ['user', 'accounts', 'categories', 'invoked_tools'],
+      protect: [
+        'user',
+        'matching_transactions',
+        'ledger_stats',
+        'overview',
+        'accounts',
+        'categories',
+        'invoked_tools',
+      ],
     }).json;
     const system = [
       buildSystemPrompt(masterPrompt),
@@ -1262,6 +1287,7 @@ export class AiAdvisorService {
       invoked.length
         ? `User-invoked tools for this turn (@ / slash): ${invoked.join(', ')}. Prioritize these datasets.`
         : 'No explicit @ or / tool invocation for this turn.',
+      TWIN_GROUNDING_RULES,
       'Live Opal twin context (JSON):',
       twinJson,
       context.web_sources
@@ -1703,6 +1729,8 @@ export class AiAdvisorService {
       },
     ];
     const response = await runProviderChat(config, messages);
+    // The built-in fallback is not a title ("I'm **Opal Advisor** — still…").
+    if (this.isLocalOpalFallback(response.model)) return null;
     const raw = String(response.content || '')
       .split('\n')[0]
       .replace(/^["'`]+|["'`]+$/g, '')

@@ -154,17 +154,37 @@ function summarizeTwin(twin: Record<string, unknown>): string {
     );
   }
 
-  const txns = (twin.recent_transactions ?? twin.transactions) as
-    | Array<Record<string, unknown>>
-    | undefined;
-  const nTxn = countList(txns);
-  if (nTxn && Array.isArray(txns)) {
-    const spent = txns
-      .filter((row) => String(row.type || 'expense') === 'expense')
-      .reduce((sum, row) => sum + (Number(row.amount) || 0), 0);
+  // Server totals only: adding up the listed rows mixed currencies and
+  // covered just the newest few transactions.
+  const stats = twin.ledger_stats as Record<string, any> | undefined;
+  if (stats?.last_90_days) {
     bits.push(
-      `Recent ledger rows: **${nTxn}**${spent ? ` (expenses in that window ${money(spent, currency)})` : ''}`,
+      `Last 90 days — income ${money(stats.last_90_days.income, currency)}, spending ${money(stats.last_90_days.expense, currency)}`,
     );
+    const top = (stats.last_90_days.expense_by_category || []).slice(0, 3);
+    if (top.length) {
+      bits.push(
+        `Top spending: ${top.map((row: any) => `${row.category} ${money(row.spent, currency)}`).join('; ')}`,
+      );
+    }
+  }
+
+  const match = twin.matching_transactions as Record<string, any> | undefined;
+  if (match) {
+    const label = match.search_terms?.length
+      ? `“${match.search_terms.join(' ')}”`
+      : 'your question';
+    if (!match.match_count) {
+      bits.push(`No transactions in your ledger match ${label}.`);
+    } else {
+      const latest = match.rows?.[0];
+      bits.push(
+        `${match.match_count} transaction${match.match_count === 1 ? '' : 's'} match ${label}` +
+          `${match.expense_total ? ` — spent ${money(match.expense_total, currency)}` : ''}` +
+          `${match.income_total ? `, received ${money(match.income_total, currency)}` : ''}` +
+          `${latest ? ` (latest: ${latest.description || latest.merchant || 'transaction'} on ${latest.date}, ${money(latest.amount, latest.currency || currency)})` : ''}`,
+      );
+    }
   }
 
   const nBudgets = countList(twin.budgets);
@@ -209,7 +229,7 @@ ${
   const lines = [
     `I'm **Opal Advisor** — still here with you inside Opal.`,
     ``,
-    `A fast free model wasn’t available for this turn, so I’m answering with your in-app twin tools (not an outside LLM).`,
+    `The free AI models are busy right now, so I couldn’t write full advice for this question. Here’s what your twin shows — please ask again in a minute.`,
     ``,
   ];
 
@@ -218,7 +238,7 @@ ${
       `**What your twin tools returned**`,
       summarizeTwin(twin),
       ``,
-      `I won’t invent balances beyond that snapshot. For a full narrative answer (cash-flow stories, mermaid custom charts from live numbers, deeper coaching), add \`GROQ_API_KEY\` on the server or connect OpenRouter in [Settings](/settings).`,
+      `I won’t invent anything beyond these numbers. For faster, unlimited answers you can connect your own AI key in [Settings → AI](/settings).`,
       ``,
       `**Next steps**`,
       `- Ask something concrete: “Am I over budget?” or “What’s my net worth?”`,
@@ -226,11 +246,11 @@ ${
     );
   } else {
     lines.push(
-      `I don’t have twin JSON in this turn yet.`,
+      `I couldn’t load your twin data for this turn.`,
       ``,
       `**Try**`,
-      `- Ask again after the backend has \`GROQ_API_KEY\` set and restarted`,
-      `- Or connect your own key in [Settings → AI](/settings)`,
+      `- Ask again in a minute`,
+      `- Or connect your own AI key in [Settings → AI](/settings)`,
     );
   }
 
