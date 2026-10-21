@@ -34,6 +34,11 @@ export type ProviderChatRequest = {
    * (only Opal Free does this internally; others go through providers/index).
    */
   maxContinuations?: number;
+  /**
+   * Document OCR (receipts): Gemini gets the system prompt as a real
+   * systemInstruction, high media resolution and a low thinking level.
+   */
+  ocr?: boolean;
 };
 
 /** Default completion budget for advisor replies (was 2048 and cut long answers short). */

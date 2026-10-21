@@ -39,8 +39,11 @@ async function createPgPool(): Promise<Pool> {
     password: db.PASSWORD as string,
     database: db.DATABASE as string,
     max,
-    min: 0,
-    idleTimeoutMillis: Number(process.env.PG_POOL_IDLE_MS || 10_000),
+    // Keep a couple of connections warm: with min 0 / 10s idle almost every
+    // request after a short pause paid a fresh TCP + TLS + auth handshake to
+    // the database (hundreds of ms to Supabase) before running its query.
+    min: Math.min(max, Number(process.env.PG_POOL_MIN || 2)),
+    idleTimeoutMillis: Number(process.env.PG_POOL_IDLE_MS || 60_000),
     connectionTimeoutMillis: Number(process.env.PG_POOL_CONNECT_MS || 15_000),
     allowExitOnIdle: true,
     application_name: 'opal-expense-backend',

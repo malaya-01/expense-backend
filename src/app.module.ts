@@ -25,6 +25,7 @@ import { SpacesModule } from './api/spaces/spaces.module';
 import { SyncModule } from './api/sync/sync.module';
 import { PermissionsModule } from './api/permissions/permissions.module';
 import { TutorialModule } from './api/tutorial/tutorial.module';
+import { DashboardModule } from './api/dashboard/dashboard.module';
 import { ScheduleModule } from '@nestjs/schedule';
 import { AuthorizationGuard } from './helper/guards/authorization.guard';
 import { PermissionsGuard } from './helper/guards/permissions.guard';
@@ -70,6 +71,7 @@ import { PermissionsGuard } from './helper/guards/permissions.guard';
     SyncModule,
     PermissionsModule,
     TutorialModule,
+    DashboardModule,
   ],
   controllers: [AppController],
   providers: [AppService,

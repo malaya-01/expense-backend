@@ -45,7 +45,10 @@ export class PermissionsGuard implements CanActivate {
       throw new ForbiddenException('Insufficient permissions');
     }
 
-    const access = await this.permissionsService.resolveEffectiveAccess(userId);
+    const access = await this.permissionsService.resolveEffectiveAccess(
+      userId,
+      request.user.db_is_admin,
+    );
     request.user = {
       ...request.user,
       is_admin: access.is_admin,

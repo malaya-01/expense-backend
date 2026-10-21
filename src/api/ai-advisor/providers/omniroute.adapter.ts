@@ -16,6 +16,7 @@ import {
   localOpalBackend,
   resolveRemoteFreeBackends,
   resolveVisionFreeBackends,
+  VISION_ROUTE_TIMEOUT_MS,
 } from './omniroute.free-backends';
 import { buildLocalOpalReply } from './opal-local-reply';
 import {
@@ -239,6 +240,21 @@ async function chatOpenAiPost(
   };
 }
 
+/**
+ * Receipt OCR settings: high media resolution keeps small printed digits
+ * legible; a low thinking level keeps the reply fast and leaves the output
+ * budget for the JSON instead of hidden reasoning.
+ */
+function geminiOcrTuning(model: string): Record<string, unknown> {
+  const thinkingConfig = /gemini-2\.5/i.test(model)
+    ? { thinkingBudget: 512 }
+    : { thinkingLevel: 'low' };
+  return {
+    mediaResolution: 'MEDIA_RESOLUTION_HIGH',
+    thinkingConfig,
+  };
+}
+
 async function chatGeminiNative(
   backend: FreeBackend,
   request: ProviderChatRequest,
@@ -248,11 +264,17 @@ async function chatGeminiNative(
   if (!backend.chatUrl || !backend.apiKey) {
     throw new Error(`${backend.label}: missing URL or key`);
   }
+  const ocr = Boolean(request.ocr);
   const parts: Array<Record<string, unknown>> = [];
+  const systemParts: Array<{ text: string }> = [];
   for (const message of messages) {
     if (message.content?.trim()) {
-      const prefix = message.role === 'system' ? 'Instructions:\n' : '';
-      parts.push({ text: `${prefix}${message.content}` });
+      if (ocr && message.role === 'system') {
+        systemParts.push({ text: message.content });
+      } else {
+        const prefix = message.role === 'system' ? 'Instructions:\n' : '';
+        parts.push({ text: `${prefix}${message.content}` });
+      }
     }
     for (const file of message.attachments || []) {
       const mime =
@@ -268,25 +290,36 @@ async function chatGeminiNative(
     }
   }
   const url = `${backend.chatUrl}?key=${encodeURIComponent(backend.apiKey)}`;
-  const res = await fetchWithTimeout(
-    url,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts }],
-        generationConfig: {
-          temperature: request.temperature ?? 0.1,
-          // Thinking tokens share this budget on Gemini 2.5+/3 Flash; 2048
-          // clipped long receipts (line items) mid-JSON.
-          maxOutputTokens: Math.min(request.maxTokens ?? 1024, 4096),
-          responseMimeType: 'application/json',
-        },
-      }),
-    },
-    backend.timeoutMs || FREE_ROUTE_BUDGET_MS,
-    signal,
-  );
+  const send = (tuned: boolean) =>
+    fetchWithTimeout(
+      url,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          ...(systemParts.length
+            ? { systemInstruction: { parts: systemParts } }
+            : {}),
+          contents: [{ role: 'user', parts }],
+          generationConfig: {
+            temperature: request.temperature ?? 0.1,
+            // Thinking tokens share this budget on Gemini 2.5+/3 Flash; 2048
+            // clipped long receipts (line items) mid-JSON.
+            maxOutputTokens: Math.min(request.maxTokens ?? 1024, 4096),
+            responseMimeType: 'application/json',
+            ...(tuned ? geminiOcrTuning(backend.upstreamModel) : {}),
+          },
+        }),
+      },
+      backend.timeoutMs || FREE_ROUTE_BUDGET_MS,
+      signal,
+    );
+  let res = await send(ocr);
+  // A model that rejects the OCR tuning (thinking / media resolution) gets
+  // one plain retry instead of failing over to a slower backend.
+  if (ocr && res.status === 400) {
+    res = await send(false);
+  }
   if (!res.ok) {
     throw new Error(`${backend.label}: ${await readErrorText(res)}`);
   }
@@ -408,20 +441,47 @@ function isGroqQuotaError(detail: string): boolean {
   );
 }
 
+/** Whole receipt read (all fallbacks) must finish inside this budget. */
+const VISION_CHAIN_BUDGET_MS = Number(
+  process.env.RECEIPT_VISION_BUDGET_MS || 40_000,
+);
+/** One model may use at most this much, leaving room for a fallback. */
+const VISION_ATTEMPT_MAX_MS = Number(
+  process.env.RECEIPT_VISION_ATTEMPT_MS || 25_000,
+);
+/** Not worth starting another model with less time than this left. */
+const MIN_VISION_ATTEMPT_MS = 4_000;
+
+function isAbortError(err: any): boolean {
+  return err?.name === 'AbortError' || err?.name === 'TimeoutError';
+}
+
+/** Primary Gemini Flash first, then Groq vision, then the older Gemini. */
+function orderVisionBackends(backends: FreeBackend[]): FreeBackend[] {
+  const gemini = backends.filter((b) => b.kind === 'gemini_native');
+  const others = backends.filter((b) => b.kind !== 'gemini_native');
+  return [...gemini.slice(0, 1), ...others, ...gemini.slice(1)];
+}
+
 /**
- * Sequential vision OCR: Groq vision, then Gemini. Never uses local Opal
- * (it cannot see images and would invent fields).
+ * Sequential vision OCR under one overall deadline. Gemini Flash goes first
+ * (native JSON mode, strongest at small printed text), then Groq vision.
+ * Never uses local Opal (it cannot see images and would invent fields).
  */
 export async function trySequentialVisionChat(
   messages: ChatMessage[],
-  options?: { skipGroq?: boolean; maxTokens?: number },
+  options?: { skipGroq?: boolean; maxTokens?: number; deadlineMs?: number },
 ): Promise<{ result: ProviderChatResult | null; errors: string[] }> {
-  const backends = resolveVisionFreeBackends({ skipGroq: options?.skipGroq });
+  const backends = orderVisionBackends(
+    resolveVisionFreeBackends({ skipGroq: options?.skipGroq }),
+  );
+  const deadline = Date.now() + (options?.deadlineMs ?? VISION_CHAIN_BUDGET_MS);
   const base: ProviderChatRequest = {
     model: 'auto',
     messages,
-    temperature: 0.1,
+    temperature: 0,
     maxTokens: GROQ_FREE_MAX_OUTPUT_TOKENS,
+    ocr: true,
   };
   const errors: string[] = [];
   if (!backends.length) {
@@ -435,16 +495,34 @@ export async function trySequentialVisionChat(
     if (skipRemainingGroq && isGroqBackend(backend)) {
       continue;
     }
+    const remaining = deadline - Date.now();
+    if (remaining < MIN_VISION_ATTEMPT_MS) {
+      errors.push('Receipt reading took too long');
+      break;
+    }
+    // Each attempt only gets what is left of the overall budget, so slow
+    // models can no longer stack 45 s timeouts back to back.
+    const attempt: FreeBackend = {
+      ...backend,
+      timeoutMs: Math.min(
+        backend.timeoutMs || VISION_ROUTE_TIMEOUT_MS,
+        VISION_ATTEMPT_MAX_MS,
+        remaining,
+      ),
+    };
+    // Gemini native is always JSON (responseMimeType), so it never needs
+    // the "retry without JSON mode" second request.
     const allowJson =
-      backend.kind === 'gemini_native' ||
-      (!isGroqBackend(backend) && !backend.upstreamModel.startsWith('qwen/'));
+      backend.kind !== 'gemini_native' &&
+      !isGroqBackend(backend) &&
+      !backend.upstreamModel.startsWith('qwen/');
     try {
       const run = async (json: boolean) => {
         const maxTokens = isGroqBackend(backend)
           ? GROQ_FREE_MAX_OUTPUT_TOKENS
           : Math.min(options?.maxTokens ?? 3072, 4096);
         const result = await chatOnce(
-          backend,
+          attempt,
           { ...base, maxTokens, json },
           messages,
         );
@@ -463,13 +541,16 @@ export async function trySequentialVisionChat(
       if (allowJson) {
         try {
           return { result: await run(true), errors };
-        } catch {
+        } catch (err: any) {
+          if (isAbortError(err)) throw err;
           /* retry without JSON mode */
         }
       }
       return { result: await run(false), errors };
     } catch (err: any) {
-      const detail = err?.message || String(err);
+      const detail = isAbortError(err)
+        ? `${backend.label}: timed out`
+        : err?.message || String(err);
       errors.push(detail);
       console.warn(`[Opal vision] ${backend.label} failed: ${detail}`);
       if (isGroqBackend(backend) && isGroqQuotaError(detail)) {

@@ -204,6 +204,47 @@ export class TransactionsService {
     }
   }
 
+  /**
+   * Dashboard slice: everything dated on/after `since`, plus the newest
+   * `recent` rows even when they are older (so "Cash movement" is never empty).
+   */
+  async findSince(userId: string, since: string, recent = 6) {
+    const client = await this.pgPool.connect();
+    try {
+      const result = await client.query(
+        `SELECT t.*,
+                sc.name AS source_name,
+                sc.currency AS source_currency,
+                dc.name AS destination_name,
+                dc.currency AS destination_currency,
+                c.name AS category_name
+         FROM ledger_transactions t
+         LEFT JOIN financial_containers sc ON sc.id = t.source_container_id
+         LEFT JOIN financial_containers dc ON dc.id = t.destination_container_id
+         LEFT JOIN categories c ON c.id = t.category_id
+         WHERE t.user_id = $1 AND t.deleted_at IS NULL
+           AND (
+             t.date >= $2::date
+             OR t.id IN (
+               SELECT id FROM ledger_transactions
+               WHERE user_id = $1 AND deleted_at IS NULL
+               ORDER BY date DESC, created_at DESC
+               LIMIT $3
+             )
+           )
+         ORDER BY t.date DESC, t.created_at DESC`,
+        [userId, since, recent],
+      );
+      return result.rows.map((row) => this.normalize(row));
+    } catch (error: any) {
+      throw new BadRequestException(
+        error.message || 'Failed to fetch transactions',
+      );
+    } finally {
+      client.release();
+    }
+  }
+
   async findOne(userId: string, id: string) {
     const client = await this.pgPool.connect();
     try {

@@ -134,8 +134,18 @@ export class PermissionsService implements OnModuleInit {
     return this.normalizeAdminFlag(result.rows[0]?.is_admin);
   }
 
-  async resolveEffectiveAccess(userId: string): Promise<EffectiveAccess> {
-    const dbAdmin = await this.getUserAdminFlag(userId);
+  /**
+   * `knownDbAdmin`: the users.is_admin value the caller already read this
+   * request (AuthorizationGuard), so the flag is not queried twice.
+   */
+  async resolveEffectiveAccess(
+    userId: string,
+    knownDbAdmin?: unknown,
+  ): Promise<EffectiveAccess> {
+    const dbAdmin =
+      knownDbAdmin === undefined
+        ? await this.getUserAdminFlag(userId)
+        : this.normalizeAdminFlag(knownDbAdmin);
     const cached = await this.cache.get<EffectiveAccess>(this.cacheKey(userId));
     if (cached) {
       if (dbAdmin) {

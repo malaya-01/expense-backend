@@ -159,6 +159,15 @@ const TRANSFER_HINT_RE =
 const SELF_PAYEE_RE =
   /\b(self|myself|yourself|my\s+account|own\s+upi|to\s+self)\b/i;
 
+/** A second, totals-only pass runs only if the scan is still this young. */
+const SECOND_PASS_DEADLINE_MS = Number(
+  process.env.RECEIPT_SECOND_PASS_DEADLINE_MS || 30_000,
+);
+const MIN_SECOND_PASS_MS = 8_000;
+
+const RECEIPT_TOTALS_SYSTEM_PROMPT =
+  'You re-read the totals block and header date of a receipt, bill or payment screenshot for a personal-finance app. Reply with only the JSON object the user asks for: plain numbers without currency symbols, null for anything not printed. Never guess digits.';
+
 function emptyResult(
   warning: string,
   extra?: Partial<ReceiptParseResult>,
@@ -478,6 +487,13 @@ function joinHaystack(parts: Array<string | null | undefined>): string {
 
 function asPaymentStatus(value: unknown, haystack: string): string | null {
   const raw = asString(value);
+  // The model saw the screen; an explicit status wins. Regex over merchant,
+  // notes and item names ("Cancelled item", "Error Pizza") wrongly blocked
+  // real receipts as failed payments.
+  const explicit = raw?.trim().toLowerCase();
+  if (explicit === 'success' || explicit === 'failed' || explicit === 'pending') {
+    return explicit;
+  }
   const text = joinHaystack([raw, haystack]);
   if (!text) return raw;
   if (FAILED_STATUS_RE.test(text)) return 'failed';
@@ -592,9 +608,15 @@ export class ReceiptParseService {
   ) {}
 
   async parse(userId: string, dto: ParseReceiptDto): Promise<ReceiptParseResult> {
+    const startedAt = Date.now();
     const mime = dto.mime_type === 'image/jpg' ? 'image/jpeg' : dto.mime_type;
-    const saved = await this.persistReceipt(userId, dto, mime);
-    const finish = (result: ReceiptParseResult): ReceiptParseResult => {
+    // Storing the scan (R2 upload + 4 DB writes) runs alongside the AI read
+    // instead of before it; only the response waits for it.
+    const savedPromise = this.persistReceipt(userId, dto, mime);
+    const finish = async (
+      result: ReceiptParseResult,
+    ): Promise<ReceiptParseResult> => {
+      const saved = await savedPromise;
       const out: ReceiptParseResult = saved
         ? {
             ...result,
@@ -623,8 +645,10 @@ export class ReceiptParseService {
       return out;
     };
 
-    const [categories, containers, profileRow] = await Promise.all([
-      this.categories.findAll(userId),
+    // Context and provider lookups are independent: run them together.
+    const providerPromise = this.resolveVisionProvider(userId, mime);
+    const [categories, containers, profileRow, initialByok, freeQuota] = await Promise.all([
+      this.categoryOptions(userId),
       this.accounts.findAll(userId),
       this.pgPool
         .query(
@@ -633,6 +657,10 @@ export class ReceiptParseService {
         )
         .then((r) => r.rows[0] || {})
         .catch(() => ({}) as Record<string, any>),
+      providerPromise,
+      providerPromise.then((config) =>
+        config ? null : this.omnirouteUsage.getUsage(userId).catch(() => null),
+      ),
     ]);
     const categoryNames = categories.map((row: { name: string }) => row.name);
     const containerNames = containers.map(
@@ -658,21 +686,26 @@ export class ReceiptParseService {
       mimeType: mime,
       dataBase64: dto.data_base64,
     };
-    const messagesFor = (instruction: string): ChatMessage[] => [
-      { role: 'system', content: system },
+    const messagesFor = (
+      instruction: string,
+      systemPrompt = system,
+    ): ChatMessage[] => [
+      { role: 'system', content: systemPrompt },
       { role: 'user', content: instruction, attachments: [attachment] },
     ];
 
     // Route: the user's own vision-capable provider when active (stronger
     // models, no free quota), else Opal Free vision (Groq → Gemini).
-    let byok = await this.resolveVisionProvider(userId, mime);
+    let byok = initialByok;
     let quotaChecked = false;
     const runVision = async (
       instruction: string,
+      options?: { systemPrompt?: string; deadlineMs?: number },
     ): Promise<{ result: ProviderChatResult | null; errors: string[]; viaFree: boolean; blocked?: boolean }> => {
+      const messages = messagesFor(instruction, options?.systemPrompt);
       if (byok) {
         try {
-          const result = await runProviderChat(byok, messagesFor(instruction), 4096);
+          const result = await runProviderChat(byok, messages, 4096);
           return { result, errors: [], viaFree: false };
         } catch (error: any) {
           console.warn(`[Opal receipts] ${byok.provider} vision failed, using Opal Free: ${error?.message || error}`);
@@ -681,12 +714,13 @@ export class ReceiptParseService {
       }
       if (!quotaChecked) {
         quotaChecked = true;
-        const quota = await this.omnirouteUsage.getUsage(userId);
+        const quota = freeQuota ?? (await this.omnirouteUsage.getUsage(userId));
         if (quota.remaining <= 0) return { result: null, errors: [], viaFree: true, blocked: true };
       }
-      const { result, errors } = await trySequentialVisionChat(messagesFor(instruction), {
+      const { result, errors } = await trySequentialVisionChat(messages, {
         skipGroq,
         maxTokens: 3072,
+        deadlineMs: options?.deadlineMs,
       });
       return { result, errors, viaFree: true };
     };
@@ -711,7 +745,7 @@ export class ReceiptParseService {
       ));
     }
     if (first.viaFree) {
-      await this.omnirouteUsage.recordSuccessfulRequest(userId).catch(() => undefined);
+      void this.omnirouteUsage.recordSuccessfulRequest(userId).catch(() => undefined);
     }
     const source = first.viaFree
       ? describeVisionSource(first.result.model)
@@ -730,9 +764,11 @@ export class ReceiptParseService {
     let passes = 1;
 
     // Focused second pass on the totals / date when the first reading does
-    // not reconcile or has low confidence.
+    // not reconcile or has low confidence — only while the scan is still
+    // quick, so a slow first read is not doubled.
+    const secondPassBudget = SECOND_PASS_DEADLINE_MS - (Date.now() - startedAt);
     const reason =
-      extractedRaw.payment_status === 'failed'
+      extractedRaw.payment_status === 'failed' || secondPassBudget < MIN_SECOND_PASS_MS
         ? null
         : secondPassReason({
             reconciliation,
@@ -741,7 +777,12 @@ export class ReceiptParseService {
             isPayment: isPaymentScreen,
           });
     if (reason) {
-      const second = await runVision(buildTotalsPassPrompt(details, reason));
+      const second = await runVision(buildTotalsPassPrompt(details, reason), {
+        // The full extraction prompt asks for the whole template, which
+        // contradicted the narrow totals-only reply this pass wants.
+        systemPrompt: RECEIPT_TOTALS_SYSTEM_PROMPT,
+        deadlineMs: secondPassBudget,
+      });
       const json2 = second.result ? parseLenientJson(second.result.content) : null;
       if (json2) {
         passes = 2;
@@ -879,7 +920,7 @@ export class ReceiptParseService {
 
     return finish({
       ok: hasCore,
-      stored: Boolean(saved),
+      stored: false, // finish() marks it once the upload settles
       warning: warnings.length ? warnings.join(' ') : undefined,
       used_provider: source.provider,
       used_model: source.model,
@@ -913,6 +954,22 @@ export class ReceiptParseService {
       confidence,
       passes,
     });
+  }
+
+  /**
+   * Category ids and names only. CategoriesService.findAll also sums this
+   * period's spend per category, which the receipt reader never uses.
+   */
+  private async categoryOptions(
+    userId: string,
+  ): Promise<Array<{ id: string; name: string; parent_id: string | null }>> {
+    const result = await this.pgPool.query(
+      `SELECT id, name, parent_id FROM categories
+       WHERE user_id = $1 AND deleted_at IS NULL
+       ORDER BY name ASC`,
+      [userId],
+    );
+    return result.rows;
   }
 
   /** The user's active provider when it can read this file type, else null. */
@@ -1233,7 +1290,11 @@ export class ReceiptParseService {
       const hasDestination = Boolean(
         destinationContainer || destinationBank || destinationLabel,
       );
-      const paymentStatus = asPaymentStatus(parsed.payment_status, haystack);
+      const paymentStatus = asPaymentStatus(
+        parsed.payment_status,
+        // Line-item names are not status evidence.
+        notes === lineNotes ? haystack.replace(notes || '', '') : haystack,
+      );
       let transactionType = asTransactionType(
         parsed.transaction_type,
         haystack,

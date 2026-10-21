@@ -84,11 +84,7 @@ export class BudgetsService {
          ORDER BY b.name ASC`,
         [userId],
       );
-      const rows: any[] = [];
-      for (const row of result.rows) {
-        rows.push(await this.withProgress(client, userId, row));
-      }
-      return rows;
+      return this.withProgressBatch(client, userId, result.rows);
     } catch (error: any) {
       throw new BadRequestException(error.message || 'Failed to fetch budgets');
     } finally {
@@ -275,7 +271,6 @@ export class BudgetsService {
 
   private async withProgress(client: any, userId: string, row: any) {
     const period = this.periodWindow(row.period_type);
-    const currency = String(row.currency || 'USD').toUpperCase();
 
     const params: unknown[] = [userId, period.start, period.end];
     let categoryFilter = '';
@@ -300,10 +295,66 @@ export class BudgetsService {
       params,
     );
 
-    const spentBase = Number(spentResult.rows[0]?.spent_base || 0);
+    return this.buildProgress(
+      row,
+      period,
+      Number(spentResult.rows[0]?.spent_base || 0),
+      String(spentResult.rows[0]?.base_currency || 'USD').toUpperCase(),
+    );
+  }
+
+  /**
+   * Spent-so-far for every budget in one round trip (one query per budget
+   * made the list scale with the number of budgets).
+   */
+  private async withProgressBatch(client: any, userId: string, rows: any[]) {
+    if (!rows.length) return [];
+    const periods = rows.map((row) => this.periodWindow(row.period_type));
+    const spentResult = await client.query(
+      `SELECT w.idx,
+              COALESCE(SUM(COALESCE(t.amount_base, t.amount)), 0) AS spent_base,
+              (SELECT currency FROM users WHERE id = $1) AS base_currency
+       FROM unnest($2::int[], $3::date[], $4::date[], $5::text[])
+              AS w(idx, start_date, end_date, category_id)
+       LEFT JOIN ledger_transactions t
+         ON t.user_id = $1
+        AND t.type = 'expense'
+        AND t.deleted_at IS NULL
+        AND t.date >= w.start_date
+        AND t.date <= w.end_date
+        AND (w.category_id IS NULL OR t.category_id::text = w.category_id)
+       GROUP BY w.idx`,
+      [
+        userId,
+        rows.map((_, idx) => idx),
+        periods.map((period) => period.start),
+        periods.map((period) => period.end),
+        rows.map((row) => (row.category_id ? String(row.category_id) : null)),
+      ],
+    );
+    const spentByIdx = new Map<number, number>(
+      spentResult.rows.map((r: any) => [Number(r.idx), Number(r.spent_base)]),
+    );
     const baseCurrency = String(
       spentResult.rows[0]?.base_currency || 'USD',
     ).toUpperCase();
+    return rows.map((row, idx) =>
+      this.buildProgress(
+        row,
+        periods[idx],
+        spentByIdx.get(idx) || 0,
+        baseCurrency,
+      ),
+    );
+  }
+
+  private buildProgress(
+    row: any,
+    period: PeriodWindow,
+    spentBase: number,
+    baseCurrency: string,
+  ) {
+    const currency = String(row.currency || 'USD').toUpperCase();
     const spent = convertAmount(spentBase, baseCurrency, currency);
     const amount = Number(row.amount);
     const remaining = Math.round((amount - spent + Number.EPSILON) * 100) / 100;

@@ -479,7 +479,9 @@ export function resolveReceiptDate(
   printed.forEach((date, i) => candidates.push({ date, weight: printed.length > 1 ? (i === 0 ? 0.75 : 0.5) : 0.95 }));
   for (const date of interpretDate(String(modelDate ?? ''), monthFirst)) {
     if (!candidates.some((c) => c.date === date)) candidates.push({ date, weight: 0.7 });
-    else candidates.find((c) => c.date === date)!.weight += 0.1;
+    // On an ambiguous dd/mm vs mm/dd print the model saw the whole document
+    // (country, other dates), so its pick decides between the two readings.
+    else candidates.find((c) => c.date === date)!.weight += printed.length > 1 ? 0.3 : 0.1;
   }
   const plausible = candidates.filter((c) => isPlausibleDate(c.date, today));
   if (!plausible.length) {
@@ -716,49 +718,62 @@ export type ReceiptPromptContext = {
   accountLabels: string[];
 };
 
+/**
+ * Shape of the reply. Values are type placeholders, not examples: a template
+ * with realistic values ("DMart", 1249, a recent date, HDFC 4521) was being
+ * copied by models into fields they could not read.
+ */
 export const RECEIPT_JSON_TEMPLATE = {
-  document_type: 'grocery',
-  payment_status: 'success',
-  transaction_type: 'expense',
-  merchant: 'DMart',
-  merchant_legal_name: 'Avenue Supermarts Ltd',
-  currency: 'INR',
-  date_raw: '07/10/26',
-  date: '2026-10-07',
-  time: '18:42',
-  grand_total: 1249.0,
-  amount_paid: 1249.0,
-  total_label: 'Net Amount',
-  subtotal: 1189.52,
-  taxes: [{ label: 'CGST 2.5%', rate: 2.5, amount: 29.74 }, { label: 'SGST 2.5%', rate: 2.5, amount: 29.74 }],
-  tax_total: 59.48,
-  discount_total: null,
-  tip: null,
-  service_charge: null,
-  round_off: 0.0,
-  payment_method: 'card',
-  card_last4: '4521',
-  card_network: 'Visa',
-  upi_vpa: null,
-  upi_txn_id: null,
-  platform: null,
-  platform_txn_id: null,
-  bank_name: 'HDFC',
-  account_last4: '4521',
-  account_label: 'HDFC Bank Card XX4521',
-  container_name: null,
-  destination_bank_name: null,
-  destination_account_last4: null,
-  destination_account_label: null,
-  destination_container_name: null,
-  invoice_number: 'B-2231/88',
-  merchant_tax_id: '27AACCA8432H1ZQ',
-  merchant_address: 'Thane West, Maharashtra',
-  notes: null,
-  category_name: 'Groceries',
-  description: 'Groceries at DMart',
-  confidence: { merchant: 0.95, total: 0.95, date: 0.9, currency: 0.99, category: 0.9 },
-  line_items: [{ name: 'Toor Dal 1kg', qty: 2, unit_price: 165, amount: 330 }],
+  document_type: 'string',
+  payment_status: 'success|failed|pending|null',
+  transaction_type: 'expense|income|transfer',
+  merchant: 'string|null',
+  merchant_legal_name: 'string|null',
+  currency: 'ISO 4217 code',
+  date_raw: 'string as printed|null',
+  date: 'YYYY-MM-DD|null',
+  time: 'HH:mm|null',
+  grand_total: 'number|null',
+  amount_paid: 'number|null',
+  total_label: 'string|null',
+  subtotal: 'number|null',
+  taxes: [{ label: 'string', rate: 'number|null', amount: 'number' }],
+  tax_total: 'number|null',
+  discount_total: 'number|null',
+  tip: 'number|null',
+  service_charge: 'number|null',
+  round_off: 'number|null',
+  payment_method: 'string|null',
+  card_last4: 'string|null',
+  card_network: 'string|null',
+  upi_vpa: 'string|null',
+  upi_txn_id: 'string|null',
+  platform: 'string|null',
+  platform_txn_id: 'string|null',
+  bank_name: 'string|null',
+  account_last4: 'string|null',
+  account_label: 'string|null',
+  container_name: 'string|null',
+  destination_bank_name: 'string|null',
+  destination_account_last4: 'string|null',
+  destination_account_label: 'string|null',
+  destination_container_name: 'string|null',
+  invoice_number: 'string|null',
+  merchant_tax_id: 'string|null',
+  merchant_address: 'string|null',
+  notes: 'string|null',
+  category_name: 'string|null',
+  description: 'string|null',
+  confidence: {
+    merchant: 'number 0-1',
+    total: 'number 0-1',
+    date: 'number 0-1',
+    currency: 'number 0-1',
+    category: 'number 0-1',
+  },
+  line_items: [
+    { name: 'string', qty: 'number|null', unit_price: 'number|null', amount: 'number|null' },
+  ],
 };
 
 export function buildReceiptSystemPrompt(ctx: ReceiptPromptContext): string {
@@ -769,6 +784,7 @@ export function buildReceiptSystemPrompt(ctx: ReceiptPromptContext): string {
     'Reading rules',
     '- Copy only what is visible. Unknown or unreadable → null. Never invent merchants, amounts, ids, accounts or dates.',
     '- Amounts are plain numbers (1249.5): no currency symbols, no thousands separators; read decimal commas correctly (12,50 → 12.5).',
+    '- Read every digit of the total and the date exactly; do not round. If a digit is smudged or cut off, lower the confidence for that field instead of guessing.',
     '- grand_total = the final amount payable/paid, labelled e.g. Grand Total, Net Amount, Net Payable, Total Payable, Amount Paid, Bill Amount, Balance Due, Total (INR), or the big "₹…" on a UPI success screen. NEVER use Sub Total, Taxable Value/Amount, Total Qty/Items, MRP total, "You saved", a tax line or a line-item amount as grand_total. Put the label you used in total_label.',
     '- amount_paid = tendered/charged amount if printed separately (card slip, UPI); subtotal = amount before taxes.',
     '- taxes: one entry per printed tax line (CGST, SGST, UTGST, IGST, CESS, VAT, GST, Sales Tax, Service Tax) with rate % and amount; tax_total = their total. discount_total = discounts actually deducted. tip / service_charge if added. round_off is signed (-0.40 or 0.30).',
@@ -794,7 +810,7 @@ export function buildReceiptSystemPrompt(ctx: ReceiptPromptContext): string {
     `User accounts (container_name / destination_container_name must be one of these when it matches, else null): ${ctx.accountLabels.slice(0, 40).join(' | ') || '(none)'}`,
     `User categories: ${ctx.categoryNames.slice(0, 120).join(' | ') || '(none)'}`,
     '',
-    `JSON template (example values): ${JSON.stringify(RECEIPT_JSON_TEMPLATE)}`,
+    `JSON shape (placeholders show the type; replace every one with the value read from the document, or null): ${JSON.stringify(RECEIPT_JSON_TEMPLATE)}`,
   ].join('\n');
 }
 
