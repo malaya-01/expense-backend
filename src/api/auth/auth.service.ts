@@ -409,29 +409,30 @@ export class AuthService {
     await this.cacheManager.set(key, otp, OTP_TTL_MS);
     await this.cacheManager.del(`${email}-otp-attempts`);
 
-    if (canEmail && !allowInline) {
-      // Send in the background and answer exactly as for an unknown email, so
-      // neither the response nor its timing reveals whether the account exists.
-      void this.sendRecoveryCode(email, otp).catch(async (err) => {
+    if (canEmail) {
+      try {
+        await this.sendRecoveryCode(email, otp);
+        return genericResponse;
+      } catch (err) {
         // eslint-disable-next-line no-console
         console.error(
           '[Opal] Recovery email failed:',
           err instanceof Error ? err.message : err,
         );
-        try {
-          if ((await this.cacheManager.get<string>(key)) === otp) {
-            await this.cacheManager.del(key);
+        if (!allowInline) {
+          try {
+            if ((await this.cacheManager.get<string>(key)) === otp) {
+              await this.cacheManager.del(key);
+            }
+          } catch {
+            /* ignore cache errors */
           }
-        } catch {
-          /* ignore cache errors */
+          return genericResponse;
         }
-      });
-      return genericResponse;
+      }
     }
 
-    // Inline OTP (opt-in via PASSWORD_RESET_INLINE_CODE). Email is skipped
-    // entirely: the mail API can accept a message that later bounces, which
-    // would leave the user with no code at all.
+    // On-screen code only when mail is off or the send just failed.
     // eslint-disable-next-line no-console
     console.warn(`[Opal] Inline recovery code issued for ${email}.`);
     return {

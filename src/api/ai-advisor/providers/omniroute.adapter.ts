@@ -71,6 +71,15 @@ function isGroqBackend(backend: FreeBackend): boolean {
   return Boolean(backend.chatUrl?.includes('api.groq.com'));
 }
 
+function messageNeedsVision(messages: ChatMessage[]): boolean {
+  return messages.some((message) =>
+    (message.attachments || []).some((file) => {
+      const mime = String(file.mimeType || '').toLowerCase();
+      return mime.startsWith('image/') || mime === 'application/pdf';
+    }),
+  );
+}
+
 async function readErrorText(res: Response): Promise<string> {
   try {
     const data = await res.json();
@@ -190,8 +199,11 @@ async function chatOpenAiPost(
         model: backend.upstreamModel,
         messages: buildOpenAiMessages(messages),
         temperature: request.temperature ?? 0.35,
-        max_tokens: tokenBudget,
-        ...(groq ? { max_completion_tokens: tokenBudget } : {}),
+        // gpt-oss rejects a string-only schema and prefers max_completion_tokens.
+        // Other Groq models (vision Qwen) still take max_tokens.
+        ...(groq && /gpt-oss/i.test(backend.upstreamModel)
+          ? { max_completion_tokens: tokenBudget }
+          : { max_tokens: tokenBudget }),
         stream: false,
         ...(wantJson ? { response_format: { type: 'json_object' } } : {}),
         ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
@@ -373,11 +385,14 @@ async function raceRemotes(
         });
     }
 
-    // Hard budget — don't leave the user waiting on slow free hosts.
-    setTimeout(
-      () => finishNull('timed out'),
-      FREE_ROUTE_BUDGET_MS + 250,
+    // Wait as long as the slowest backend in this race. Vision calls set
+    // their own timeout (longer than the text budget); cutting them at the
+    // text budget dropped image turns onto the canned local reply.
+    const budgetMs = Math.max(
+      FREE_ROUTE_BUDGET_MS,
+      ...backends.map((backend) => backend.timeoutMs || 0),
     );
+    setTimeout(() => finishNull('timed out'), budgetMs + 500);
   });
 }
 
@@ -484,11 +499,20 @@ export class OmnirouteAdapter implements AiProviderAdapter {
     },
   ): Promise<ProviderChatResult> {
     const messages = withOpalIdentity(request.messages);
-    const remotes = resolveRemoteFreeBackends(request.model || config.model);
+    const vision = messageNeedsVision(request.messages);
+    // gpt-oss chat models reject image/PDF parts ("content must be a string").
+    // Receipts and screenshots have to go to a vision model or the turn fails.
+    const remotes = vision
+      ? resolveVisionFreeBackends()
+      : resolveRemoteFreeBackends(request.model || config.model);
     const onProgress = options?.onProgress;
 
     if (!remotes.length) {
-      onProgress?.('Answering as Opal Advisor…');
+      onProgress?.(
+        vision
+          ? 'No vision model is configured…'
+          : 'Answering as Opal Advisor…',
+      );
       return chatOnce(localOpalBackend(), request, messages, options?.signal);
     }
 
@@ -507,6 +531,16 @@ export class OmnirouteAdapter implements AiProviderAdapter {
         messages,
         options,
       );
+    }
+
+    if (vision) {
+      onProgress?.('Could not read the attachment…');
+      return {
+        content:
+          "I couldn't read that image or PDF just now — the vision route didn't respond. Please try the file again. I won't guess a merchant or an amount from a file I didn't see.",
+        model: 'omniroute/opal-local',
+        provider: 'omniroute',
+      };
     }
 
     onProgress?.('Free models busy — answering as Opal Advisor…');

@@ -502,10 +502,18 @@ export class AiSettingsService {
        FROM user_ai_preferences WHERE user_id = $1`,
       [userId],
     );
-    const provider = prefs.rows[0]?.active_provider as AiProviderId | undefined;
+    let provider = prefs.rows[0]?.active_provider as AiProviderId | undefined;
     if (!provider) {
-      throw new BadRequestException(
-        'No active AI provider. Connect and select one in Settings → AI & Models.',
+      // Opal Free needs no key. A chat with nothing selected should still
+      // answer, instead of failing until the user finds Settings.
+      provider = 'omniroute';
+      await this.pgPool.query(
+        `UPDATE user_ai_preferences
+         SET active_provider = 'omniroute',
+             active_model = COALESCE(NULLIF(active_model, ''), $2),
+             updated_at = NOW()
+         WHERE user_id = $1 AND active_provider IS NULL`,
+        [userId, DEFAULT_MODELS.omniroute[0]],
       );
     }
     const config = await this.loadProviderConfig(userId, provider);

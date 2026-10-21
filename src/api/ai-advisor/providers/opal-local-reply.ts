@@ -91,29 +91,81 @@ function countList(value: unknown): number {
   return Array.isArray(value) ? value.length : 0;
 }
 
+function money(value: unknown, currency?: unknown): string {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return '—';
+  const code = String(currency || '').toUpperCase();
+  try {
+    return new Intl.NumberFormat(code === 'INR' ? 'en-IN' : 'en-US', {
+      style: code ? 'currency' : 'decimal',
+      ...(code ? { currency: code } : {}),
+      maximumFractionDigits: 0,
+    }).format(amount);
+  } catch {
+    return code ? `${code} ${amount.toFixed(0)}` : amount.toFixed(0);
+  }
+}
+
 function summarizeTwin(twin: Record<string, unknown>): string {
   const bits: string[] = [];
   const overview = twin.overview as Record<string, unknown> | undefined;
-  if (overview && typeof overview === 'object') {
-    const currency = overview.base_currency || overview.currency;
-    if (overview.net_worth != null) {
-      bits.push(
-        `Net worth snapshot: **${overview.net_worth}**${currency ? ` ${currency}` : ''}`,
-      );
+  const snapshot = (overview?.twin || overview) as Record<string, unknown> | undefined;
+  const currency =
+    (overview?.base_currency as string | undefined) ||
+    ((twin.user as Record<string, unknown> | undefined)?.base_currency as
+      | string
+      | undefined);
+  const thisMonth = overview?.this_month as Record<string, unknown> | undefined;
+
+  if (snapshot && typeof snapshot === 'object') {
+    if (snapshot.net_worth != null) {
+      bits.push(`Net worth: **${money(snapshot.net_worth, currency)}**`);
     }
-    if (overview.total_assets != null || overview.total_liabilities != null) {
+    const assets = snapshot.assets ?? snapshot.total_assets;
+    const liabilities = snapshot.liabilities ?? snapshot.total_liabilities;
+    if (assets != null || liabilities != null) {
       bits.push(
-        `Assets / liabilities: ${overview.total_assets ?? '—'} / ${overview.total_liabilities ?? '—'}`,
+        `Assets / liabilities: ${money(assets, currency)} / ${money(liabilities, currency)}`,
       );
     }
   }
 
-  const accounts = twin.accounts ?? twin.containers;
-  const nAccounts = countList(accounts);
-  if (nAccounts) bits.push(`Accounts in twin: **${nAccounts}**`);
+  if (thisMonth && typeof thisMonth === 'object') {
+    bits.push(
+      `This month — income ${money(thisMonth.income, currency)}, spending ${money(thisMonth.expense, currency)}, net ${money(thisMonth.net, currency)}`,
+    );
+  }
 
-  const nTxn = countList(twin.transactions);
-  if (nTxn) bits.push(`Recent transactions loaded: **${nTxn}**`);
+  const accounts = (twin.accounts ?? twin.containers) as Array<Record<string, unknown>> | undefined;
+  const nAccounts = countList(accounts);
+  if (nAccounts && Array.isArray(accounts)) {
+    const top = [...accounts]
+      .filter((account) => account?.balance != null)
+      .sort((a, b) => Math.abs(Number(b.balance)) - Math.abs(Number(a.balance)))
+      .slice(0, 4)
+      .map(
+        (account) =>
+          `${account.name || 'Account'} ${money(account.balance, account.currency || currency)}`,
+      );
+    bits.push(
+      top.length
+        ? `Accounts (${nAccounts}): ${top.join('; ')}`
+        : `Accounts in twin: **${nAccounts}**`,
+    );
+  }
+
+  const txns = (twin.recent_transactions ?? twin.transactions) as
+    | Array<Record<string, unknown>>
+    | undefined;
+  const nTxn = countList(txns);
+  if (nTxn && Array.isArray(txns)) {
+    const spent = txns
+      .filter((row) => String(row.type || 'expense') === 'expense')
+      .reduce((sum, row) => sum + (Number(row.amount) || 0), 0);
+    bits.push(
+      `Recent ledger rows: **${nTxn}**${spent ? ` (expenses in that window ${money(spent, currency)})` : ''}`,
+    );
+  }
 
   const nBudgets = countList(twin.budgets);
   if (nBudgets) bits.push(`Budgets loaded: **${nBudgets}**`);

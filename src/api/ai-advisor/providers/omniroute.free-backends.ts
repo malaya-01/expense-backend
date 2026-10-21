@@ -19,9 +19,13 @@ export const OMNIROUTE_DAILY_SUCCESS_LIMIT = Number(
   process.env.OMNIROUTE_DAILY_LIMIT || 20,
 );
 
-/** Hard cap for remote free routing before local Opal answers. */
+/**
+ * How long a text route may run before the built-in reply takes over.
+ * 8s was shorter than a cold Groq/Gemini turn with a full twin prompt,
+ * so the advisor often answered with the canned fallback instead.
+ */
 export const FREE_ROUTE_BUDGET_MS = Number(
-  process.env.OMNIROUTE_ROUTE_BUDGET_MS || 8_000,
+  process.env.OMNIROUTE_ROUTE_BUDGET_MS || 25_000,
 );
 
 export const OMNIROUTE_FREE_MODELS = [
@@ -67,19 +71,17 @@ function openRouterModelFor(alias: string): string {
 }
 
 /**
- * Groq on-demand free tier rejects max_tokens above the OTPM cap (1000).
- * Receipt JSON does not need 1024 tokens — stay well under the gate.
+ * Visible-token budget for Groq chat. The old 768 cap was shared with
+ * hidden reasoning on gpt-oss, so advisor replies stopped mid-answer.
+ * Groq accepts up to 8192 completion tokens on the current free models.
  */
 export const GROQ_FREE_MAX_OUTPUT_TOKENS = Math.min(
-  Number(process.env.GROQ_MAX_OUTPUT_TOKENS || 768),
-  768,
+  Math.max(256, Number(process.env.GROQ_MAX_OUTPUT_TOKENS || 4096) || 4096),
+  8192,
 );
 
-/** Groq Llama 4 Scout was retired July 2026. Current Groq vision models: */
-export const GROQ_VISION_MODELS = [
-  'qwen/qwen3.6-27b',
-  'qwen/qwen3.8-27b',
-] as const;
+/** Current Groq vision model (qwen3.6-27b was removed from the API). */
+export const GROQ_VISION_MODELS = ['qwen/qwen3.8-27b'] as const;
 export const GROQ_VISION_MODEL = GROQ_VISION_MODELS[0];
 /** Gemini 2.0 Flash was retired; 3.6 is the current vision Flash. */
 export const GEMINI_VISION_MODELS = [
