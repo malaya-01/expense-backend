@@ -36,11 +36,13 @@ import {
   rememberSessionState,
 } from './session-state';
 import {
+  isGmailApiConfigured,
+  sendAuthMail,
+} from 'src/utils/mail/gmail-api.util';
+import {
   buildRecoveryEmailHtml,
   buildRecoveryEmailText,
   buildVerificationEmailHtml,
-  isMailConfigured,
-  sendMail,
   shouldOfferInlineRecoveryCode,
 } from 'src/utils/mail/mail.util';
 import { buildAppPathUrl } from 'src/utils/url/public-app-url';
@@ -149,7 +151,7 @@ export class AuthService {
       throw new BadRequestException('Password and confirm password do not match');
     }
 
-    if (requireVerification && !isMailConfigured()) {
+    if (requireVerification && !isGmailApiConfigured()) {
       throw new ServiceUnavailableException(
         'Email delivery is not configured. Contact the application administrator.',
       );
@@ -316,7 +318,7 @@ export class AuthService {
     email: string,
     fullName?: string | null,
   ) {
-    if (!isMailConfigured()) {
+    if (!isGmailApiConfigured()) {
       throw new ServiceUnavailableException(
         'Email delivery is not configured. Contact the application administrator.',
       );
@@ -354,7 +356,7 @@ export class AuthService {
     ].join('\n');
 
     try {
-      await sendMail({
+      await sendAuthMail({
         to: email,
         subject: 'Verify your email',
         text,
@@ -382,7 +384,7 @@ export class AuthService {
   async generateOtp(dto: OtpGenerateDto) {
     const email = dto.email.trim().toLowerCase();
     const allowInline = shouldOfferInlineRecoveryCode();
-    const canEmail = isMailConfigured();
+    const canEmail = isGmailApiConfigured();
 
     if (!canEmail && !allowInline) {
       throw new ServiceUnavailableException(
@@ -547,12 +549,12 @@ export class AuthService {
   }
 
   private async sendRecoveryCode(email: string, otp: string) {
-    if (!isMailConfigured()) {
+    if (!isGmailApiConfigured()) {
       throw new ServiceUnavailableException(
         'Password recovery email is not configured. Contact the application administrator.',
       );
     }
-    await sendMail({
+    await sendAuthMail({
       to: email,
       subject: 'Password recovery code',
       text: buildRecoveryEmailText(otp),
