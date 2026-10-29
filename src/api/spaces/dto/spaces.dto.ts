@@ -13,6 +13,7 @@ import {
   IsUUID,
   MaxLength,
   Min,
+  ValidateIf,
   ValidateNested,
 } from 'class-validator';
 import { SUPPORTED_CURRENCIES } from 'src/common/currency/currency.data';
@@ -83,6 +84,33 @@ export class SplitParticipantDto {
   share_value?: number;
 }
 
+export class PayerContributionDto {
+  @IsUUID()
+  member_id: string;
+
+  @Type(() => Number)
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0.01)
+  paid_amount: number;
+}
+
+export class ExpenseLineItemDto {
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  name?: string;
+
+  @Type(() => Number)
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0.01)
+  amount: number;
+
+  @IsArray()
+  @ArrayMinSize(1)
+  @IsUUID('all', { each: true })
+  member_ids: string[];
+}
+
 export class CreateSpaceExpenseDto {
   @IsString()
   @MaxLength(200)
@@ -93,17 +121,38 @@ export class CreateSpaceExpenseDto {
   @Min(0.01)
   amount: number;
 
+  @ValidateIf((o) => !o.payers?.length)
   @IsUUID()
-  payer_member_id: string;
+  payer_member_id?: string;
 
-  @IsIn(['equal', 'exact', 'percentage', 'shares'])
-  split_method: 'equal' | 'exact' | 'percentage' | 'shares';
+  @IsOptional()
+  @IsArray()
+  @ArrayMinSize(1)
+  @ValidateNested({ each: true })
+  @Type(() => PayerContributionDto)
+  payers?: PayerContributionDto[];
 
+  @IsIn(['equal', 'exact', 'percentage', 'shares', 'itemized'])
+  split_method: 'equal' | 'exact' | 'percentage' | 'shares' | 'itemized';
+
+  @ValidateIf((o) => o.split_method !== 'itemized')
   @IsArray()
   @ArrayMinSize(1)
   @ValidateNested({ each: true })
   @Type(() => SplitParticipantDto)
-  participants: SplitParticipantDto[];
+  participants?: SplitParticipantDto[];
+
+  @ValidateIf((o) => o.split_method === 'itemized')
+  @IsArray()
+  @ArrayMinSize(1)
+  @ValidateNested({ each: true })
+  @Type(() => ExpenseLineItemDto)
+  line_items?: ExpenseLineItemDto[];
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(80)
+  client_op_id?: string;
 
   @IsOptional()
   @IsString()
@@ -145,6 +194,13 @@ export class CreateSpaceExpenseDto {
   @IsOptional()
   @IsUUID()
   personal_container_id?: string;
+
+  @ApiPropertyOptional({
+    description: 'Receivable account that holds what others owe. Created when omitted.',
+  })
+  @IsOptional()
+  @IsUUID()
+  receivable_container_id?: string;
 }
 
 export class CreateSettlementDto {
@@ -188,6 +244,11 @@ export class CreateSettlementDto {
   @IsOptional()
   @IsUUID()
   personal_container_id?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(80)
+  client_op_id?: string;
 }
 
 export class CreateSpaceBudgetDto {

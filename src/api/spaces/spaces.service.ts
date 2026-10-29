@@ -7,7 +7,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import { randomBytes } from 'crypto';
 import { TransactionsService } from '../transactions/transactions.service';
 import {
@@ -16,7 +16,17 @@ import {
 } from 'src/storage/object-storage.service';
 import { isUuid } from 'src/storage/storage-keys';
 import { can, slugify, type SpacePermission, type SpaceRole } from './spaces.permissions';
-import { computeSplits, round2, simplifyDebts } from './spaces.settlement';
+import {
+  applyExpenseNets,
+  applySettlementNet,
+  computeItemizedSplits,
+  computeSplits,
+  maxSettlementAmount,
+  normalizePayers,
+  round2,
+  simplifyDebts,
+  type PayerInput,
+} from './spaces.settlement';
 import {
   ContributeSpaceGoalDto,
   CreateSettlementDto,
@@ -498,30 +508,48 @@ export class SpacesService {
   async createExpense(userId: string, spaceId: string, dto: CreateSpaceExpenseDto) {
     const membership = await this.requireMembership(userId, spaceId, 'add_expense');
     const space = await this.findSpace(spaceId);
-    const splits = computeSplits(dto.split_method, dto.amount, dto.participants);
+    const plan = this.planExpenseOrThrow(dto);
+    if (dto.client_op_id) {
+      const existing = await this.pgPool.query(
+        `SELECT id FROM space_expenses
+         WHERE space_id = $1 AND client_op_id = $2 AND deleted_at IS NULL`,
+        [spaceId, dto.client_op_id],
+      );
+      if (existing.rowCount) return this.getExpense(spaceId, existing.rows[0].id);
+    }
+    const myPaid =
+      plan.payers.find((p) => p.member_id === membership.id)?.paid_amount || 0;
+    if (dto.link_to_personal && !(myPaid > 0)) {
+      throw new BadRequestException(
+        'Only someone who paid can record that payment on their own account. Save the bill without linking, and each person can record their side later.',
+      );
+    }
+    if (dto.link_to_personal && !dto.personal_container_id) {
+      throw new BadRequestException('Choose the account the money left');
+    }
     const expenseDate = dto.expense_date || new Date().toISOString().slice(0, 10);
-    // Upload before opening the DB transaction (no locks held during I/O).
     const receipt = await this.storeSpaceReceipt(userId, spaceId, dto, expenseDate);
     const client = await this.pgPool.connect();
     try {
       await client.query('BEGIN');
       await this.assertActiveMembers(client, spaceId, [
-        dto.payer_member_id,
-        ...dto.participants.map((p) => p.member_id),
+        ...plan.payers.map((p) => p.member_id),
+        ...plan.splits.map((s) => s.member_id),
       ]);
       const expense = await client.query(
         `INSERT INTO space_expenses
           (space_id, title, amount, currency, payer_member_id, split_method, category,
            expense_date, notes, tags, receipt_name, receipt_mime_type, receipt_base64,
-           created_by, link_to_personal, personal_container_id, receipt_file_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+           created_by, link_to_personal, personal_container_id, receipt_file_id,
+           line_items, client_op_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
          RETURNING *`,
         [
           spaceId,
           dto.title.trim(),
           dto.amount,
           space.currency,
-          dto.payer_member_id,
+          plan.payers[0].member_id,
           dto.split_method,
           dto.category || null,
           expenseDate,
@@ -534,10 +562,19 @@ export class SpacesService {
           dto.link_to_personal === true,
           dto.personal_container_id || null,
           receipt.fileId,
+          JSON.stringify(dto.split_method === 'itemized' ? dto.line_items || [] : []),
+          dto.client_op_id || null,
         ],
       );
       const expenseId = expense.rows[0].id;
-      for (const split of splits) {
+      for (const payer of plan.payers) {
+        await client.query(
+          `INSERT INTO space_expense_payers (expense_id, member_id, paid_amount)
+           VALUES ($1,$2,$3)`,
+          [expenseId, payer.member_id, payer.paid_amount],
+        );
+      }
+      for (const split of plan.splits) {
         await client.query(
           `INSERT INTO space_expense_splits (expense_id, member_id, share_value, owed_amount)
            VALUES ($1,$2,$3,$4)`,
@@ -545,37 +582,143 @@ export class SpacesService {
         );
       }
 
-      let personalTxId: string | null = null;
-      if (dto.link_to_personal && dto.personal_container_id) {
-        const mySplit = splits.find((s) => s.member_id === membership.id);
-        const amount = mySplit?.owed_amount || 0;
-        if (amount > 0) {
-          // Use the same client — nested pgPool.connect() while holding this
-          // transaction deadlocks when the pool is saturated.
-          const tx = await this.transactionsService.createWithClient(
-            client,
-            userId,
-            {
-              type: 'expense',
-              amount,
-              description: `[${space.name}] ${dto.title.trim()}`,
-              date: dto.expense_date || new Date().toISOString().slice(0, 10),
-              source_container_id: dto.personal_container_id,
-              currency: space.currency,
-              notes: dto.notes || `Linked space expense ${expenseId}`,
-              merchant: dto.title.trim(),
-            } as any,
-            'spaces',
-          );
-          personalTxId = tx.id;
-          await client.query(
-            `UPDATE space_expenses SET personal_transaction_id = $2 WHERE id = $1`,
-            [expenseId, personalTxId],
-          );
-        }
+      let ledgerEffect: {
+        paid: number;
+        receivable: number;
+        account_id: string;
+      } | null = null;
+      if (dto.link_to_personal && dto.personal_container_id && myPaid > 0) {
+        const myShare =
+          plan.splits.find((s) => s.member_id === membership.id)?.owed_amount || 0;
+        ledgerEffect = await this.postPayerAuthorization(client, {
+          userId,
+          space,
+          expenseId,
+          title: dto.title.trim(),
+          date: expenseDate,
+          paid: myPaid,
+          share: myShare,
+          paymentContainerId: dto.personal_container_id,
+          receivableContainerId: dto.receivable_container_id,
+        });
       }
 
       await this.logActivity(client, spaceId, userId, 'expense_added', dto.title.trim(), {
+        expense_id: expenseId,
+        amount: dto.amount,
+        payers: plan.payers,
+      });
+      await client.query('COMMIT');
+      const saved = await this.getExpense(spaceId, expenseId);
+      return { ...saved, ledger_effect: ledgerEffect };
+    } catch (error: any) {
+      await client.query('ROLLBACK');
+      if (receipt.fileId) {
+        await this.storage.deleteSpaceFile(receipt.fileId, spaceId);
+      }
+      if (error?.code === '23505' && dto.client_op_id) {
+        const existing = await this.pgPool.query(
+          `SELECT id FROM space_expenses
+           WHERE space_id = $1 AND client_op_id = $2 AND deleted_at IS NULL`,
+          [spaceId, dto.client_op_id],
+        );
+        if (existing.rowCount) return this.getExpense(spaceId, existing.rows[0].id);
+      }
+      if (error instanceof HttpException) throw error;
+      throw new BadRequestException(error.message || 'Could not create expense');
+    } finally {
+      client.release();
+    }
+  }
+
+  /** Payers, shares, and the primary payer. Rejects a bill that does not reconcile. */
+  private planExpenseOrThrow(dto: CreateSpaceExpenseDto) {
+    try {
+      const payers = normalizePayers(dto.amount, dto.payer_member_id, dto.payers);
+      const splits =
+        dto.split_method === 'itemized'
+          ? computeItemizedSplits(dto.amount, dto.line_items || [])
+          : computeSplits(dto.split_method, dto.amount, dto.participants || []);
+      return { payers, splits };
+    } catch (error: any) {
+      throw new BadRequestException(error.message || 'This split does not add up');
+    }
+  }
+
+  async updateExpense(
+    userId: string,
+    spaceId: string,
+    expenseId: string,
+    dto: CreateSpaceExpenseDto,
+  ) {
+    if (!isUuid(expenseId)) throw new NotFoundException('Expense not found');
+    const membership = await this.requireMembership(userId, spaceId, 'read');
+    const space = await this.findSpace(spaceId);
+    const found = await this.pgPool.query(
+      `SELECT id, title, created_by FROM space_expenses
+       WHERE id = $1 AND space_id = $2 AND deleted_at IS NULL`,
+      [expenseId, spaceId],
+    );
+    if (!found.rowCount) throw new NotFoundException('Expense not found');
+    const role = membership.role as SpaceRole;
+    const allowed =
+      can(role, 'manage_space') ||
+      (found.rows[0].created_by === userId && can(role, 'edit_own_expense'));
+    if (!allowed) throw new ForbiddenException('Insufficient space permissions');
+    const plan = this.planExpenseOrThrow(dto);
+    const expenseDate = dto.expense_date || new Date().toISOString().slice(0, 10);
+    const client = await this.pgPool.connect();
+    try {
+      await client.query('BEGIN');
+      const links = await client.query(
+        `SELECT 1 FROM space_ledger_links WHERE expense_id = $1 LIMIT 1`,
+        [expenseId],
+      );
+      if (links.rowCount) {
+        throw new BadRequestException(
+          'This bill is already on an account. Delete it and add it again if the split has to change.',
+        );
+      }
+      await this.assertActiveMembers(client, spaceId, [
+        ...plan.payers.map((p) => p.member_id),
+        ...plan.splits.map((s) => s.member_id),
+      ]);
+      await client.query(
+        `UPDATE space_expenses
+         SET title = $3, amount = $4, payer_member_id = $5, split_method = $6,
+             category = $7, expense_date = $8, notes = $9, line_items = $10,
+             updated_at = NOW()
+         WHERE id = $1 AND space_id = $2 AND deleted_at IS NULL`,
+        [
+          expenseId,
+          spaceId,
+          dto.title.trim(),
+          dto.amount,
+          plan.payers[0].member_id,
+          dto.split_method,
+          dto.category || null,
+          expenseDate,
+          dto.notes || null,
+          JSON.stringify(dto.split_method === 'itemized' ? dto.line_items || [] : []),
+        ],
+      );
+      await client.query(`DELETE FROM space_expense_splits WHERE expense_id = $1`, [expenseId]);
+      await client.query(`DELETE FROM space_expense_payers WHERE expense_id = $1`, [expenseId]);
+      for (const payer of plan.payers) {
+        await client.query(
+          `INSERT INTO space_expense_payers (expense_id, member_id, paid_amount)
+           VALUES ($1,$2,$3)`,
+          [expenseId, payer.member_id, payer.paid_amount],
+        );
+      }
+      for (const split of plan.splits) {
+        await client.query(
+          `INSERT INTO space_expense_splits (expense_id, member_id, share_value, owed_amount)
+           VALUES ($1,$2,$3,$4)`,
+          [expenseId, split.member_id, split.share_value, split.owed_amount],
+        );
+      }
+      await this.logActivity(client, spaceId, userId, 'expense_edited', dto.title.trim(), {
         expense_id: expenseId,
         amount: dto.amount,
       });
@@ -583,10 +726,8 @@ export class SpacesService {
       return this.getExpense(spaceId, expenseId);
     } catch (error: any) {
       await client.query('ROLLBACK');
-      if (receipt.fileId) {
-        await this.storage.deleteSpaceFile(receipt.fileId, spaceId);
-      }
-      throw new BadRequestException(error.message || 'Could not create expense');
+      if (error instanceof HttpException) throw error;
+      throw new BadRequestException(error.message || 'Could not update expense');
     } finally {
       client.release();
     }
@@ -637,10 +778,8 @@ export class SpacesService {
   }
 
   /**
-   * Soft-delete a space expense (creator with edit_own_expense, or
-   * owner/admin) and release its receipt file. Balances, budgets and reports
-   * already ignore deleted expenses. A linked personal transaction is left
-   * untouched (it is the member's own ledger record).
+   * Soft-delete a space expense and reverse the acting member's own account
+   * links. Another member's account is never touched.
    */
   async deleteExpense(userId: string, spaceId: string, expenseId: string) {
     if (!isUuid(spaceId) || !isUuid(expenseId)) {
@@ -662,15 +801,27 @@ export class SpacesService {
     if (!allowed) {
       throw new ForbiddenException('Insufficient space permissions');
     }
-    await this.pgPool.query(
-      `UPDATE space_expenses
-       SET deleted_at = NOW(), updated_at = NOW()
-       WHERE id = $1 AND space_id = $2 AND deleted_at IS NULL`,
-      [expenseId, spaceId],
-    );
-    await this.logActivity(this.pgPool, spaceId, userId, 'expense_deleted', expense.title, {
-      expense_id: expenseId,
-    });
+    const client = await this.pgPool.connect();
+    try {
+      await client.query('BEGIN');
+      await this.reverseActorLinks(client, userId, { expenseId });
+      await client.query(
+        `UPDATE space_expenses
+         SET deleted_at = NOW(), updated_at = NOW()
+         WHERE id = $1 AND space_id = $2 AND deleted_at IS NULL`,
+        [expenseId, spaceId],
+      );
+      await this.logActivity(client, spaceId, userId, 'expense_deleted', expense.title, {
+        expense_id: expenseId,
+      });
+      await client.query('COMMIT');
+    } catch (error: any) {
+      await client.query('ROLLBACK');
+      if (error instanceof HttpException) throw error;
+      throw new BadRequestException(error.message || 'Could not delete expense');
+    } finally {
+      client.release();
+    }
     if (expense.receipt_file_id) {
       // Best-effort; never fails the delete.
       void this.storage.deleteSpaceFile(expense.receipt_file_id as string, spaceId);
@@ -683,6 +834,14 @@ export class SpacesService {
       `SELECT e.*,
               f.public_token AS receipt_token,
               f.mime_type AS receipt_file_mime,
+              COALESCE((
+                SELECT json_agg(json_build_object(
+                  'member_id', p.member_id,
+                  'paid_amount', p.paid_amount
+                ) ORDER BY p.paid_amount DESC)
+                FROM space_expense_payers p
+                WHERE p.expense_id = e.id
+              ), '[]'::json) AS payers,
               json_agg(json_build_object(
                 'id', s.id,
                 'member_id', s.member_id,
@@ -706,8 +865,19 @@ export class SpacesService {
       // storage:migrate-layout has not moved yet.
       receipt_url: receipt_token ? `${MEDIA_PATH_PREFIX}${receipt_token}` : null,
       receipt_mime_type: receipt_file_mime || row.receipt_mime_type || null,
+      payers: Array.isArray(row.payers)
+        ? row.payers
+            .filter((p: any) => p && p.member_id)
+            .map((p: any) => ({
+              member_id: p.member_id,
+              paid_amount: Number(p.paid_amount),
+            }))
+        : [],
+      line_items: Array.isArray(row.line_items) ? row.line_items : [],
       splits: Array.isArray(row.splits)
-        ? row.splits.filter((s: any) => s && s.member_id)
+        ? row.splits
+            .filter((s: any) => s && s.member_id)
+            .map((s: any) => ({ ...s, owed_amount: Number(s.owed_amount) }))
         : [],
     }));
   }
@@ -719,42 +889,62 @@ export class SpacesService {
     return found;
   }
 
-  async computeBalances(spaceId: string) {
+  async computeBalances(spaceId: string, db: Pool | PoolClient = this.pgPool) {
     const members = await this.listMembers(spaceId);
     const nets = new Map<string, number>();
     for (const m of members) nets.set(m.id, 0);
 
-    const expenses = await this.pgPool.query(
-      `SELECT e.payer_member_id, s.member_id, s.owed_amount
+    const expenses = await db.query(
+      `SELECT e.id, e.payer_member_id, e.amount,
+              COALESCE((
+                SELECT json_agg(json_build_object(
+                  'member_id', p.member_id,
+                  'paid_amount', p.paid_amount
+                ))
+                FROM space_expense_payers p
+                WHERE p.expense_id = e.id
+              ), '[]'::json) AS payers,
+              COALESCE((
+                SELECT json_agg(json_build_object(
+                  'member_id', s.member_id,
+                  'owed_amount', s.owed_amount
+                ))
+                FROM space_expense_splits s
+                WHERE s.expense_id = e.id
+              ), '[]'::json) AS splits
        FROM space_expenses e
-       JOIN space_expense_splits s ON s.expense_id = e.id
        WHERE e.space_id = $1 AND e.deleted_at IS NULL`,
       [spaceId],
     );
     for (const row of expenses.rows) {
-      const owed = Number(row.owed_amount);
-      nets.set(row.member_id, round2((nets.get(row.member_id) || 0) - owed));
-      nets.set(
-        row.payer_member_id,
-        round2((nets.get(row.payer_member_id) || 0) + owed),
-      );
+      const listed = Array.isArray(row.payers) ? row.payers : [];
+      const payers: PayerInput[] = listed.length
+        ? listed.map((p: { member_id: string; paid_amount: number }) => ({
+            member_id: p.member_id,
+            paid_amount: Number(p.paid_amount),
+          }))
+        : [{ member_id: row.payer_member_id, paid_amount: Number(row.amount) }];
+      const shares = (Array.isArray(row.splits) ? row.splits : [])
+        .filter((s: { member_id?: string }) => s?.member_id)
+        .map((s: { member_id: string; owed_amount: number }) => ({
+          member_id: s.member_id,
+          owed_amount: Number(s.owed_amount),
+        }));
+      applyExpenseNets(nets, payers, shares);
     }
 
-    const settlements = await this.pgPool.query(
+    const settlements = await db.query(
       `SELECT from_member_id, to_member_id, amount
        FROM space_settlements
        WHERE space_id = $1 AND deleted_at IS NULL AND status = 'completed'`,
       [spaceId],
     );
     for (const row of settlements.rows) {
-      const amount = Number(row.amount);
-      nets.set(
+      applySettlementNet(
+        nets,
         row.from_member_id,
-        round2((nets.get(row.from_member_id) || 0) + amount),
-      );
-      nets.set(
         row.to_member_id,
-        round2((nets.get(row.to_member_id) || 0) - amount),
+        Number(row.amount),
       );
     }
 
@@ -787,15 +977,23 @@ export class SpacesService {
         'Only the payer, the receiver, or a space admin can record this settlement',
       );
     }
-    if (
-      dto.link_to_personal &&
-      dto.personal_container_id &&
-      !actorIsPayer &&
-      !actorIsReceiver
-    ) {
+    if (dto.link_to_personal && !actorIsPayer && !actorIsReceiver) {
       throw new BadRequestException(
-        'Only the payer or receiver can link a settlement to a personal account',
+        'Only the person paying or the person receiving can update their own account',
       );
+    }
+    if (dto.link_to_personal && !dto.personal_container_id) {
+      throw new BadRequestException('Choose the account to update');
+    }
+    if (dto.client_op_id) {
+      const existing = await this.pgPool.query(
+        `SELECT * FROM space_settlements
+         WHERE space_id = $1 AND client_op_id = $2 AND deleted_at IS NULL`,
+        [spaceId, dto.client_op_id],
+      );
+      if (existing.rowCount) {
+        return { ...existing.rows[0], amount: Number(existing.rows[0].amount) };
+      }
     }
     const status = dto.scheduled_at ? 'scheduled' : 'completed';
     const client = await this.pgPool.connect();
@@ -805,12 +1003,34 @@ export class SpacesService {
         dto.from_member_id,
         dto.to_member_id,
       ]);
+      const balances = await this.computeBalances(spaceId, client);
+      const open = maxSettlementAmount(
+        balances.map((b) => ({ memberId: b.member_id, net: b.net })),
+        dto.from_member_id,
+        dto.to_member_id,
+      );
+      const reserved = await client.query(
+        `SELECT COALESCE(SUM(amount), 0)::float AS reserved
+         FROM space_settlements
+         WHERE space_id = $1 AND deleted_at IS NULL
+           AND status IN ('scheduled', 'pending')
+           AND from_member_id = $2 AND to_member_id = $3`,
+        [spaceId, dto.from_member_id, dto.to_member_id],
+      );
+      const cap = round2(open - Number(reserved.rows[0]?.reserved || 0));
+      if (dto.amount > cap + 0.02) {
+        throw new BadRequestException(
+          cap > 0.009
+            ? `Only ${cap} ${space.currency} is still owed on this settlement. Record that amount, or a smaller part of it.`
+            : 'Nothing is owed between these two people right now. Add the shared bills first, then settle the suggested amount.',
+        );
+      }
       const result = await client.query(
         `INSERT INTO space_settlements
           (space_id, from_member_id, to_member_id, amount, currency, status, notes,
            proof_name, proof_mime_type, proof_base64, scheduled_at, settled_at,
-           created_by, link_to_personal, personal_container_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+           created_by, link_to_personal, personal_container_id, client_op_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
          RETURNING *`,
         [
           spaceId,
@@ -828,42 +1048,107 @@ export class SpacesService {
           userId,
           dto.link_to_personal === true,
           dto.personal_container_id || null,
+          dto.client_op_id || null,
         ],
       );
-      let personalTxId: string | null = null;
+      let ledgerEffect: { direction: 'paid' | 'received'; amount: number } | null = null;
+      let counterpartyCollected = false;
       if (dto.link_to_personal && dto.personal_container_id && status === 'completed') {
-        // Payer's money leaves their account; receiver's money arrives in theirs.
-        const tx = await this.transactionsService.createWithClient(
-          client,
+        ledgerEffect = await this.postSettlementAuthorization(client, {
           userId,
-          {
-            type: actorIsPayer ? 'expense' : 'income',
+          space,
+          settlementId: result.rows[0].id,
+          amount: dto.amount,
+          containerId: dto.personal_container_id,
+          actorIsPayer,
+          notes: dto.notes,
+        });
+      }
+      if (status === 'completed' && !(dto.link_to_personal && actorIsReceiver)) {
+        const creditor = await client.query(
+          `SELECT user_id FROM space_members WHERE id = $1`,
+          [dto.to_member_id],
+        );
+        let collected: { direction: 'received'; amount: number } | null = null;
+        try {
+          collected = await this.collectCreditorReceivable(client, {
+            userId: creditor.rows[0].user_id,
+            space,
+            settlementId: result.rows[0].id,
             amount: dto.amount,
-            description: `[${space.name}] Settlement`,
-            date: new Date().toISOString().slice(0, 10),
-            ...(actorIsPayer
-              ? { source_container_id: dto.personal_container_id }
-              : { destination_container_id: dto.personal_container_id }),
-            currency: space.currency,
-            notes: dto.notes || `Space settlement ${result.rows[0].id}`,
-          } as any,
-          'spaces',
-        );
-        personalTxId = tx.id;
-        await client.query(
-          `UPDATE space_settlements SET personal_transaction_id = $2 WHERE id = $1`,
-          [result.rows[0].id, personalTxId],
-        );
+          });
+        } catch (error) {
+          // A missing or mismatched personal account must not block the group settlement.
+          if (!(error instanceof BadRequestException)) throw error;
+        }
+        counterpartyCollected = Boolean(collected);
+        if (collected && actorIsReceiver) ledgerEffect = collected;
       }
       await this.logActivity(client, spaceId, userId, 'settlement_completed', 'Settlement recorded', {
         settlement_id: result.rows[0].id,
         amount: dto.amount,
       });
       await client.query('COMMIT');
-      return { ...result.rows[0], personal_transaction_id: personalTxId };
+      return {
+        ...result.rows[0],
+        amount: Number(result.rows[0].amount),
+        ledger_effect: ledgerEffect,
+        counterparty_collected: counterpartyCollected,
+      };
     } catch (error: any) {
       await client.query('ROLLBACK');
+      if (error?.code === '23505' && dto.client_op_id) {
+        const existing = await this.pgPool.query(
+          `SELECT * FROM space_settlements
+           WHERE space_id = $1 AND client_op_id = $2 AND deleted_at IS NULL`,
+          [spaceId, dto.client_op_id],
+        );
+        if (existing.rowCount) {
+          return { ...existing.rows[0], amount: Number(existing.rows[0].amount) };
+        }
+      }
+      if (error instanceof HttpException) throw error;
       throw new BadRequestException(error.message || 'Could not create settlement');
+    } finally {
+      client.release();
+    }
+  }
+
+  async deleteSettlement(userId: string, spaceId: string, settlementId: string) {
+    const membership = await this.requireMembership(userId, spaceId, 'settle');
+    if (!isUuid(settlementId)) throw new NotFoundException('Settlement not found');
+    const found = await this.pgPool.query(
+      `SELECT * FROM space_settlements
+       WHERE id = $1 AND space_id = $2 AND deleted_at IS NULL`,
+      [settlementId, spaceId],
+    );
+    if (!found.rowCount) throw new NotFoundException('Settlement not found');
+    const row = found.rows[0];
+    const involved =
+      membership.id === row.from_member_id || membership.id === row.to_member_id;
+    if (!involved && membership.role !== 'owner' && membership.role !== 'admin') {
+      throw new ForbiddenException('Insufficient space permissions');
+    }
+    const client = await this.pgPool.connect();
+    try {
+      await client.query('BEGIN');
+      await this.reverseActorLinks(client, userId, { settlementId });
+      await client.query(
+        `UPDATE space_settlements
+         SET deleted_at = NOW(), updated_at = NOW(), status = 'cancelled'
+         WHERE id = $1 AND space_id = $2 AND deleted_at IS NULL`,
+        [settlementId, spaceId],
+      );
+      await this.logActivity(client, spaceId, userId, 'settlement_reversed', 'Settlement removed', {
+        settlement_id: settlementId,
+        amount: Number(row.amount),
+      });
+      await client.query('COMMIT');
+      return { id: settlementId, deleted: true };
+    } catch (error: any) {
+      await client.query('ROLLBACK');
+      if (error instanceof HttpException) throw error;
+      throw new BadRequestException(error.message || 'Could not remove settlement');
     } finally {
       client.release();
     }
@@ -1310,6 +1595,415 @@ export class SpacesService {
     if (entry && Math.abs(entry.net) > 0.005) {
       throw new BadRequestException('Settle up before leaving/removing this member');
     }
+  }
+
+  /**
+   * The payer's account drops by the full amount they paid. What the others
+   * owe is a receivable, so their later settlement can pay it back.
+   */
+  private async postPayerAuthorization(
+    client: PoolClient,
+    input: {
+      userId: string;
+      space: { id: string; name: string; currency: string };
+      expenseId: string;
+      title: string;
+      date: string;
+      paid: number;
+      share: number;
+      paymentContainerId: string;
+      receivableContainerId?: string;
+    },
+  ) {
+    const receivable = round2(input.paid - input.share);
+    const payment = await this.transactionsService.createWithClient(
+      client,
+      input.userId,
+      {
+        type: 'expense',
+        amount: input.paid,
+        description: `[${input.space.name}] Paid ${input.title}`,
+        date: input.date,
+        source_container_id: input.paymentContainerId,
+        currency: input.space.currency,
+        merchant: input.title,
+        notes: `Space bill. You paid ${round2(input.paid)}. Your share is ${round2(input.share)}. Others owe you ${Math.max(0, receivable)}.`,
+      } as any,
+      'spaces',
+    );
+    await this.recordLedgerLink(client, {
+      spaceId: input.space.id,
+      userId: input.userId,
+      expenseId: input.expenseId,
+      kind: 'payment_out',
+      containerId: input.paymentContainerId,
+      transactionId: payment.id,
+      amount: input.paid,
+    });
+    await client.query(
+      `UPDATE space_expenses
+       SET personal_transaction_id = $2, link_to_personal = TRUE, personal_container_id = $3
+       WHERE id = $1`,
+      [input.expenseId, payment.id, input.paymentContainerId],
+    );
+    if (receivable > 0.009) {
+      const receivableId = await this.ensureSpaceReceivable(
+        client,
+        input.userId,
+        input.space,
+        input.receivableContainerId,
+      );
+      const owed = await this.transactionsService.createWithClient(
+        client,
+        input.userId,
+        {
+          type: 'income',
+          amount: receivable,
+          description: `[${input.space.name}] Owed for ${input.title}`,
+          date: input.date,
+          destination_container_id: receivableId,
+          currency: input.space.currency,
+          merchant: input.title,
+          notes: `Waiting on the others for ${input.title}. Settlements they record can pay this back into an account you choose.`,
+        } as any,
+        'spaces',
+      );
+      await this.recordLedgerLink(client, {
+        spaceId: input.space.id,
+        userId: input.userId,
+        expenseId: input.expenseId,
+        kind: 'receivable_up',
+        containerId: receivableId,
+        transactionId: owed.id,
+        amount: receivable,
+      });
+    }
+    return {
+      paid: round2(input.paid),
+      receivable: Math.max(0, receivable),
+      account_id: input.paymentContainerId,
+    };
+  }
+
+  /** Move only the acting member's account. The other side stays a space balance until they authorize it. */
+  private async postSettlementAuthorization(
+    client: PoolClient,
+    input: {
+      userId: string;
+      space: { id: string; name: string; currency: string };
+      settlementId: string;
+      amount: number;
+      containerId: string;
+      actorIsPayer: boolean;
+      notes?: string;
+    },
+  ) {
+    const date = new Date().toISOString().slice(0, 10);
+    if (input.actorIsPayer) {
+      const tx = await this.transactionsService.createWithClient(
+        client,
+        input.userId,
+        {
+          type: 'expense',
+          amount: input.amount,
+          description: `[${input.space.name}] Settlement paid`,
+          date,
+          source_container_id: input.containerId,
+          currency: input.space.currency,
+          notes: input.notes || `Paid a space settlement ${input.settlementId}`,
+        } as any,
+        'spaces',
+      );
+      await this.recordLedgerLink(client, {
+        spaceId: input.space.id,
+        userId: input.userId,
+        settlementId: input.settlementId,
+        kind: 'settlement_out',
+        containerId: input.containerId,
+        transactionId: tx.id,
+        amount: input.amount,
+      });
+      await client.query(
+        `UPDATE space_settlements SET personal_transaction_id = $2 WHERE id = $1`,
+        [input.settlementId, tx.id],
+      );
+      return { direction: 'paid' as const, amount: round2(input.amount) };
+    }
+
+    const note = this.spaceReceivableNote(input.space.id);
+    const receivable = await client.query(
+      `SELECT id, balance, currency FROM financial_containers
+       WHERE user_id = $1 AND deleted_at IS NULL AND space_id IS NULL
+         AND type = 'receivable' AND notes = $2
+       LIMIT 1
+       FOR UPDATE`,
+      [input.userId, note],
+    );
+    let left = round2(input.amount);
+    let primaryId: string | null = null;
+    const row = receivable.rows[0];
+    if (
+      row &&
+      String(row.currency).toUpperCase() === input.space.currency
+    ) {
+      const take = round2(Math.min(Math.max(0, Number(row.balance)), left));
+      if (take > 0.009) {
+        const tx = await this.transactionsService.createWithClient(
+          client,
+          input.userId,
+          {
+            type: 'transfer',
+            amount: take,
+            description: `[${input.space.name}] Settlement received`,
+            date,
+            source_container_id: row.id,
+            destination_container_id: input.containerId,
+            currency: input.space.currency,
+            notes: input.notes || `Collected a space settlement ${input.settlementId}`,
+          } as any,
+          'spaces',
+        );
+        primaryId = tx.id;
+        left = round2(left - take);
+        await this.recordLedgerLink(client, {
+          spaceId: input.space.id,
+          userId: input.userId,
+          settlementId: input.settlementId,
+          kind: 'settlement_in',
+          containerId: input.containerId,
+          transactionId: tx.id,
+          amount: take,
+        });
+      }
+    }
+    if (left > 0.009) {
+      const tx = await this.transactionsService.createWithClient(
+        client,
+        input.userId,
+        {
+          type: 'income',
+          amount: left,
+          description: `[${input.space.name}] Settlement received`,
+          date,
+          destination_container_id: input.containerId,
+          currency: input.space.currency,
+          notes: input.notes || `Collected a space settlement ${input.settlementId}`,
+        } as any,
+        'spaces',
+      );
+      primaryId = primaryId || tx.id;
+      await this.recordLedgerLink(client, {
+        spaceId: input.space.id,
+        userId: input.userId,
+        settlementId: input.settlementId,
+        kind: 'settlement_in',
+        containerId: input.containerId,
+        transactionId: tx.id,
+        amount: left,
+      });
+    }
+    if (primaryId) {
+      await client.query(
+        `UPDATE space_settlements SET personal_transaction_id = $2 WHERE id = $1`,
+        [input.settlementId, primaryId],
+      );
+    }
+    return { direction: 'received' as const, amount: round2(input.amount) };
+  }
+
+  /**
+   * The creditor already authorized this when they recorded the bill:
+   * money others owe them sits in a receivable and comes back to the
+   * account they paid from. A later settlement does not need a second opt-in.
+   */
+  private async collectCreditorReceivable(
+    client: PoolClient,
+    input: {
+      userId: string;
+      space: { id: string; name: string; currency: string };
+      settlementId: string;
+      amount: number;
+    },
+  ) {
+    const note = this.spaceReceivableNote(input.space.id);
+    const receivable = await client.query(
+      `SELECT id, balance, currency FROM financial_containers
+       WHERE user_id = $1 AND deleted_at IS NULL AND space_id IS NULL
+         AND type = 'receivable' AND notes = $2
+       LIMIT 1
+       FOR UPDATE`,
+      [input.userId, note],
+    );
+    const row = receivable.rows[0];
+    if (!row || String(row.currency).toUpperCase() !== input.space.currency) return null;
+    const take = round2(Math.min(Math.max(0, Number(row.balance)), input.amount));
+    if (take <= 0.009) return null;
+    const dest = await client.query(
+      `SELECT container_id FROM space_ledger_links
+       WHERE space_id = $1 AND user_id = $2 AND kind = 'payment_out'
+         AND container_id IS NOT NULL
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [input.space.id, input.userId],
+    );
+    if (!dest.rowCount) return null;
+    const date = new Date().toISOString().slice(0, 10);
+    const tx = await this.transactionsService.createWithClient(
+      client,
+      input.userId,
+      {
+        type: 'transfer',
+        amount: take,
+        description: `[${input.space.name}] Settlement received`,
+        date,
+        source_container_id: row.id,
+        destination_container_id: dest.rows[0].container_id,
+        currency: input.space.currency,
+        notes: `Collected from a space settlement ${input.settlementId}`,
+      } as any,
+      'spaces',
+    );
+    await this.recordLedgerLink(client, {
+      spaceId: input.space.id,
+      userId: input.userId,
+      settlementId: input.settlementId,
+      kind: 'settlement_in',
+      containerId: dest.rows[0].container_id,
+      transactionId: tx.id,
+      amount: take,
+    });
+    return { direction: 'received' as const, amount: take };
+  }
+
+  private spaceReceivableNote(spaceId: string) {
+    return `opal-space:${spaceId}`;
+  }
+
+  private async ensureSpaceReceivable(
+    client: PoolClient,
+    userId: string,
+    space: { id: string; name: string; currency: string },
+    preferredId?: string,
+  ) {
+    if (preferredId) {
+      const picked = await client.query(
+        `SELECT id, type, currency FROM financial_containers
+         WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND space_id IS NULL
+         FOR UPDATE`,
+        [preferredId, userId],
+      );
+      if (!picked.rowCount) {
+        throw new BadRequestException('Receivable account not found');
+      }
+      if (picked.rows[0].type !== 'receivable') {
+        throw new BadRequestException(
+          'What others owe you has to sit in a receivable account',
+        );
+      }
+      if (String(picked.rows[0].currency).toUpperCase() !== space.currency) {
+        throw new BadRequestException(
+          `That receivable is in ${picked.rows[0].currency}. This space uses ${space.currency}.`,
+        );
+      }
+      return picked.rows[0].id as string;
+    }
+    const note = this.spaceReceivableNote(space.id);
+    const found = await client.query(
+      `SELECT id, currency FROM financial_containers
+       WHERE user_id = $1 AND deleted_at IS NULL AND space_id IS NULL
+         AND type = 'receivable' AND notes = $2
+       LIMIT 1
+       FOR UPDATE`,
+      [userId, note],
+    );
+    if (found.rowCount) {
+      if (String(found.rows[0].currency).toUpperCase() !== space.currency) {
+        throw new BadRequestException(
+          `Your receivable for this space is in ${found.rows[0].currency}, but the space uses ${space.currency}.`,
+        );
+      }
+      return found.rows[0].id as string;
+    }
+    let name = `Owed to me · ${space.name}`.slice(0, 100);
+    const clash = await client.query(
+      `SELECT 1 FROM financial_containers
+       WHERE user_id = $1 AND name = $2 AND deleted_at IS NULL AND space_id IS NULL`,
+      [userId, name],
+    );
+    if (clash.rowCount) {
+      name = `${`Owed to me · ${space.name}`.slice(0, 88)} ${space.id.slice(0, 8)}`;
+    }
+    const created = await client.query(
+      `INSERT INTO financial_containers
+        (user_id, name, type, balance, currency, notes, include_in_net_worth)
+       VALUES ($1, $2, 'receivable', 0, $3, $4, TRUE)
+       RETURNING id`,
+      [userId, name, space.currency, note],
+    );
+    return created.rows[0].id as string;
+  }
+
+  private async recordLedgerLink(
+    client: PoolClient,
+    row: {
+      spaceId: string;
+      userId: string;
+      expenseId?: string | null;
+      settlementId?: string | null;
+      kind: 'payment_out' | 'receivable_up' | 'settlement_out' | 'settlement_in';
+      containerId: string;
+      transactionId: string;
+      amount: number;
+    },
+  ) {
+    await client.query(
+      `INSERT INTO space_ledger_links
+        (space_id, user_id, expense_id, settlement_id, kind, container_id, transaction_id, amount)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [
+        row.spaceId,
+        row.userId,
+        row.expenseId || null,
+        row.settlementId || null,
+        row.kind,
+        row.containerId,
+        row.transactionId,
+        row.amount,
+      ],
+    );
+  }
+
+  /**
+   * Undo every account posting that belongs to this bill or settlement.
+   * Those postings were authorized for this event, so removing the event
+   * puts each connected account back.
+   */
+  private async reverseActorLinks(
+    client: PoolClient,
+    _userId: string,
+    which: { expenseId?: string; settlementId?: string },
+  ) {
+    const column = which.expenseId ? 'expense_id' : 'settlement_id';
+    const id = which.expenseId || which.settlementId;
+    const links = await client.query(
+      `SELECT user_id, transaction_id FROM space_ledger_links
+       WHERE ${column} = $1
+       FOR UPDATE`,
+      [id],
+    );
+    for (const link of links.rows) {
+      if (!link.transaction_id) continue;
+      try {
+        await this.transactionsService.removeWithClient(
+          client,
+          link.user_id,
+          link.transaction_id,
+        );
+      } catch (error) {
+        if (!(error instanceof NotFoundException)) throw error;
+      }
+    }
+    await client.query(`DELETE FROM space_ledger_links WHERE ${column} = $1`, [id]);
   }
 
   private async logActivity(

@@ -517,44 +517,10 @@ export class TransactionsService {
     const client = await this.pgPool.connect();
     try {
       await client.query('BEGIN');
-      const existing = await client.query(
-        `SELECT * FROM ledger_transactions
-         WHERE user_id = $1 AND id = $2 AND deleted_at IS NULL
-         FOR UPDATE`,
-        [userId, id],
-      );
-      if (!existing.rowCount) {
-        throw new NotFoundException('Transaction not found');
-      }
-      const row = existing.rows[0];
-      const posted: PostedTx = {
-        type: row.type,
-        amount: Number(row.amount),
-        currency: row.currency,
-        source_container_id: row.source_container_id,
-        destination_container_id: row.destination_container_id,
-        exchange_rate: Number(row.exchange_rate || 1),
-        fx_rate_to_base: Number(row.fx_rate_to_base || 1),
-        amount_base: Number(row.amount_base || row.amount),
-        description: row.description,
-        date: requireDateOnly(row.date),
-      };
-      await this.reverseJournal(
-        client,
-        userId,
-        id,
-        posted,
-        'Transaction deleted',
-      );
-      await client.query(
-        `UPDATE ledger_transactions
-         SET deleted_at = NOW(), updated_at = NOW()
-         WHERE user_id = $1 AND id = $2`,
-        [userId, id],
-      );
+      const removed = await this.removeWithClient(client, userId, id);
       await client.query('COMMIT');
       // Best-effort: drop the scan unless another live transaction uses it.
-      void this.releaseReceiptFile(userId, row.receipt_id || null, id);
+      void this.releaseReceiptFile(userId, removed.receiptId, id);
       return { id, deleted: true };
     } catch (error: any) {
       await client.query('ROLLBACK');
@@ -565,6 +531,40 @@ export class TransactionsService {
     } finally {
       client.release();
     }
+  }
+
+  /** Reverse and soft-delete a transaction on a caller-owned transaction. */
+  async removeWithClient(client: PoolClient, userId: string, id: string) {
+    const existing = await client.query(
+      `SELECT * FROM ledger_transactions
+       WHERE user_id = $1 AND id = $2 AND deleted_at IS NULL
+       FOR UPDATE`,
+      [userId, id],
+    );
+    if (!existing.rowCount) {
+      throw new NotFoundException('Transaction not found');
+    }
+    const row = existing.rows[0];
+    const posted: PostedTx = {
+      type: row.type,
+      amount: Number(row.amount),
+      currency: row.currency,
+      source_container_id: row.source_container_id,
+      destination_container_id: row.destination_container_id,
+      exchange_rate: Number(row.exchange_rate || 1),
+      fx_rate_to_base: Number(row.fx_rate_to_base || 1),
+      amount_base: Number(row.amount_base || row.amount),
+      description: row.description,
+      date: requireDateOnly(row.date),
+    };
+    await this.reverseJournal(client, userId, id, posted, 'Transaction deleted');
+    await client.query(
+      `UPDATE ledger_transactions
+       SET deleted_at = NOW(), updated_at = NOW()
+       WHERE user_id = $1 AND id = $2`,
+      [userId, id],
+    );
+    return { id, receiptId: (row.receipt_id as string | null) || null };
   }
 
   private validateShape(dto: CreateTransactionDto) {

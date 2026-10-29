@@ -333,6 +333,28 @@ export class SpacesController {
     }
   }
 
+  @Patch(':spaceId/expenses/:expenseId')
+  @RequirePermissions('spaces.update')
+  async updateExpense(
+    @Req() req: Request,
+    @Param('spaceId') spaceId: string,
+    @Param('expenseId') expenseId: string,
+    @Body() dto: CreateSpaceExpenseDto,
+    @Res() res: Response,
+  ) {
+    try {
+      const data = await this.spacesService.updateExpense(
+        this.userId(req),
+        spaceId,
+        expenseId,
+        dto,
+      );
+      return res.status(HttpStatus.OK).send(successResponse(data, 'Expense updated'));
+    } catch (error) {
+      return this.fail(res, error);
+    }
+  }
+
   @Delete(':spaceId/expenses/:expenseId')
   @ApiOperation({ summary: 'Delete a space expense and its stored receipt' })
   @RequirePermissions('spaces.delete')
@@ -401,6 +423,26 @@ export class SpacesController {
         dto,
       );
       return res.status(HttpStatus.OK).send(successResponse(data, 'Settlement saved'));
+    } catch (error) {
+      return this.fail(res, error);
+    }
+  }
+
+  @Delete(':spaceId/settlements/:settlementId')
+  @RequirePermissions('spaces.delete')
+  async deleteSettlement(
+    @Req() req: Request,
+    @Param('spaceId') spaceId: string,
+    @Param('settlementId') settlementId: string,
+    @Res() res: Response,
+  ) {
+    try {
+      const data = await this.spacesService.deleteSettlement(
+        this.userId(req),
+        spaceId,
+        settlementId,
+      );
+      return res.status(HttpStatus.OK).send(successResponse(data, 'Settlement removed'));
     } catch (error) {
       return this.fail(res, error);
     }
