@@ -4,7 +4,15 @@ import { CategoriesService } from '../categories/categories.service';
 import { AccountsService } from '../accounts/accounts.service';
 import { ParseReceiptDto } from './dto/ai-advisor.dto';
 import { AiOmnirouteUsageService } from './ai-omniroute-usage.service';
-import { trySequentialVisionChat } from './providers/omniroute.adapter';
+import {
+  trySequentialTextChat,
+  trySequentialVisionChat,
+} from './providers/omniroute.adapter';
+import {
+  mirageFieldsToReceiptJson,
+  readReceiptWithMirage,
+  transcriptCanReplaceImage,
+} from './mirage-receipt';
 import { ChatMessage, ProviderChatResult, ProviderConfig } from './providers/types';
 import { runProviderChat } from './providers';
 import { AiSettingsService } from './ai-settings.service';
@@ -645,6 +653,17 @@ export class ReceiptParseService {
       return out;
     };
 
+    // The phone already read the image. Only store the file.
+    if (dto.store_only) {
+      return finish({ ...emptyResult(''), ok: true, warning: undefined });
+    }
+
+    // Optional server-side Mirage. Off unless MIRAGE_OCR=1. The phone path
+    // is the one that keeps scans fast.
+    const localPromise = mime.startsWith('image/')
+      ? readReceiptWithMirage(dto.data_base64, mime)
+      : Promise.resolve(null);
+
     // Context and provider lookups are independent: run them together.
     const providerPromise = this.resolveVisionProvider(userId, mime);
     const [categories, containers, profileRow, initialByok, freeQuota] = await Promise.all([
@@ -689,9 +708,20 @@ export class ReceiptParseService {
     const messagesFor = (
       instruction: string,
       systemPrompt = system,
+      transcript?: string,
     ): ChatMessage[] => [
       { role: 'system', content: systemPrompt },
-      { role: 'user', content: instruction, attachments: [attachment] },
+      transcript
+        ? {
+            role: 'user',
+            content: `${instruction}
+
+The image was read locally by Mirage (Latin-script OCR). You do not have the pixels. Copy only what appears in this transcript; if a digit is missing, use null.
+
+OCR transcript:
+${transcript.slice(0, 6000)}`,
+          }
+        : { role: 'user', content: instruction, attachments: [attachment] },
     ];
 
     // Route: the user's own vision-capable provider when active (stronger
@@ -700,9 +730,38 @@ export class ReceiptParseService {
     let quotaChecked = false;
     const runVision = async (
       instruction: string,
-      options?: { systemPrompt?: string; deadlineMs?: number },
+      options?: { systemPrompt?: string; deadlineMs?: number; transcript?: string },
     ): Promise<{ result: ProviderChatResult | null; errors: string[]; viaFree: boolean; blocked?: boolean }> => {
-      const messages = messagesFor(instruction, options?.systemPrompt);
+      const messages = messagesFor(
+        instruction,
+        options?.systemPrompt,
+        options?.transcript,
+      );
+      if (options?.transcript) {
+        if (byok) {
+          try {
+            const result = await runProviderChat(byok, messages, 2048);
+            return { result, errors: [], viaFree: false };
+          } catch (error: any) {
+            console.warn(
+              `[Opal receipts] ${byok.provider} text failed, using Opal Free: ${error?.message || error}`,
+            );
+            byok = null;
+          }
+        }
+        if (!quotaChecked) {
+          quotaChecked = true;
+          const quota = freeQuota ?? (await this.omnirouteUsage.getUsage(userId));
+          if (quota.remaining <= 0) {
+            return { result: null, errors: [], viaFree: true, blocked: true };
+          }
+        }
+        const { result, errors } = await trySequentialTextChat(messages, {
+          maxTokens: 2048,
+          deadlineMs: options?.deadlineMs,
+        });
+        return { result, errors, viaFree: true };
+      }
       if (byok) {
         try {
           const result = await runProviderChat(byok, messages, 4096);
@@ -725,7 +784,34 @@ export class ReceiptParseService {
       return { result, errors, viaFree: true };
     };
 
-    const first = await runVision(RECEIPT_USER_PROMPT);
+    // Mirage reads the image on this machine. A grounded amount skips the
+    // vision API entirely. A usable transcript still skips the image and
+    // sends only text, which is the cheaper call.
+    const localRead = await localPromise;
+    const grounded = localRead ? mirageFieldsToReceiptJson(localRead) : null;
+    const transcript =
+      !grounded && localRead && transcriptCanReplaceImage(localRead.text)
+        ? localRead.text
+        : undefined;
+
+    let readFromTranscript = Boolean(transcript);
+    const first = grounded
+      ? {
+          result: {
+            content: JSON.stringify(grounded),
+            model: 'cactus/mirage',
+            provider: 'local' as const,
+          },
+          errors: [] as string[],
+          viaFree: false,
+          blocked: false,
+        }
+      : await runVision(RECEIPT_USER_PROMPT, { transcript });
+    if (!first.result && transcript && !first.blocked) {
+      // Local text was too thin for the text model. The image is still here.
+      readFromTranscript = false;
+      Object.assign(first, await runVision(RECEIPT_USER_PROMPT));
+    }
     if (first.blocked) {
       return finish(
         emptyResult(
@@ -747,9 +833,14 @@ export class ReceiptParseService {
     if (first.viaFree) {
       void this.omnirouteUsage.recordSuccessfulRequest(userId).catch(() => undefined);
     }
-    const source = first.viaFree
+    const baseSource = first.viaFree
       ? describeVisionSource(first.result.model)
       : describeByokSource(first.result);
+    const source = first.result.model.startsWith('cactus/')
+      ? { provider: 'Mirage', model: 'cactus/mirage' }
+      : readFromTranscript
+        ? { ...baseSource, model: `${baseSource.model} + mirage-ocr` }
+        : baseSource;
 
     const json = parseLenientJson(first.result.content) || {};
     let details = extractReceiptDetails(json);
@@ -768,7 +859,9 @@ export class ReceiptParseService {
     // quick, so a slow first read is not doubled.
     const secondPassBudget = SECOND_PASS_DEADLINE_MS - (Date.now() - startedAt);
     const reason =
-      extractedRaw.payment_status === 'failed' || secondPassBudget < MIN_SECOND_PASS_MS
+      first.result.model.startsWith('cactus/') ||
+      extractedRaw.payment_status === 'failed' ||
+      secondPassBudget < MIN_SECOND_PASS_MS
         ? null
         : secondPassReason({
             reconciliation,
@@ -782,6 +875,7 @@ export class ReceiptParseService {
         // contradicted the narrow totals-only reply this pass wants.
         systemPrompt: RECEIPT_TOTALS_SYSTEM_PROMPT,
         deadlineMs: secondPassBudget,
+        transcript: readFromTranscript ? transcript : undefined,
       });
       const json2 = second.result ? parseLenientJson(second.result.content) : null;
       if (json2) {

@@ -268,4 +268,12 @@ export class ParseReceiptDto {
   @IsString()
   @MaxLength(5_500_000)
   data_base64: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Store the scan and skip vision. Set when the phone already read the receipt.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  store_only?: boolean;
 }
